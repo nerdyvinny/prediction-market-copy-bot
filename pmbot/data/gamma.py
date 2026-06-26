@@ -82,13 +82,27 @@ class GammaClient:
         rows = data if isinstance(data, list) else data.get("data", [])
         return [self._parse_market(m) for m in rows]
 
+    def _fetch_market_raw(self, condition_id: str) -> dict | None:
+        """Fetch one market's raw dict, whether it's open OR closed.
+
+        Gamma's /markets defaults to non-closed results; closed markets only
+        come back when `closed=true` is passed. So we try the default first
+        (finds open markets) and fall back to closed=true.
+        """
+        for params in (
+            {"condition_ids": condition_id, "limit": 1},
+            {"condition_ids": condition_id, "limit": 1, "closed": "true"},
+        ):
+            data = self._get("/markets", params)
+            rows = data if isinstance(data, list) else data.get("data", [])
+            if rows:
+                return rows[0]
+        return None
+
     def get_market(self, condition_id: str) -> Market | None:
-        """Fetch a single market by its condition id."""
-        data = self._get("/markets", {"condition_ids": condition_id, "limit": 1})
-        rows = data if isinstance(data, list) else data.get("data", [])
-        if not rows:
-            return None
-        return self._parse_market(rows[0])
+        """Fetch a single market by its condition id (open or closed)."""
+        m = self._fetch_market_raw(condition_id)
+        return self._parse_market(m) if m else None
 
     def get_resolution(self, condition_id: str) -> tuple[bool, str | None]:
         """Return (closed, winning_token_id) for a market.
@@ -97,20 +111,29 @@ class GammaClient:
         settled decisively (price ~1.0). Used to settle leaders' open positions
         when reconstructing their realized P&L.
         """
-        data = self._get("/markets", {"condition_ids": condition_id, "limit": 1})
-        rows = data if isinstance(data, list) else data.get("data", [])
-        if not rows:
+        m = self._fetch_market_raw(condition_id)
+        if not m:
             return (False, None)
-        m = rows[0]
-        closed = bool(m.get("closed", False))
+        return (bool(m.get("closed", False)), self._winner_from_raw(m))
+
+    def get_market_with_resolution(self, condition_id: str) -> tuple[Market | None, str | None]:
+        """One lookup -> (Market, winning_token_id). Used by the backtester."""
+        m = self._fetch_market_raw(condition_id)
+        if not m:
+            return (None, None)
+        return (self._parse_market(m), self._winner_from_raw(m))
+
+    @staticmethod
+    def _winner_from_raw(m: dict) -> str | None:
+        if not bool(m.get("closed", False)):
+            return None
         prices = [_to_float_or_none(p) or 0.0 for p in _load_json_list(m.get("outcomePrices"))]
         tokens = _load_json_list(m.get("clobTokenIds"))
-        winning: str | None = None
-        if closed and prices and tokens and len(prices) == len(tokens):
+        if prices and tokens and len(prices) == len(tokens):
             idx = max(range(len(prices)), key=lambda i: prices[i])
             if prices[idx] >= 0.99:
-                winning = str(tokens[idx])
-        return (closed, winning)
+                return str(tokens[idx])
+        return None
 
     # -- parsing ---------------------------------------------------------
     @classmethod

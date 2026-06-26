@@ -31,7 +31,12 @@ def _build_parser() -> argparse.ArgumentParser:
     paper = sub.add_parser("paper", help="run the loop in simulation (no real orders)")
     paper.add_argument("--cycles", type=int, default=None, help="run N cycles then exit (default: forever)")
 
-    sub.add_parser("backtest", help="replay historical leader trades")
+    bt = sub.add_parser("backtest", help="replay historical leader trades")
+    bt.add_argument("--leaders", type=str, default=None,
+                    help="comma-separated wallets to backtest (default: auto-select)")
+    bt.add_argument("--lookback", type=int, default=180, help="days of history (default 180)")
+    bt.add_argument("--limit", type=int, default=500, help="max trades per leader (default 500)")
+
     sub.add_parser("live", help="GATED live trading (disabled by default)")
     return p
 
@@ -60,8 +65,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.mode == "backtest":
-        print(f"[pmbot {__version__}] backtest mode")
-        print("Backtest harness arrives in Phase 4.")
+        from pmbot.backtest import Backtester
+        from pmbot.data import GammaClient, PolymarketDataClient
+        from pmbot.leaders.scoring import LeaderSelector
+
+        data, gamma = PolymarketDataClient(), GammaClient()
+        try:
+            if args.leaders:
+                leaders = [w.strip().lower() for w in args.leaders.split(",") if w.strip()]
+            else:
+                print("· auto-selecting leaders to backtest…")
+                leaders = [r.wallet for r in LeaderSelector(data, gamma).select()]
+            if not leaders:
+                print("No leaders to backtest (loosen leaders.yaml or pass --leaders).")
+                return 0
+            print(f"· backtesting {len(leaders)} leader(s) over {args.lookback}d…\n")
+            report = Backtester(data, gamma, settings,
+                                lookback_days=args.lookback, trades_limit=args.limit).run(leaders)
+            print(report.summary_text())
+        finally:
+            data.close()
+            gamma.close()
         return 0
 
     if args.mode == "live":
