@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pmbot"
+version = "0.1.0"
+description = "Prediction-market copy-trading bot (Polymarket) — paper-first."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "pandas>=2.2",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "tenacity>=8.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2", "pytest-asyncio>=0.23"]
+live = ["py-clob-client>=0.34"]  # Phase 6 only — install in a Python 3.12 venv
+
+[project.scripts]
+pmbot = "pmbot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pmbot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

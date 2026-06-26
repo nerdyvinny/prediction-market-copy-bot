@@ -1,0 +1,31 @@
+# Automatic leader selection + scoring config.
+#
+# The bot pulls Polymarket's PUBLIC leaderboard, scores every candidate wallet,
+# and auto-follows the top_n that pass all `filters`. You don't list wallets
+# here (selection is automatic) — you set the BAR. Tune during paper testing.
+
+selection:
+  top_n: 2                     # start small; raise once paper P&L looks sane
+  rescore_interval_hours: 24   # re-rank the leaderboard on this cadence
+
+# A wallet must pass ALL of these to be eligible. These sanity caps exist to
+# reject lucky/low-sample wallets (the #1 killer of copy trading).
+filters:
+  lookback_days: 90
+  min_resolved_trades: 100
+  min_win_rate: 0.55
+  min_realized_pnl_usd: 0
+  min_distinct_categories: 2          # consistency across market types
+  min_avg_market_liquidity_usd: 5000  # leader must trade liquid markets
+  max_position_concentration: 0.40    # largest single position <= 40% of book
+
+# Ranking weights for eligible wallets (must sum to ~1.0). Higher total = followed first.
+weights:
+  realized_pnl: 0.35
+  win_rate: 0.25
+  consistency: 0.20            # spread across categories
+  recency: 0.20                # decay-weighted toward recent activity
+
+# Manual overrides (optional).
+allowlist: []   # wallet addresses to always include (bypass filters)
+blocklist: []   # wallet addresses to never follow
