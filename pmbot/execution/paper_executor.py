@@ -1,0 +1,85 @@
+"""Paper executor: simulate fills against the live order book + a slippage model.
+
+No orders are placed and no funds move. A BUY is assumed to fill at the ask
+nudged up by the slippage budget; a SELL at the bid nudged down. If the book is
+unavailable, we fall back to the signal's target price. Every fill is recorded
+to the ledger so paper P&L tracks exactly like live would.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from pmbot.config import get_settings
+from pmbot.data import PriceCache
+from pmbot.execution.executor import TradeExecutor
+from pmbot.models import Fill, Position, Side, Signal
+from pmbot.portfolio.ledger import Ledger
+
+log = logging.getLogger(__name__)
+
+_MIN_PRICE = 1e-4
+_MAX_PRICE = 1 - 1e-4
+
+
+class PaperExecutor(TradeExecutor):
+    mode = "paper"
+
+    def __init__(
+        self,
+        ledger: Ledger,
+        price_cache: PriceCache | None = None,
+        slippage_bps: float | None = None,
+    ):
+        settings = get_settings()
+        self.ledger = ledger
+        self.price_cache = price_cache or PriceCache()
+        self.slippage_bps = settings.slippage_bps if slippage_bps is None else slippage_bps
+
+    def execute(self, signal: Signal) -> Fill | None:
+        if signal.size_usd <= 0:
+            return None
+        price = self._resolve_fill_price(signal)
+        if price is None:
+            log.warning("paper: no price for token %s; skipping", signal.token_id)
+            return None
+
+        shares = signal.size_usd / price
+        fill = Fill(
+            signal=signal,
+            fill_price=price,
+            size_usd=signal.size_usd,
+            shares=shares,
+            timestamp=datetime.now(timezone.utc),
+            mode=self.mode,
+            slippage_bps=self.slippage_bps,
+        )
+        self.ledger.record_fill(fill)
+        log.info(
+            "paper %s %s %.2f sh @ %.4f ($%.2f) %s",
+            signal.side.value, signal.outcome, shares, price, signal.size_usd, signal.reason,
+        )
+        return fill
+
+    def _resolve_fill_price(self, signal: Signal) -> float | None:
+        slip = self.slippage_bps / 10_000.0
+        quote = None
+        try:
+            quote = self.price_cache.get_quote(signal.token_id)
+        except Exception as e:  # network hiccup -> fall back to target price
+            log.debug("paper: quote fetch failed (%s); using target price", e)
+
+        if signal.side is Side.BUY:
+            base = quote.ask if (quote and quote.ask) else signal.target_price
+            price = base * (1 + slip) if base else None
+        else:
+            base = quote.bid if (quote and quote.bid) else signal.target_price
+            price = base * (1 - slip) if base else None
+
+        if not price or price <= 0:
+            return None
+        return min(max(price, _MIN_PRICE), _MAX_PRICE)
+
+    def get_positions(self) -> list[Position]:
+        return self.ledger.get_positions()
