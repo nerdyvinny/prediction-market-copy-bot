@@ -71,15 +71,21 @@ class Engine:
         return ranked
 
     def poll_once(self) -> tuple[int, int]:
-        """One cycle: generate -> size -> execute. Returns (fills, signals)."""
+        """One cycle: generate -> size -> execute. Returns (fills, signals).
+
+        Per-signal failures are isolated so one bad market can't abort the cycle.
+        """
         signals = list(self.strategy.generate())
         fills = 0
         for sig in signals:
-            sized = self.risk.size(sig)
-            if sized is None:
-                continue
-            if self.executor.execute(sized) is not None:
-                fills += 1
+            try:
+                sized = self.risk.size(sig)
+                if sized is None:
+                    continue
+                if self.executor.execute(sized) is not None:
+                    fills += 1
+            except Exception as e:
+                log.warning("poll: failed on %s: %s", sig.token_id[:10], e)
         return fills, len(signals)
 
     # -- loop ------------------------------------------------------------
@@ -89,20 +95,30 @@ class Engine:
         print("Reading public data only; no real orders are placed in paper mode.\n")
 
         cycle = 0
+        errors = 0
         try:
             while max_cycles is None or cycle < max_cycles:
-                now = time.monotonic()
-                if not self.leaders or (now - self._last_rescore) >= self._rescore_interval:
-                    print("· rescoring leaders…")
-                    self.rescore()
-                    self._last_rescore = now
-                    self._print_leaders()
+                try:
+                    now = time.monotonic()
+                    if not self.leaders or (now - self._last_rescore) >= self._rescore_interval:
+                        print("· rescoring leaders…")
+                        self.rescore()
+                        self._last_rescore = now
+                        self._print_leaders()
 
-                fills, n = self.poll_once()
-                realized = self.ledger.realized_pnl_total()
-                open_positions = len(self.ledger.get_positions())
-                print(f"· cycle {cycle}: {n} signals, {fills} paper fills | "
-                      f"open={open_positions} realized=${realized:,.2f}")
+                    fills, n = self.poll_once()
+                    s = self.ledger.summary()
+                    print(f"· cycle {cycle}: {n} signals, {fills} paper fills | "
+                          f"open={s['open_positions']} deployed=${s['deployed_usd']:,.0f} "
+                          f"realized=${s['realized_pnl']:,.2f}")
+                    errors = 0
+                except Exception as e:
+                    errors += 1
+                    backoff = min(self.settings.poll_interval_seconds * errors, 120)
+                    log.error("cycle %d failed (%s); backing off %.0fs", cycle, e, backoff)
+                    time.sleep(backoff)
+                    cycle += 1
+                    continue
 
                 cycle += 1
                 if max_cycles is not None and cycle >= max_cycles:

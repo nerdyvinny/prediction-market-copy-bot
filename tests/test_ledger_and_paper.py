@@ -71,6 +71,22 @@ def test_ledger_records_and_dedupes():
     led.close()
 
 
+def test_ledger_summary_and_leader_exposures():
+    led = Ledger(":memory:")
+    _fill(led, _sig(side=Side.BUY, size_usd=50, uid="a", leader="0xL1", token="t1", market="m1"), price=0.50)
+    _fill(led, _sig(side=Side.BUY, size_usd=30, uid="b", leader="0xL2", token="t2", market="m2"), price=0.60)
+    s = led.summary()
+    assert s["fills"] == 2
+    assert s["open_positions"] == 2
+    assert s["deployed_usd"] == pytest.approx(50.0 + 30.0)  # 100*0.5 + 50*0.6
+    assert s["realized_pnl"] == pytest.approx(0.0)
+    assert s["leaders"] == 2
+    exps = led.leader_exposures()
+    assert exps["0xL1"] == pytest.approx(50.0)
+    assert exps["0xL2"] == pytest.approx(30.0)
+    led.close()
+
+
 def test_ledger_realized_pnl_and_exposures():
     led = Ledger(":memory:")
     _fill(led, _sig(side=Side.BUY, size_usd=50, uid="b1"), price=0.50)   # +100 sh @0.50

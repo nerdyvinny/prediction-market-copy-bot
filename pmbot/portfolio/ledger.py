@@ -178,6 +178,29 @@ class Ledger:
     def fill_count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) AS c FROM fills").fetchone()["c"])
 
+    def deployed_usd(self) -> float:
+        """Total cost-basis currently deployed across open positions."""
+        return sum(abs(p.shares * p.avg_price) for p in self.get_positions())
+
+    def leader_exposures(self) -> dict[str, float]:
+        """Net USD deployed per leader we've followed (BUY - SELL)."""
+        rows = self.conn.execute(
+            """SELECT source_leader AS leader,
+                      COALESCE(SUM(CASE WHEN side='BUY' THEN size_usd ELSE -size_usd END), 0) AS net
+               FROM fills WHERE source_leader IS NOT NULL GROUP BY source_leader"""
+        ).fetchall()
+        return {r["leader"]: float(r["net"] or 0.0) for r in rows}
+
+    def summary(self) -> dict:
+        positions = self.get_positions()
+        return {
+            "fills": self.fill_count(),
+            "open_positions": len(positions),
+            "deployed_usd": sum(abs(p.shares * p.avg_price) for p in positions),
+            "realized_pnl": self.realized_pnl_total(),
+            "leaders": len(self.leader_exposures()),
+        }
+
     @staticmethod
     def _row_to_position(row: sqlite3.Row) -> Position:
         return Position(

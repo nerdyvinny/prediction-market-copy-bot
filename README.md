@@ -5,8 +5,10 @@ wallets from Polymarket's public leaderboard, scores them, and mirrors their
 long-horizon trades — first in **simulation (paper mode)**, with live execution
 gated behind a compliance check.
 
-> Status: **early build.** Phase 0 scaffolding. See
-> `../.claude/plans/lets-make-a-plan-tidy-puffin.md` for the full plan.
+> Status: **paper-trading ready** (Phases 0–5 complete: data layer, ledger,
+> paper executor, auto leader selection + Strategy #4, backtester, monitoring).
+> Live execution (Phase 6) is intentionally gated. Strategies #1 (arb) and #2
+> (selective copy) are next.
 
 ## ⚠️ Compliance notice — read before going live
 
@@ -38,13 +40,30 @@ python -m venv .venv
 pip install -e ".[dev]"
 
 cp .env.example .env        # defaults are fine for paper mode
-pmbot paper                 # or: python -m pmbot.cli paper
+
+pmbot paper                 # run the copy loop in simulation (Ctrl+C to stop)
+pmbot paper --cycles 1      # single cycle then exit
+pmbot status                # portfolio summary + open paper positions
+pmbot backtest --lookback 180   # vet auto-selected leaders on resolved history
+pmbot backtest --leaders 0xabc...,0xdef...   # backtest specific wallets
+pmbot live                  # refuses — gated until Phase 6
 ```
+
+Tune which/how-many leaders to follow in `pmbot/config/leaders.yaml`
+(thresholds + `top_n`); tune sizing/horizon in `.env`.
 
 Run tests:
 
 ```bash
 pytest
+```
+
+Helper scripts (read-only, hit live public APIs):
+
+```bash
+python scripts/verify_data_layer.py    # data clients end-to-end
+python scripts/verify_engine.py        # selection + one paper cycle
+python scripts/run_backtest_demo.py    # backtest on resolved markets
 ```
 
 ## Layout

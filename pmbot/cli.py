@@ -37,6 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--lookback", type=int, default=180, help="days of history (default 180)")
     bt.add_argument("--limit", type=int, default=500, help="max trades per leader (default 500)")
 
+    sub.add_parser("status", help="show paper portfolio summary + open positions")
     sub.add_parser("live", help="GATED live trading (disabled by default)")
     return p
 
@@ -47,6 +48,10 @@ def _setup_logging(verbose: bool) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # HTTP client logs are very chatty at INFO; keep them quiet unless verbose.
+    if not verbose:
+        for noisy in ("httpx", "httpcore"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -86,6 +91,28 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             data.close()
             gamma.close()
+        return 0
+
+    if args.mode == "status":
+        from pmbot.portfolio.ledger import Ledger
+
+        led = Ledger(settings.db_path)
+        try:
+            s = led.summary()
+            print(f"=== pmbot status ({settings.db_path}) ===")
+            print(f"  fills          : {s['fills']}")
+            print(f"  open positions : {s['open_positions']}")
+            print(f"  deployed       : ${s['deployed_usd']:,.2f} / ${settings.bankroll_usd:,.0f} bankroll")
+            print(f"  realized P&L   : ${s['realized_pnl']:,.2f}")
+            print(f"  leaders followed: {s['leaders']}")
+            positions = led.get_positions()
+            if positions:
+                print("  positions:")
+                for p in sorted(positions, key=lambda x: -abs(x.shares * x.avg_price)):
+                    print(f"    {p.outcome:>4s} {p.shares:>11.2f} sh @ {p.avg_price:.4f} "
+                          f"(${p.shares*p.avg_price:,.2f})  mkt={p.market_id[:12]}…")
+        finally:
+            led.close()
         return 0
 
     if args.mode == "live":
