@@ -31,6 +31,7 @@ class LeaderTrade:
     usd_size: float      # notional in USDC
     timestamp: datetime
     tx_hash: str | None = None
+    event_slug: str | None = None  # coarse grouping for category/consistency scoring
 
     @property
     def uid(self) -> str:
