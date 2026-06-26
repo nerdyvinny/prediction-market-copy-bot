@@ -90,6 +90,28 @@ class GammaClient:
             return None
         return self._parse_market(rows[0])
 
+    def get_resolution(self, condition_id: str) -> tuple[bool, str | None]:
+        """Return (closed, winning_token_id) for a market.
+
+        winning_token_id is set only when the market is closed AND one outcome
+        settled decisively (price ~1.0). Used to settle leaders' open positions
+        when reconstructing their realized P&L.
+        """
+        data = self._get("/markets", {"condition_ids": condition_id, "limit": 1})
+        rows = data if isinstance(data, list) else data.get("data", [])
+        if not rows:
+            return (False, None)
+        m = rows[0]
+        closed = bool(m.get("closed", False))
+        prices = [_to_float_or_none(p) or 0.0 for p in _load_json_list(m.get("outcomePrices"))]
+        tokens = _load_json_list(m.get("clobTokenIds"))
+        winning: str | None = None
+        if closed and prices and tokens and len(prices) == len(tokens):
+            idx = max(range(len(prices)), key=lambda i: prices[i])
+            if prices[idx] >= 0.99:
+                winning = str(tokens[idx])
+        return (closed, winning)
+
     # -- parsing ---------------------------------------------------------
     @classmethod
     def _parse_market(cls, m: dict) -> Market:

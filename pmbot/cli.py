@@ -1,20 +1,20 @@
 """Command-line entrypoint.
 
 Usage:
-    pmbot paper       # run the copy-trading loop in simulation (no real orders)
-    pmbot backtest    # replay historical leader trades (Phase 4)
-    pmbot live        # GATED — refuses unless explicitly, lawfully enabled
-
-This is an early stub; the paper/backtest loops are wired up in later phases.
+    pmbot paper                 # run the copy-trading loop in simulation
+    pmbot paper --cycles 1      # run a single cycle and exit
+    pmbot backtest              # replay historical leader trades (Phase 4)
+    pmbot live                  # GATED — refuses unless explicitly, lawfully enabled
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 from pmbot import __version__
-from pmbot.config import RunMode, get_settings
+from pmbot.config import get_settings
 
 _COMPLIANCE = (
     "Live trading is OFF by default. Only enable it where you are lawfully able "
@@ -25,20 +25,38 @@ _COMPLIANCE = (
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pmbot", description="Prediction-market copy-trading bot.")
     p.add_argument("--version", action="version", version=f"pmbot {__version__}")
+    p.add_argument("-v", "--verbose", action="store_true", help="enable debug logging")
     sub = p.add_subparsers(dest="mode", required=True)
-    sub.add_parser("paper", help="run the loop in simulation (no real orders)")
+
+    paper = sub.add_parser("paper", help="run the loop in simulation (no real orders)")
+    paper.add_argument("--cycles", type=int, default=None, help="run N cycles then exit (default: forever)")
+
     sub.add_parser("backtest", help="replay historical leader trades")
     sub.add_parser("live", help="GATED live trading (disabled by default)")
     return p
 
 
+def _setup_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    _setup_logging(getattr(args, "verbose", False))
     settings = get_settings()
 
     if args.mode == "paper":
-        print(f"[pmbot {__version__}] paper mode - bankroll ${settings.bankroll_usd:.0f}")
-        print("Engine not wired yet (Phase 3). Scaffolding is in place.")
+        from pmbot.engine import Engine
+
+        engine = Engine(settings=settings)
+        try:
+            engine.run(max_cycles=args.cycles)
+        finally:
+            engine.close()
         return 0
 
     if args.mode == "backtest":

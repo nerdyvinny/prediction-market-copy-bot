@@ -51,6 +51,9 @@ class Settings(BaseSettings):
 
     # Strategy #4 horizon: only copy trades in markets resolving this far out.
     longterm_min_days_to_resolution: int = 7
+    # Skip copying trades priced at the extremes (near-certain = little edge).
+    copy_price_min: float = 0.05
+    copy_price_max: float = 0.95
 
     # --- LIVE ONLY (optional; leave unset for paper/backtest) ---
     pk: str | None = None
