@@ -59,9 +59,25 @@ def compute_wallet_stats(
     trades: list[LeaderTrade],
     resolver: Resolver,
     now: datetime | None = None,
+    *,
+    copyable_trades_only: bool = True,
+    price_min: float = 0.05,
+    price_max: float = 0.95,
 ) -> WalletStats:
     now = now or datetime.now(timezone.utc)
     trades = sorted(trades, key=lambda t: t.timestamp)
+
+    # Filter to copyable trades only (Strategy #4 criteria: BUY side + price band)
+    if copyable_trades_only:
+        from pmbot.models import Side
+        trades_filtered = []
+        for t in trades:
+            if t.side is not Side.BUY:
+                continue
+            if not (price_min <= t.price <= price_max):
+                continue
+            trades_filtered.append(t)
+        trades = trades_filtered
 
     pos: dict[str, tuple[float, float]] = {}      # token -> (shares, avg)
     token_market: dict[str, str] = {}
@@ -122,6 +138,10 @@ def compute_wallet_stats(
 
 def passes_filters(st: WalletStats, f: FilterConfig) -> bool:
     if st.n_trades < f.min_resolved_trades:
+        return False
+    # Require a real resolved track record (rejects high-volume wallets with no
+    # settled outcomes — they have $0 realized P&L and an unverifiable win rate).
+    if st.n_resolved_markets < f.min_resolved_markets:
         return False
     if st.realized_pnl < f.min_realized_pnl_usd:
         return False
@@ -218,7 +238,12 @@ class LeaderSelector:
             trades = [t for t in trades if t.timestamp >= cutoff]
             if not trades:
                 continue
-            stats.append(compute_wallet_stats(wallet, trades, self._resolver, now=now))
+            stats.append(compute_wallet_stats(
+                wallet, trades, self._resolver, now=now,
+                copyable_trades_only=cfg.filters.copyable_trades_only,
+                price_min=cfg.filters.copy_price_min,
+                price_max=cfg.filters.copy_price_max,
+            ))
 
         eligible = [s for s in stats if passes_filters(s, cfg.filters)]
         # Allowlisted wallets bypass filters entirely.

@@ -172,6 +172,7 @@ class Backtester:
                     continue
                 entries.append((t, market, winner))
 
+        log.info("backtest: gathered %d entries from %d leaders", len(entries), len(leaders))
         return self._simulate(entries)
 
     def run_on_markets(self, condition_ids: list[str], now: datetime | None = None) -> BacktestReport:
