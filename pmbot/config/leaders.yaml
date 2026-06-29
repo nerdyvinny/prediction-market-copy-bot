@@ -1,23 +1,43 @@
 # Automatic leader selection + scoring config.
 #
-# The bot pulls Polymarket's PUBLIC leaderboard, scores every candidate wallet,
+# The bot pulls Polymarket's PUBLIC leaderboard, scores every candidate wallet
+# based on their COPYABLE trades (Strategy #4: BUY-only, within price band),
 # and auto-follows the top_n that pass all `filters`. You don't list wallets
 # here (selection is automatic) — you set the BAR. Tune during paper testing.
 
 selection:
-  top_n: 2                     # start small; raise once paper P&L looks sane
-  rescore_interval_hours: 24   # re-rank the leaderboard on this cadence
+  top_n: 7                      # expanded from 2; backtest yielded ~7 clean leaders
+  rescore_interval_hours: 24    # re-rank the leaderboard on this cadence
 
 # A wallet must pass ALL of these to be eligible. These sanity caps exist to
 # reject lucky/low-sample wallets (the #1 killer of copy trading).
+# Strategy #4 filters: score leaders only on BUY trades in acceptable price band.
+#
+# Profile below = "RECOMMENDED" from the filter backtest (compare_filters.py):
+# strict (min_resolved_trades=100) found only 1 leader; this yields ~7 with real
+# resolved track records and positive copyable-trade P&L.
 filters:
   lookback_days: 90
-  min_resolved_trades: 100
-  min_win_rate: 0.55
-  min_realized_pnl_usd: 0
-  min_distinct_categories: 2          # consistency across market types
-  min_avg_market_liquidity_usd: 5000  # leader must trade liquid markets
-  max_position_concentration: 0.40    # largest single position <= 40% of book
+  min_resolved_trades: 5       # min copyable trades observed (sample size)
+  min_resolved_markets: 5      # min markets that ACTUALLY resolved (real track record)
+  min_win_rate: 0.50           # enforced once >=5 markets resolved
+  min_realized_pnl_usd: 0.01   # must be net-positive on copyable trades
+  min_distinct_categories: 1   # allow specialists
+  min_avg_market_liquidity_usd: 3000  # leader must trade reasonably liquid markets
+  max_position_concentration: 0.60    # largest single position <= 60% of book
+
+  # Strategy #4 copyable trades filtering
+  copyable_trades_only: true   # score on BUY-only, price-band trades
+  copy_price_min: 0.05         # skip near-0 longshots
+  copy_price_max: 0.95         # skip near-certain bets
+
+# STRICT VARIANT (only 1 leader on current data — use once Polymarket history
+# deepens). Swap into `filters:` above to tighten:
+#  min_resolved_trades: 100
+#  min_resolved_markets: 10
+#  min_win_rate: 0.55
+#  min_distinct_categories: 2
+#  max_position_concentration: 0.40
 
 # Ranking weights for eligible wallets (must sum to ~1.0). Higher total = followed first.
 weights:

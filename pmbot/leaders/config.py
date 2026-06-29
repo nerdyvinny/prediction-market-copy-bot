@@ -20,11 +20,16 @@ class SelectionConfig:
 class FilterConfig:
     lookback_days: int = 90
     min_resolved_trades: int = 100        # min number of observed trades (sample size)
+    min_resolved_markets: int = 5         # min markets that actually RESOLVED (real track record)
     min_win_rate: float = 0.55
     min_realized_pnl_usd: float = 0.0
     min_distinct_categories: int = 2      # breadth proxy (distinct event groups)
     min_avg_market_liquidity_usd: float = 5000.0
     max_position_concentration: float = 0.40
+    # Copyable trades filtering (Strategy #4): score leaders on BUY trades within price band
+    copyable_trades_only: bool = True
+    copy_price_min: float = 0.05
+    copy_price_max: float = 0.95
 
 
 @dataclass
@@ -56,11 +61,15 @@ def load_leader_config(path: str | Path | None = None) -> LeaderConfig:
         filters=FilterConfig(
             lookback_days=int(flt.get("lookback_days", 90)),
             min_resolved_trades=int(flt.get("min_resolved_trades", 100)),
+            min_resolved_markets=int(flt.get("min_resolved_markets", 5)),
             min_win_rate=float(flt.get("min_win_rate", 0.55)),
             min_realized_pnl_usd=float(flt.get("min_realized_pnl_usd", 0)),
             min_distinct_categories=int(flt.get("min_distinct_categories", 2)),
             min_avg_market_liquidity_usd=float(flt.get("min_avg_market_liquidity_usd", 5000)),
             max_position_concentration=float(flt.get("max_position_concentration", 0.40)),
+            copyable_trades_only=bool(flt.get("copyable_trades_only", True)),
+            copy_price_min=float(flt.get("copy_price_min", 0.05)),
+            copy_price_max=float(flt.get("copy_price_max", 0.95)),
         ),
         weights={**LeaderConfig().weights, **(raw.get("weights") or {})},
         allowlist=[str(w).lower() for w in (raw.get("allowlist") or [])],

@@ -47,7 +47,9 @@ def test_compute_wallet_stats_reconstructs_pnl_and_winrate():
     ]
     resolver = {"A": (True, "A1"), "B": (False, None)}.__getitem__
 
-    st = compute_wallet_stats("0xLEADER", trades, resolver, now=NOW)
+    # copyable_trades_only=False tests the raw P&L reconstruction (buys + sells).
+    st = compute_wallet_stats("0xLEADER", trades, resolver, now=NOW,
+                              copyable_trades_only=False)
 
     assert st.n_trades == 3
     assert st.n_markets == 2
@@ -57,6 +59,21 @@ def test_compute_wallet_stats_reconstructs_pnl_and_winrate():
     assert st.n_categories == 2
     assert st.concentration == pytest.approx(110.0 / 150.0)
     assert st.recency_days == pytest.approx(5.0, abs=0.01)
+
+
+def test_compute_wallet_stats_copyable_filter_drops_sells_and_extremes():
+    # Strategy #4 scoring: only BUY trades within the price band count.
+    trades = [
+        _t("A", "A1", Side.BUY, 0.40, 100, 10, "cat-a"),    # copyable
+        _t("B", "B1", Side.SELL, 0.50, 100, 5, "cat-b"),    # dropped: SELL
+        _t("C", "C1", Side.BUY, 0.99, 100, 4, "cat-c"),     # dropped: above band
+        _t("D", "D1", Side.BUY, 0.01, 100, 3, "cat-d"),     # dropped: below band
+    ]
+    resolver = {k: (False, None) for k in "ABCD"}.__getitem__
+    st = compute_wallet_stats("0xLEADER", trades, resolver, now=NOW,
+                              copyable_trades_only=True, price_min=0.05, price_max=0.95)
+    assert st.n_trades == 1          # only the single in-band BUY survives
+    assert st.n_categories == 1
 
 
 def test_compute_wallet_stats_settles_losing_outcome():
@@ -73,7 +90,8 @@ def test_passes_filters_enforces_sample_and_winrate():
     base = dict(wallet="w", n_trades=120, n_markets=20, n_resolved_markets=10,
                 realized_pnl=500.0, win_rate=0.6, n_categories=3,
                 recency_days=2.0, concentration=0.2)
-    f = FilterConfig()  # defaults: min_resolved_trades=100, min_win_rate=0.55, cats>=2
+    # defaults: min_resolved_trades=100, min_resolved_markets=5, min_win_rate=0.55, cats>=2
+    f = FilterConfig()
     assert passes_filters(WalletStats(**base), f) is True
 
     assert passes_filters(WalletStats(**{**base, "n_trades": 50}), f) is False        # sample
@@ -82,9 +100,17 @@ def test_passes_filters_enforces_sample_and_winrate():
     assert passes_filters(WalletStats(**{**base, "concentration": 0.9}), f) is False   # concentration
     assert passes_filters(WalletStats(**{**base, "win_rate": 0.4}), f) is False        # win rate
 
-    # win-rate NOT enforced when too few resolved markets
-    thin = WalletStats(**{**base, "n_resolved_markets": 3, "win_rate": 0.0})
-    assert passes_filters(thin, f) is True
+    # No resolved track record -> rejected by the min_resolved_markets floor,
+    # even with strong P&L (rejects high-volume wallets with zero settled outcomes).
+    no_record = WalletStats(**{**base, "n_resolved_markets": 0, "win_rate": 0.0})
+    assert passes_filters(no_record, f) is False
+
+    # win-rate is only enforced once >=5 markets resolve: a 4-resolved wallet with
+    # a low win rate clears win-rate, but a lower floor is needed to be eligible.
+    thin_cfg = FilterConfig(min_resolved_trades=1, min_resolved_markets=1,
+                            min_distinct_categories=1)
+    thin = WalletStats(**{**base, "n_resolved_markets": 4, "win_rate": 0.0})
+    assert passes_filters(thin, thin_cfg) is True
 
 
 def test_rank_wallets_orders_by_weighted_score():
