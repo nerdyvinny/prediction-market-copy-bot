@@ -12,13 +12,13 @@ _DEFAULT_PATH = Path(__file__).resolve().parent.parent / "config" / "leaders.yam
 
 @dataclass
 class SelectionConfig:
-    top_n: int = 2
+    top_n: int = 8
     rescore_interval_hours: float = 24.0
 
 
 @dataclass
 class FilterConfig:
-    lookback_days: int = 90
+    lookback_days: int = 45
     min_resolved_trades: int = 100        # min number of observed trades (sample size)
     min_win_rate: float = 0.55
     min_realized_pnl_usd: float = 0.0
@@ -50,11 +50,11 @@ def load_leader_config(path: str | Path | None = None) -> LeaderConfig:
     flt = raw.get("filters", {}) or {}
     return LeaderConfig(
         selection=SelectionConfig(
-            top_n=int(sel.get("top_n", 2)),
+            top_n=int(sel.get("top_n", 8)),
             rescore_interval_hours=float(sel.get("rescore_interval_hours", 24)),
         ),
         filters=FilterConfig(
-            lookback_days=int(flt.get("lookback_days", 90)),
+            lookback_days=int(flt.get("lookback_days", 45)),
             min_resolved_trades=int(flt.get("min_resolved_trades", 100)),
             min_win_rate=float(flt.get("min_win_rate", 0.55)),
             min_realized_pnl_usd=float(flt.get("min_realized_pnl_usd", 0)),

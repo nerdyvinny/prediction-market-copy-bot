@@ -17,6 +17,11 @@ class Side(str, Enum):
     SELL = "SELL"
 
 
+class Venue(str, Enum):
+    POLYMARKET = "polymarket"
+    KALSHI = "kalshi"
+
+
 @dataclass(frozen=True)
 class LeaderTrade:
     """A single trade observed from a leader wallet (public Data API)."""
@@ -61,12 +66,45 @@ class Quote:
     token_id: str
     bid: float | None = None
     ask: float | None = None
+    bid_size: float | None = None   # shares available at best bid
+    ask_size: float | None = None
 
     @property
     def mid(self) -> float | None:
         if self.bid is None or self.ask is None:
             return self.bid if self.ask is None else self.ask
         return (self.bid + self.ask) / 2.0
+
+
+@dataclass(frozen=True)
+class KalshiMarket:
+    """A binary market on Kalshi, including the top-of-book quotes that the
+    /markets endpoint embeds (saves a per-market orderbook call when scanning).
+
+    Prices are in dollars 0..1, same convention as Polymarket probability
+    prices. Sizes are in contracts (1 contract pays $1 if right).
+    """
+
+    ticker: str                     # e.g. "KXHIGHNY-26JUL04-T98"
+    event_ticker: str
+    title: str
+    subtitle: str = ""
+    status: str = ""                # "active" | "closed" | "settled" | ...
+    close_time: datetime | None = None
+    yes_bid: float | None = None
+    yes_ask: float | None = None
+    no_bid: float | None = None
+    no_ask: float | None = None
+    yes_ask_size: float | None = None   # contracts available at yes_ask
+    no_ask_size: float | None = None
+    volume_24h: float | None = None
+    liquidity_usd: float | None = None
+    rules_primary: str = ""
+    result: str = ""                # "yes" | "no" | "" when unsettled
+
+    @property
+    def is_open(self) -> bool:
+        return self.status == "active"
 
 
 @dataclass(frozen=True)
@@ -82,6 +120,10 @@ class Signal:
     reason: str
     source_leader: str | None = None
     source_uid: str | None = None  # leader-trade uid, for dedupe
+    venue: str = Venue.POLYMARKET.value
+    # Arbitrage legs that must execute together share a leg_group id; the
+    # engine executes such groups both-or-neither.
+    leg_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +137,7 @@ class Fill:
     timestamp: datetime
     mode: str               # "paper" | "live"
     slippage_bps: float = 0.0
+    fee_usd: float = 0.0    # exchange fee (Kalshi taker fee; Polymarket = 0)
 
 
 @dataclass
@@ -107,3 +150,4 @@ class Position:
     shares: float = 0.0
     avg_price: float = 0.0
     realized_pnl: float = 0.0
+    venue: str = Venue.POLYMARKET.value

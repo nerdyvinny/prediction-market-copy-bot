@@ -5,13 +5,13 @@
 # here (selection is automatic) — you set the BAR. Tune during paper testing.
 
 selection:
-  top_n: 2                     # start small; raise once paper P&L looks sane
+  top_n: 8                     # diversify across more leaders instead of just 2
   rescore_interval_hours: 24   # re-rank the leaderboard on this cadence
 
 # A wallet must pass ALL of these to be eligible. These sanity caps exist to
 # reject lucky/low-sample wallets (the #1 killer of copy trading).
 filters:
-  lookback_days: 90
+  lookback_days: 45            # recent form only (45d won the 2026-07 copy-P&L sweep)
   min_resolved_trades: 100
   min_win_rate: 0.55
   min_realized_pnl_usd: 0

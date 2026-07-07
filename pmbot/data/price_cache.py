@@ -82,14 +82,40 @@ class PriceCache:
         book = self._get("/book", {"token_id": token_id})
         bids = book.get("bids") or []
         asks = book.get("asks") or []
-        best_bid = max((_to_float(b.get("price")) for b in bids), default=None)
-        best_ask = min((_to_float(a.get("price")) for a in asks), default=None)
-        return Quote(token_id=token_id, bid=best_bid, ask=best_ask)
+        best_bid = _best_level(bids, want_max=True)
+        best_ask = _best_level(asks, want_max=False)
+        return Quote(
+            token_id=token_id,
+            bid=best_bid[0] if best_bid else None,
+            ask=best_ask[0] if best_ask else None,
+            bid_size=best_bid[1] if best_bid else None,
+            ask_size=best_ask[1] if best_ask else None,
+        )
 
     def get_price(self, token_id: str, side: str = "buy") -> float | None:
         """Single-sided price (CLOB midpoint-ish). `side` is 'buy' or 'sell'."""
         data = self._get("/price", {"token_id": token_id, "side": side})
         return _to_float(data.get("price")) if isinstance(data, dict) else None
+
+    def get_price_history(
+        self, token_id: str, *, start_ts: int, end_ts: int, fidelity_minutes: int = 60
+    ) -> list[tuple[int, float]]:
+        """Historical (unix_ts, price) points from the CLOB. Uncached.
+
+        `fidelity_minutes` is the sampling interval. Prices are last/mid-ish,
+        not asks — backtests should add a spread assumption on top.
+        """
+        data = self._get(
+            "/prices-history",
+            {"market": token_id, "startTs": start_ts, "endTs": end_ts,
+             "fidelity": fidelity_minutes},
+        )
+        out = []
+        for row in (data.get("history") or []) if isinstance(data, dict) else []:
+            t, p = row.get("t"), _to_float(row.get("p"))
+            if t is not None and p is not None:
+                out.append((int(t), p))
+        return out
 
 
 def _to_float(v: Any) -> float | None:
@@ -97,3 +123,15 @@ def _to_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _best_level(levels: list, *, want_max: bool) -> tuple[float, float] | None:
+    """Best (price, size) from a CLOB book side; None if side is empty."""
+    parsed = [
+        (p, _to_float(lvl.get("size")) or 0.0)
+        for lvl in levels
+        if (p := _to_float(lvl.get("price"))) is not None
+    ]
+    if not parsed:
+        return None
+    return max(parsed) if want_max else min(parsed)

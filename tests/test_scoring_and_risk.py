@@ -135,3 +135,87 @@ def test_risk_size_rejects_dust():
     rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
     assert rm.size(_sig(10)) is None      # 10 * 0.05 = 0.50 < 1.0
     led.close()
+
+
+def _sell_sig(size_usd, token="tok", market="mkt"):
+    return Signal(market_id=market, token_id=token, outcome="Yes", side=Side.SELL,
+                  target_price=0.50, size_usd=size_usd, reason="exit",
+                  source_leader="0xLEAD", source_uid=f"s-{size_usd}")
+
+
+def test_risk_size_sell_is_not_shrunk_by_copy_fraction():
+    led = Ledger(":memory:")
+    # Position worth $100 (200 sh @ 0.50).
+    buy = _sig(100)
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=100, shares=200,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    # A full-value exit request should pass through uncut, not *0.05.
+    sized = rm.size(_sell_sig(100))
+    assert sized is not None and sized.size_usd == pytest.approx(100.0)
+    led.close()
+
+
+def test_risk_size_sell_capped_at_position_value():
+    led = Ledger(":memory:")
+    buy = _sig(100)
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=100, shares=200,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    # Asking to sell more than we hold gets capped to what we actually hold.
+    sized = rm.size(_sell_sig(9999))
+    assert sized is not None and sized.size_usd == pytest.approx(100.0)
+    led.close()
+
+
+def test_risk_size_sell_with_no_position_rejected():
+    led = Ledger(":memory:")
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    assert rm.size(_sell_sig(100)) is None
+    led.close()
+
+
+def test_leader_weight_scales_buy_sizing_and_neutral_default():
+    led = Ledger(":memory:")
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    rm.set_leader_weights({"0xLEAD": 1.5, "0xhot": 99.0})
+    sized = rm.size(_sig(1000))                    # 1000 * 0.05 * 1.5 = 75 -> market cap 50
+    assert sized is not None and sized.size_usd == pytest.approx(50.0)
+    sized = rm.size(_sig(400))                     # 400 * 0.05 * 1.5 = 30
+    assert sized is not None and sized.size_usd == pytest.approx(30.0)
+    # Unknown leader -> neutral 1.0; clamp caps stored weights at 2.0.
+    sized = rm.size(_sig(400, leader="0xother"))
+    assert sized is not None and sized.size_usd == pytest.approx(20.0)
+    assert rm.leader_weights["0xhot"] == pytest.approx(2.0)
+    led.close()
+
+
+def test_compounding_redeploys_realized_profits():
+    led = Ledger(":memory:")
+    # Buy $400 (800 sh @0.50) then sell all @0.75: +$200 realized, 0 deployed.
+    buy = _sig(400, token="tokC", market="mC")
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=400, shares=800,
+                         timestamp=NOW, mode="paper"))
+    sell = Signal("mC", "tokC", "Yes", Side.SELL, 0.75, 600, "exit",
+                  source_leader=None, source_uid="s1")
+    led.record_fill(Fill(signal=sell, fill_price=0.75, size_usd=600, shares=800,
+                         timestamp=NOW, mode="paper"))
+
+    compounding = RiskManager(led, _settings(bankroll_usd=500.0, compound_profits=True))
+    fixed = RiskManager(led, _settings(bankroll_usd=500.0, compound_profits=False))
+    assert compounding._free_bankroll() == pytest.approx(700.0)   # 500 + 200
+    assert fixed._free_bankroll() == pytest.approx(500.0)
+    led.close()
+
+
+def test_compounding_shrinks_after_losses():
+    led = Ledger(":memory:")
+    buy = _sig(400, token="tokL", market="mL")
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=400, shares=800,
+                         timestamp=NOW, mode="paper"))
+    sell = Signal("mL", "tokL", "Yes", Side.SELL, 0.25, 200, "exit", source_uid="s2")
+    led.record_fill(Fill(signal=sell, fill_price=0.25, size_usd=200, shares=800,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(bankroll_usd=500.0, compound_profits=True))
+    assert rm._free_bankroll() == pytest.approx(300.0)            # 500 - 200
+    led.close()

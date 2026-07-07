@@ -172,7 +172,7 @@ class LeaderSelector:
         gamma: GammaClient,
         config: LeaderConfig | None = None,
         *,
-        max_candidates: int = 30,
+        max_candidates: int = 200,
         trades_limit: int = 300,
         top_markets: int = 8,
         per_market: int = 50,
@@ -205,7 +205,12 @@ class LeaderSelector:
         )
         candidates |= set(cfg.allowlist)
         candidates -= set(cfg.blocklist)
-        ordered = sorted(candidates)[: self.max_candidates]
+        # Score every harvested candidate — cutting the pool alphabetically
+        # before scoring would discard most wallets on a quality-blind basis.
+        # `max_candidates` only guards against a pathologically large harvest.
+        ordered = sorted(candidates)
+        if len(ordered) > self.max_candidates:
+            ordered = ordered[: self.max_candidates]
 
         cutoff = now - timedelta(days=cfg.filters.lookback_days)
         stats: list[WalletStats] = []

@@ -1,12 +1,13 @@
-"""Backtest harness for Strategy #4.
+"""Backtest harnesses for the copy strategies.
 
-Replays leaders' *historical* BUY entries in markets that have since resolved,
-as if we had copied them (our sizing + slippage, held to resolution). It reuses
-the live RiskManager and ledger accounting, and frees exposure as positions
-resolve in time order — so bankroll/caps behave like they would live.
+`Backtester` replays leaders' historical BUY entries held to resolution
+(Strategy #4 semantics). `ExactCopyBacktester` replays full leader tapes —
+BUYs *and* proportional SELLs — matching what `ExactCopyStrategy` does live.
+Both reuse the live RiskManager and ledger accounting, and free exposure as
+positions resolve in time order — so bankroll/caps behave like they would live.
 
 Only resolved markets with a decisive winner are included (that's the only way
-to know the true payout). Use this to vet auto-selected leaders before the
+to know the true payout). Use these to vet auto-selected leaders before the
 optional live window.
 """
 
@@ -19,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from pmbot.config import Settings, get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
-from pmbot.models import Fill, Market, Side, Signal
+from pmbot.models import Fill, LeaderTrade, Market, Side, Signal
 from pmbot.portfolio.ledger import Ledger
 from pmbot.risk import RiskManager
 
@@ -59,6 +60,8 @@ def max_drawdown(cumulative: list[float]) -> float:
 class BacktestReport:
     results: list[CopyResult]
     starting_bankroll: float
+    title: str = "Strategy #4 (long-term copy)"
+    note: str = "assumes hold-to-resolution; only resolved markets included."
 
     def metrics(self) -> dict:
         n = len(self.results)
@@ -91,7 +94,7 @@ class BacktestReport:
             return ("Backtest: 0 copyable resolved trades found.\n"
                     "Try a longer --lookback, a higher --limit, or different leaders.")
         lines = [
-            "=== Backtest: Strategy #4 (long-term copy) ===",
+            f"=== Backtest: {self.title} ===",
             f"  copied trades : {m['n_trades']}",
             f"  invested      : ${m['invested']:,.2f}",
             f"  net P&L       : ${m['net_pnl']:,.2f}",
@@ -103,7 +106,7 @@ class BacktestReport:
         ]
         for leader, (cnt, pnl) in sorted(m["by_leader"].items(), key=lambda x: -x[1][1]):
             lines.append(f"    {leader[:12]}…  {cnt:>3d} trades  net ${pnl:,.2f}")
-        lines.append("\nNote: assumes hold-to-resolution; only resolved markets included.")
+        lines.append(f"\nNote: {self.note}")
         return "\n".join(lines)
 
 
@@ -246,3 +249,261 @@ class Backtester:
 
         ledger.close()
         return BacktestReport(results=results, starting_bankroll=self.s.bankroll_usd)
+
+
+def vet_weights(rois: dict[str, float]) -> dict[str, float]:
+    """Turn per-leader copy-backtest ROIs into sizing multipliers.
+
+    Mean-normalized (so the pack's total allocation stays roughly flat) —
+    a leader at 2x the pack's average copy-ROI gets ~2x the base fraction.
+    Clamping to the RiskManager's [0.5, 2.0] band happens downstream in
+    `set_leader_weights`. Leaders absent from `rois` default to 1.0 there.
+    """
+    positive = {w: r for w, r in rois.items() if r > 0}
+    if not positive:
+        return {}
+    mean = sum(positive.values()) / len(positive)
+    if mean <= 0:
+        return {}
+    return {w: r / mean for w, r in positive.items()}
+
+
+@dataclass
+class _Tranche:
+    """Our copied holding attributed to one (leader, token)."""
+
+    market: Market
+    outcome: str
+    entry_ts: datetime
+    shares: float = 0.0
+    cost: float = 0.0          # total USD spent on remaining + sold shares
+    bought: float = 0.0        # lifetime shares bought (for reporting)
+    realized: float = 0.0
+
+    @property
+    def avg(self) -> float:
+        return self.cost / self.bought if self.bought else 0.0
+
+
+class ExactCopyBacktester:
+    """Replay leader tapes with ExactCopyStrategy semantics.
+
+    Mirrors BUYs (risk-sized) and mirrors SELLs proportionally to the fraction
+    of the leader's position they exited, at the leader's price ± slippage.
+    Whatever is still held when the market resolves settles at the payout.
+
+    `fetch_tapes` does the network work once; `simulate` is offline apart from
+    memoized market-resolution lookups, so parameter sweeps over the same
+    tapes are cheap.
+    """
+
+    def __init__(
+        self,
+        data: PolymarketDataClient,
+        gamma: GammaClient,
+        settings: Settings | None = None,
+        *,
+        slippage_bps: float | None = None,
+        trades_limit: int = 1000,
+    ):
+        s = settings or get_settings()
+        self.s = s
+        self.data = data
+        self.gamma = gamma
+        self.slip = (s.slippage_bps if slippage_bps is None else slippage_bps) / 10_000
+        self.trades_limit = trades_limit
+        self._mkt_cache: dict[str, tuple[Market | None, str | None]] = {}
+
+    def _market(self, condition_id: str) -> tuple[Market | None, str | None]:
+        if condition_id not in self._mkt_cache:
+            try:
+                self._mkt_cache[condition_id] = self.gamma.get_market_with_resolution(condition_id)
+            except Exception:
+                self._mkt_cache[condition_id] = (None, None)
+        return self._mkt_cache[condition_id]
+
+    def fetch_tapes(self, leaders: list[str]) -> dict[str, list[LeaderTrade]]:
+        """Fetch each leader's trade tape (paginated, newest-first from API)."""
+        tapes: dict[str, list[LeaderTrade]] = {}
+        chunk = 500
+        for leader in leaders:
+            trades: list[LeaderTrade] = []
+            seen: set[str] = set()
+            offset = 0
+            while len(trades) < self.trades_limit:
+                want = min(chunk, self.trades_limit - len(trades))
+                try:
+                    page = self.data.get_trades(user=leader, limit=want, offset=offset)
+                except Exception as e:
+                    log.debug("backtest: tape fetch failed for %s: %s", leader[:10], e)
+                    break
+                fresh = [t for t in page if t.uid not in seen]
+                seen.update(t.uid for t in fresh)
+                trades.extend(fresh)
+                if len(page) < want:
+                    break
+                offset += len(page)
+            tapes[leader.lower()] = trades
+        return tapes
+
+    def run(
+        self,
+        leaders: list[str],
+        *,
+        lookback_days: int = 60,
+        min_leader_notional: float = 0.0,
+        price_min: float | None = None,
+        price_max: float | None = None,
+        now: datetime | None = None,
+    ) -> BacktestReport:
+        tapes = self.fetch_tapes(leaders)
+        return self.simulate(
+            tapes, lookback_days=lookback_days, min_leader_notional=min_leader_notional,
+            price_min=price_min, price_max=price_max, now=now,
+        )
+
+    def simulate(
+        self,
+        tapes: dict[str, list[LeaderTrade]],
+        *,
+        lookback_days: int = 60,
+        min_leader_notional: float = 0.0,
+        price_min: float | None = None,
+        price_max: float | None = None,
+        now: datetime | None = None,
+        settings: Settings | None = None,
+        slippage_bps: float | None = None,
+        leader_weights: dict[str, float] | None = None,
+        min_hours_to_resolution: float = 0.0,
+    ) -> BacktestReport:
+        """Simulate the tapes over the window [now - lookback_days, now].
+
+        `now` also upper-bounds the tape, so walk-forward splits work: tune on
+        an earlier window (pass a past `now`), validate on the recent one.
+        `settings` overrides sizing knobs (copy_fraction, caps, bankroll) per
+        run so allocation sweeps don't need a backtester per combination.
+        `leader_weights` are per-leader copy_fraction multipliers (see
+        `vet_weights`); `min_hours_to_resolution` skips entries placed within
+        that many hours of the market's close (in-game/near-resolution trades
+        are the ones our live lag copies worst).
+        """
+        s = settings or self.s
+        slip = self.slip if slippage_bps is None else slippage_bps / 10_000
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=lookback_days)
+        p_min = s.copy_price_min if price_min is None else price_min
+        p_max = s.copy_price_max if price_max is None else price_max
+
+        all_trades = [t for tape in tapes.values() for t in tape if cutoff <= t.timestamp <= now]
+        all_trades.sort(key=lambda t: t.timestamp)
+
+        ledger = Ledger(":memory:")
+        risk = RiskManager(ledger, s)
+        if leader_weights:
+            risk.set_leader_weights(leader_weights)
+        leader_pos: dict[tuple[str, str], float] = {}   # leader's own share count
+        tranches: dict[tuple[str, str], _Tranche] = {}  # our copied holdings
+        results: list[CopyResult] = []
+        # heap: (resolve_ts, seq, key, winner) — settle leftovers at payout.
+        pending: list[tuple] = []
+        settled: set[tuple[str, str]] = set()
+        seq = 0
+
+        def finish(key: tuple[str, str], rts: datetime, winner: str) -> None:
+            if key in settled:
+                return
+            settled.add(key)
+            tr = tranches[key]
+            leader, token = key
+            if tr.shares > 1e-9:
+                payout = 1.0 if token == winner else 0.0
+                tr.realized += (payout - tr.avg) * tr.shares
+                ledger.record_fill(Fill(
+                    signal=Signal(tr.market.market_id, token, tr.outcome, Side.SELL,
+                                  payout, payout * tr.shares, "backtest-settle",
+                                  source_leader=leader),
+                    fill_price=payout, size_usd=payout * tr.shares,
+                    shares=tr.shares, timestamp=rts, mode="backtest",
+                ))
+                tr.shares = 0.0
+            results.append(CopyResult(
+                leader=leader, market_id=tr.market.market_id, outcome=tr.outcome,
+                entry_ts=tr.entry_ts, resolve_ts=rts, entry_price=tr.avg,
+                size_usd=tr.cost, shares=tr.bought, won=tr.realized > 0,
+                pnl=tr.realized,
+            ))
+
+        def settle_until(ts: datetime) -> None:
+            while pending and pending[0][0] <= ts:
+                rts, _, key, winner = heapq.heappop(pending)
+                finish(key, rts, winner)
+
+        for t in all_trades:
+            if not t.token_id or not t.market_id:
+                continue
+            settle_until(t.timestamp)
+            lkey = (t.leader.lower(), t.token_id)
+            prior = leader_pos.get(lkey, 0.0)
+            delta = t.shares if t.side is Side.BUY else -t.shares
+            leader_pos[lkey] = max(0.0, prior + delta)
+
+            if t.side is Side.BUY:
+                if not (p_min <= t.price <= p_max):
+                    continue
+                if t.usd_size < min_leader_notional:
+                    continue
+                market, winner = self._market(t.market_id)
+                if market is None or not market.closed or winner is None or market.end_date is None:
+                    continue                       # only resolved markets have a known payout
+                hours_left = (market.end_date - t.timestamp).total_seconds() / 3600
+                if hours_left < min_hours_to_resolution:
+                    continue
+                sized = risk.size(Signal(
+                    t.market_id, t.token_id, t.outcome, Side.BUY, t.price,
+                    t.usd_size, "backtest", source_leader=t.leader.lower(), source_uid=t.uid,
+                ))
+                if sized is None:
+                    continue
+                entry = min(max(t.price * (1 + slip), _MIN_PRICE), _MAX_PRICE)
+                shares = sized.size_usd / entry
+                ledger.record_fill(Fill(
+                    signal=sized, fill_price=entry, size_usd=sized.size_usd,
+                    shares=shares, timestamp=t.timestamp, mode="backtest",
+                ))
+                tr = tranches.get(lkey)
+                if tr is None or lkey in settled:
+                    settled.discard(lkey)
+                    tr = _Tranche(market=market, outcome=t.outcome, entry_ts=t.timestamp)
+                    tranches[lkey] = tr
+                    heapq.heappush(pending, (market.end_date, seq, lkey, winner))
+                    seq += 1
+                tr.shares += shares
+                tr.bought += shares
+                tr.cost += sized.size_usd
+            else:
+                tr = tranches.get(lkey)
+                if tr is None or lkey in settled or tr.shares <= 1e-9:
+                    continue                       # nothing of ours to mirror-sell
+                fraction = 1.0 if prior <= 1e-9 else min(1.0, t.shares / prior)
+                sell_shares = tr.shares * fraction
+                exit_price = min(max(t.price * (1 - slip), _MIN_PRICE), _MAX_PRICE)
+                tr.realized += (exit_price - tr.avg) * sell_shares
+                tr.shares -= sell_shares
+                ledger.record_fill(Fill(
+                    signal=Signal(t.market_id, t.token_id, t.outcome, Side.SELL,
+                                  exit_price, exit_price * sell_shares, "backtest-exit",
+                                  source_leader=t.leader.lower(), source_uid=t.uid),
+                    fill_price=exit_price, size_usd=exit_price * sell_shares,
+                    shares=sell_shares, timestamp=t.timestamp, mode="backtest",
+                ))
+
+        while pending:
+            rts, _, key, winner = heapq.heappop(pending)
+            finish(key, rts, winner)
+
+        ledger.close()
+        return BacktestReport(
+            results=results, starting_bankroll=s.bankroll_usd,
+            title="exact copy (entries + mirrored exits)",
+            note="mirrors leader exits; leftovers settle at resolution; resolved markets only.",
+        )

@@ -32,15 +32,27 @@ class Settings(BaseSettings):
     data_api_base: str = "https://data-api.polymarket.com"
     gamma_api_base: str = "https://gamma-api.polymarket.com"
     clob_api_base: str = "https://clob.polymarket.com"
+    kalshi_api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
 
-    # Poll loop.
-    poll_interval_seconds: float = 15.0
+    # Poll loop. Every second of lag is edge lost to the drift guard, so poll
+    # as fast as is polite to the public Data API (8 leader queries/cycle).
+    poll_interval_seconds: float = 10.0
+    # How often to check open positions for resolved markets (realize P&L).
+    settle_interval_hours: float = 6.0
 
-    # Capital & sizing.
+    # Capital & sizing. Walk-forward validated 2026-07 (tuned on the 45d
+    # window ending 45d ago, validated on the most recent 45d): 0.10/100/400
+    # netted ~2.9x the old 0.05/50/150 baseline out-of-sample ($1,471 vs $505
+    # on a $500 bankroll), at a deeper max drawdown ($300 vs $130).
     bankroll_usd: float = 500.0
-    copy_fraction: float = 0.05            # replicate this fraction of leader size
-    max_per_market_usd: float = 50.0       # hard cap per market
-    max_per_leader_usd: float = 150.0      # hard cap of exposure per leader
+    copy_fraction: float = 0.10            # replicate this fraction of leader size
+    max_per_market_usd: float = 100.0      # hard cap per market
+    max_per_leader_usd: float = 400.0      # hard cap of exposure per leader
+    # Redeploy realized profits (and shrink after losses): free bankroll is
+    # bankroll + realized P&L - deployed, instead of a fixed starting amount.
+    # Off by default: in validation the extra compounding-funded trades were
+    # net losers ($1,333 vs $1,471); flip on for long horizons if desired.
+    compound_profits: bool = False
     min_market_liquidity_usd: float = 5000.0  # skip thin markets
 
     # Paper fill model.
@@ -52,8 +64,64 @@ class Settings(BaseSettings):
     # Strategy #4 horizon: only copy trades in markets resolving this far out.
     longterm_min_days_to_resolution: int = 7
     # Skip copying trades priced at the extremes (near-certain = little edge).
-    copy_price_min: float = 0.05
-    copy_price_max: float = 0.95
+    # Swept 2026-07 over 8 vetted leaders' tapes: 0.15-0.85 beat 0.05-0.95 and
+    # 0.10-0.90 at every lookback once paired with the $500 notional floor.
+    copy_price_min: float = 0.15
+    copy_price_max: float = 0.85
+    # Strategy #5 (exact copy): skip mirroring a trade if the current quote has
+    # already drifted this many probability points from the leader's own fill
+    # price — the edge that made it worth copying has likely decayed. This also
+    # bounds how far a live fill can deviate from what the backtests assume
+    # (they fill at the leader's price ± slippage), so keep it tight.
+    copy_max_price_drift: float = 0.03
+    # Only copy leader BUYs at or above this notional: a leader's small probes
+    # carry little conviction and our slice of them dies to slippage/dust caps.
+    # SELLs are always mirrored (reducing risk should never be filtered).
+    # Swept 2026-07: $500 floor roughly doubled ROI vs $0/$100 at every
+    # lookback (12-17% vs 1-8%) — conviction filtering is the biggest lever.
+    copy_min_leader_notional_usd: float = 500.0
+    # After scoring, vet each would-be leader by backtesting an exact copy of
+    # their recent tape; drop leaders whose copy P&L comes out below the floor.
+    # (Scoring measures THEIR profit; vetting measures OURS, after our sizing,
+    # caps and slippage — a leader can be profitable yet not copyable.)
+    copy_vet_leaders: bool = True
+    copy_vet_lookback_days: int = 45
+    copy_vet_min_pnl_usd: float = 0.0
+    # EXPERIMENTAL: scale each leader's copy_fraction by their vet-backtest
+    # ROI relative to the pack (clamped 0.5x-2x). Off by default: Data-API
+    # tape depth couldn't reach the tune window for heavy traders, so this
+    # never got a true out-of-sample validation — unproven, not disproven.
+    copy_weight_by_vet: bool = False
+    # Skip entries placed within this many hours of market close (0 = off).
+    # Validated 2026-07 on the current leader set: 6h HALVES max drawdown
+    # ($278->$114) and lifts ROI (24.3->27.0%) but drops ~37% of net P&L
+    # ($491->$308) by skipping late trades. Off for max profit; set 6 for a
+    # calmer equity curve.
+    copy_min_hours_to_resolution: float = 0.0
+
+    # --- Strategy #1: cross-platform arbitrage (Polymarket vs Kalshi) ---
+    arb_enabled: bool = False
+    # Minimum net edge per $1 contract pair AFTER Kalshi fees + slippage buffer.
+    arb_min_edge: float = 0.015
+    # Extra safety haircut per pair to absorb fill slippage on both legs.
+    arb_slippage_buffer: float = 0.005
+    arb_max_per_trade_usd: float = 50.0
+    # Matching: candidates below this title similarity are never suggested.
+    arb_match_min_similarity: float = 0.60
+    # Candidate pair end dates must agree within this window. Venues stamp
+    # dates differently (PM daily markets: start-of-day UTC; Kalshi: actual
+    # event close), so same-day pairs can differ by ~23h. 30h keeps same-day
+    # pairs while excluding adjacent days of daily-recurring series.
+    arb_match_max_close_diff_hours: float = 30.0
+    # Path to the confirmed-pairs file (only confirmed pairs are traded).
+    arb_pairs_path: str = "pmbot/config/arb_pairs.yaml"
+    # Kalshi series to scan for matching (comma-separated). The generic
+    # market feeds are flooded with combo/parlay markets, so matching works
+    # series-by-series over categories that overlap Polymarket.
+    kalshi_series: str = (
+        "KXWCGAME,KXWCADVANCE,KXMLBGAME,KXWTAMATCH,KXATPMATCH,"
+        "KXBTCD,KXETHD,KXBTC,KXETH,KXNBA,KXNHL,KXUFCFIGHT,KXHIGHNY"
+    )
 
     # --- LIVE ONLY (optional; leave unset for paper/backtest) ---
     pk: str | None = None

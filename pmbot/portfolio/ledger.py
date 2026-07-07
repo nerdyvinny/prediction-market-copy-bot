@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS fills (
     slippage_bps  REAL    NOT NULL DEFAULT 0,
     reason        TEXT,
     source_leader TEXT,
-    source_uid    TEXT
+    source_uid    TEXT,
+    venue         TEXT    NOT NULL DEFAULT 'polymarket',
+    fee_usd       REAL    NOT NULL DEFAULT 0,
+    leg_group     TEXT
 );
 CREATE TABLE IF NOT EXISTS positions (
     token_id      TEXT PRIMARY KEY,
@@ -35,11 +38,20 @@ CREATE TABLE IF NOT EXISTS positions (
     outcome       TEXT NOT NULL,
     shares        REAL NOT NULL DEFAULT 0,
     avg_price     REAL NOT NULL DEFAULT 0,
-    realized_pnl  REAL NOT NULL DEFAULT 0
+    realized_pnl  REAL NOT NULL DEFAULT 0,
+    venue         TEXT NOT NULL DEFAULT 'polymarket'
 );
 CREATE INDEX IF NOT EXISTS idx_fills_source_uid ON fills(source_uid);
 CREATE INDEX IF NOT EXISTS idx_fills_leader ON fills(source_leader);
 """
+
+# Columns added after the v1 schema; applied to pre-existing DBs on open.
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("fills", "venue", "ALTER TABLE fills ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'"),
+    ("fills", "fee_usd", "ALTER TABLE fills ADD COLUMN fee_usd REAL NOT NULL DEFAULT 0"),
+    ("fills", "leg_group", "ALTER TABLE fills ADD COLUMN leg_group TEXT"),
+    ("positions", "venue", "ALTER TABLE positions ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'"),
+]
 
 
 @dataclass
@@ -83,7 +95,14 @@ class Ledger:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        for table, column, ddl in _MIGRATIONS:
+            cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self.conn.execute(ddl)
 
     def close(self) -> None:
         self.conn.close()
@@ -101,12 +120,14 @@ class Ledger:
         cur.execute(
             """INSERT INTO fills (ts, mode, market_id, token_id, outcome, side,
                                   fill_price, size_usd, shares, slippage_bps,
-                                  reason, source_leader, source_uid)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  reason, source_leader, source_uid,
+                                  venue, fee_usd, leg_group)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 fill.timestamp.isoformat(), fill.mode, s.market_id, s.token_id,
                 s.outcome, s.side.value, fill.fill_price, fill.size_usd, fill.shares,
                 fill.slippage_bps, s.reason, s.source_leader, s.source_uid,
+                s.venue, fill.fee_usd, s.leg_group,
             ),
         )
         row = cur.execute(
@@ -120,13 +141,13 @@ class Ledger:
         eff = apply_fill(shares, avg, s.side, fill.shares, fill.fill_price)
         realized += eff.realized_delta
         cur.execute(
-            """INSERT INTO positions (token_id, market_id, outcome, shares, avg_price, realized_pnl)
-               VALUES (?,?,?,?,?,?)
+            """INSERT INTO positions (token_id, market_id, outcome, shares, avg_price, realized_pnl, venue)
+               VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(token_id) DO UPDATE SET
                    shares=excluded.shares,
                    avg_price=excluded.avg_price,
                    realized_pnl=excluded.realized_pnl""",
-            (s.token_id, s.market_id, s.outcome, eff.new_shares, eff.new_avg, realized),
+            (s.token_id, s.market_id, s.outcome, eff.new_shares, eff.new_avg, realized, s.venue),
         )
         self.conn.commit()
 
@@ -191,13 +212,23 @@ class Ledger:
         ).fetchall()
         return {r["leader"]: float(r["net"] or 0.0) for r in rows}
 
+    def fees_total(self) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(fee_usd), 0) AS f FROM fills"
+        ).fetchone()
+        return float(row["f"] or 0.0)
+
     def summary(self) -> dict:
         positions = self.get_positions()
+        fees = self.fees_total()
+        realized = self.realized_pnl_total()
         return {
             "fills": self.fill_count(),
             "open_positions": len(positions),
             "deployed_usd": sum(abs(p.shares * p.avg_price) for p in positions),
-            "realized_pnl": self.realized_pnl_total(),
+            "realized_pnl": realized,
+            "fees_usd": fees,
+            "net_pnl": realized - fees,
             "leaders": len(self.leader_exposures()),
         }
 
@@ -210,4 +241,5 @@ class Ledger:
             shares=row["shares"],
             avg_price=row["avg_price"],
             realized_pnl=row["realized_pnl"],
+            venue=row["venue"] if "venue" in row.keys() else "polymarket",
         )
