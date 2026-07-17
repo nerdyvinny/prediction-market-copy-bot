@@ -182,6 +182,7 @@ class ExactCopyStrategy(Strategy):
                         side=Side.SELL,
                         target_price=t.price,
                         size_usd=our_value * sell_fraction,
+                        size_shares=abs(our_position.shares) * sell_fraction,
                         reason=f"copy {leader[:8]}… sell {sell_fraction*100:.0f}%",
                         source_leader=leader,
                         source_uid=t.uid,

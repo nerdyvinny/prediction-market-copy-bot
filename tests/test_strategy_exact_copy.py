@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from pmbot.models import Fill, LeaderTrade, Market, Side, Signal
 from pmbot.portfolio.ledger import Ledger
 from pmbot.strategy import ExactCopyStrategy
@@ -108,6 +110,7 @@ def test_sell_mirrored_proportionally():
     assert s.side is Side.SELL
     # Leader sold 40% of their position -> mirror 40% of our $5 position.
     assert s.size_usd == 5 * 0.4
+    assert s.size_shares == pytest.approx(10 * 0.4)  # 40% of our 10 shares
     led.close()
 
 
@@ -123,6 +126,7 @@ def test_sell_with_unknown_prior_leader_position_defaults_to_full_exit():
     assert len(sigs) == 1
     assert sigs[0].side is Side.SELL
     assert sigs[0].size_usd == 5.0   # full exit of our $5 position
+    assert sigs[0].size_shares == pytest.approx(10.0)  # all our shares, in shares
     led.close()
 
 

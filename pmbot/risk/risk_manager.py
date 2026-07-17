@@ -65,11 +65,15 @@ class RiskManager:
         """
         if signal.side is Side.SELL:
             position = self.ledger.get_position(signal.token_id)
+            held_shares = abs(position.shares) if position else 0.0
             held_value = abs(position.shares * position.avg_price) if position else 0.0
+            if held_shares <= 0:
+                return None
             desired = min(signal.size_usd, held_value)
             if desired < self.min_ticket_usd:
                 return None
-            return replace(signal, size_usd=round(desired, 2))
+            shares = held_shares if signal.size_shares is None else min(signal.size_shares, held_shares)
+            return replace(signal, size_usd=round(desired, 2), size_shares=shares)
 
         fraction = self.copy_fraction
         if signal.source_leader:

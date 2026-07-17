@@ -124,8 +124,52 @@ def test_paper_executor_sell_fills_at_bid_minus_slippage():
     led = Ledger(":memory:")
     cache = FakeCache(Quote(token_id="tokA", bid=0.48, ask=0.52))
     ex = PaperExecutor(led, price_cache=cache, slippage_bps=100)
+    _fill(led, _sig(side=Side.BUY, size_usd=50.0, uid="entry"), price=0.50)  # 100 sh
     fill = ex.execute(_sig(side=Side.SELL, size_usd=48.0))
     assert fill.fill_price == pytest.approx(0.48 * 0.99)
+    led.close()
+
+
+def test_paper_executor_sell_without_position_is_skipped():
+    led = Ledger(":memory:")
+    cache = FakeCache(Quote(token_id="tokA", bid=0.48, ask=0.52))
+    ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
+    assert ex.execute(_sig(side=Side.SELL, size_usd=48.0)) is None
+    led.close()
+
+
+def test_paper_executor_sell_cannot_flip_position_short():
+    # Regression: we held 35.5 sh @ 0.845 ($30 at cost); the market collapsed
+    # to ~0.001 and a copied "sell 100%" sized at $30 was converted to
+    # 30,181 shares at the collapsed bid, flipping us −30k shares short.
+    # SELLs must fill in shares, hard-capped at what we hold.
+    led = Ledger(":memory:")
+    _fill(led, _sig(side=Side.BUY, size_usd=30.0, uid="entry"), price=0.845)  # ~35.5 sh
+    held = led.get_position("tokA").shares
+    cache = FakeCache(Quote(token_id="tokA", bid=0.001, ask=0.002))
+    ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
+
+    fill = ex.execute(_sig(side=Side.SELL, size_usd=30.0, uid="exit"))
+    assert fill is not None
+    assert fill.shares == pytest.approx(held)
+    assert fill.size_usd == pytest.approx(held * 0.001)
+    pos = led.get_position("tokA")
+    assert pos.shares == pytest.approx(0.0, abs=1e-9)
+    led.close()
+
+
+def test_paper_executor_sell_honors_size_shares():
+    from dataclasses import replace as dc_replace
+    led = Ledger(":memory:")
+    _fill(led, _sig(side=Side.BUY, size_usd=50.0, uid="entry"), price=0.50)  # 100 sh
+    cache = FakeCache(Quote(token_id="tokA", bid=0.40, ask=0.42))
+    ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
+
+    sig = dc_replace(_sig(side=Side.SELL, size_usd=20.0, uid="exit"), size_shares=40.0)
+    fill = ex.execute(sig)
+    assert fill.shares == pytest.approx(40.0)
+    assert fill.size_usd == pytest.approx(40.0 * 0.40)
+    assert led.get_position("tokA").shares == pytest.approx(60.0)
     led.close()
 
 

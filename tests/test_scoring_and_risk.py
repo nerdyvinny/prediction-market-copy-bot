@@ -168,6 +168,21 @@ def test_risk_size_sell_capped_at_position_value():
     led.close()
 
 
+def test_risk_size_sell_clamps_size_shares_to_held():
+    led = Ledger(":memory:")
+    buy = _sig(100)
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=100, shares=200,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    from dataclasses import replace as dc_replace
+    sized = rm.size(dc_replace(_sell_sig(100), size_shares=5000.0))
+    assert sized is not None and sized.size_shares == pytest.approx(200.0)
+    # A USD-only sell (no share intent) defaults to everything we hold.
+    sized_full = rm.size(_sell_sig(100))
+    assert sized_full.size_shares == pytest.approx(200.0)
+    led.close()
+
+
 def test_risk_size_sell_with_no_position_rejected():
     led = Ledger(":memory:")
     rm = RiskManager(led, _settings(), min_ticket_usd=1.0)

@@ -74,7 +74,22 @@ class PaperExecutor(TradeExecutor):
         price = self._resolve_fill_price(signal)
         if price is None:
             return None
-        shares = signal.size_usd / price
+        if signal.side is Side.SELL:
+            # Fill SELLs in shares, never size_usd / price: size_usd is valued
+            # at our avg cost, so converting it at a collapsed market price
+            # would sell orders of magnitude more shares than we hold and flip
+            # the position into a fictitious short. Hard-cap at held shares.
+            pos = self.ledger.get_position(signal.token_id)
+            held = abs(pos.shares) if pos else 0.0
+            if held <= 1e-9:
+                log.warning("paper: sell of %s with no position; skipping", signal.token_id[:10])
+                return None
+            desired = signal.size_usd / price if signal.size_shares is None else signal.size_shares
+            shares = min(desired, held)
+            size_usd = shares * price
+        else:
+            shares = signal.size_usd / price
+            size_usd = signal.size_usd
         fee = 0.0
         if signal.venue == Venue.KALSHI.value:
             # Kalshi taker fee on the order (contracts == shares).
@@ -82,7 +97,7 @@ class PaperExecutor(TradeExecutor):
         return Fill(
             signal=signal,
             fill_price=price,
-            size_usd=signal.size_usd,
+            size_usd=size_usd,
             shares=shares,
             timestamp=datetime.now(timezone.utc),
             mode=self.mode,

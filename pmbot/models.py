@@ -118,6 +118,11 @@ class Signal:
     target_price: float
     size_usd: float
     reason: str
+    # SELL intent in shares. size_usd is an estimate (valued at our avg cost);
+    # the executor must fill this many shares, not size_usd / fill_price —
+    # converting dollars at a collapsed price would sell far more shares than
+    # we hold and flip the position into a fictitious short.
+    size_shares: float | None = None
     source_leader: str | None = None
     source_uid: str | None = None  # leader-trade uid, for dedupe
     venue: str = Venue.POLYMARKET.value
