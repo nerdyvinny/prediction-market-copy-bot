@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from pmbot.models import Fill, Position, Side
 
@@ -40,6 +41,11 @@ CREATE TABLE IF NOT EXISTS positions (
     avg_price     REAL NOT NULL DEFAULT 0,
     realized_pnl  REAL NOT NULL DEFAULT 0,
     venue         TEXT NOT NULL DEFAULT 'polymarket'
+);
+CREATE TABLE IF NOT EXISTS followed_leaders (
+    wallet        TEXT PRIMARY KEY,
+    score         REAL NOT NULL DEFAULT 0,
+    followed_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fills_source_uid ON fills(source_uid);
 CREATE INDEX IF NOT EXISTS idx_fills_leader ON fills(source_leader);
@@ -228,6 +234,26 @@ class Ledger:
         for r in rows:
             out[r["leader"]] = out.get(r["leader"], 0.0) + max(0.0, float(r["net"] or 0.0))
         return out
+
+    def set_followed_leaders(self, wallets: dict[str, float]) -> None:
+        """Replace the persisted follow list (wallet -> score).
+
+        The engine writes this after every rescore so a restart remembers who
+        it was following even before the first copied trade reaches `fills` —
+        full addresses live nowhere else (logs truncate them)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute("DELETE FROM followed_leaders")
+            self.conn.executemany(
+                "INSERT INTO followed_leaders (wallet, score, followed_at) VALUES (?,?,?)",
+                [(w, s, now) for w, s in wallets.items()],
+            )
+
+    def followed_leaders(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT wallet FROM followed_leaders ORDER BY score DESC, wallet"
+        ).fetchall()
+        return [r["wallet"] for r in rows]
 
     def fees_total(self) -> float:
         row = self.conn.execute(

@@ -71,6 +71,18 @@ def test_ledger_records_and_dedupes():
     led.close()
 
 
+def test_ledger_followed_leaders_roundtrip(tmp_path):
+    db = str(tmp_path / "led.db")
+    led = Ledger(db)
+    assert led.followed_leaders() == []
+    led.set_followed_leaders({"0xlow": 0.2, "0xhigh": 0.9})
+    assert led.followed_leaders() == ["0xhigh", "0xlow"]     # score-ordered
+    led.set_followed_leaders({"0xnew": 0.5})                 # replace, not append
+    led.close()
+    with Ledger(db) as led2:                                 # survives reopen
+        assert led2.followed_leaders() == ["0xnew"]
+
+
 def test_ledger_summary_and_leader_exposures():
     led = Ledger(":memory:")
     _fill(led, _sig(side=Side.BUY, size_usd=50, uid="a", leader="0xL1", token="t1", market="m1"), price=0.50)

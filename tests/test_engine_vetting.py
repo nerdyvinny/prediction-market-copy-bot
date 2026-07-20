@@ -111,6 +111,34 @@ def test_rescore_seeds_incumbents_from_open_positions(monkeypatch):
     eng.close()
 
 
+def test_rescore_persists_follow_list_across_restarts(monkeypatch, tmp_path):
+    """A followed leader with NO copied trades yet must survive a restart:
+    the rescore persists the follow list to the ledger, and a fresh engine
+    seeds incumbents from it. An empty rescore must NOT wipe the list."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xwhale": (25, 40.0)}
+    db = str(tmp_path / "eng.db")
+
+    s = Settings(db_path=db, copy_vet_leaders=True, arb_enabled=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xwhale"]), strategy=FakeStrategy())
+    eng.rescore()
+    eng.close()
+
+    # Restart: no fills in the ledger, yet the whale is still an incumbent.
+    sel = FakeSelector([])                       # feeds lost sight of everyone
+    eng2 = Engine(settings=s, selector=sel, strategy=FakeStrategy())
+    eng2.rescore()
+    assert sel.seen_incumbents == ["0xwhale"]
+    eng2.close()
+
+    # The empty rescore above must have kept (not wiped) the persisted list.
+    sel3 = FakeSelector([])
+    eng3 = Engine(settings=s, selector=sel3, strategy=FakeStrategy())
+    eng3.rescore()
+    assert sel3.seen_incumbents == ["0xwhale"]
+    eng3.close()
+
+
 def test_rescore_passes_dropped_leaders_with_open_positions_as_exit_only(monkeypatch):
     """A leader missing from the ranked list while we still hold their copied
     positions goes to the strategy as exit-only (SELL mirroring continues)."""

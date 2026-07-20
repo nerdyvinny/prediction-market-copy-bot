@@ -86,13 +86,16 @@ class Engine:
     # -- steps -----------------------------------------------------------
     def rescore(self) -> list[LeaderScore]:
         """Re-rank the leaderboard and update the strategy's watchlist."""
-        # Incumbents are always deep-scored: currently followed leaders PLUS
-        # anyone we still hold copied positions from (survives restarts via
-        # the ledger — feed churn must never silently drop a known leader).
+        # Incumbents are always deep-scored: currently followed leaders (in
+        # memory AND the follow list persisted by the last rescore), plus
+        # anyone we still hold copied positions from. Both sets survive
+        # restarts via the ledger — feed churn must never silently drop a
+        # known leader, even one we never got to copy a trade from.
         incumbents = {r.wallet for r in self.leaders}
         held: set[str] = set()
         try:
             held = set(self.ledger.leader_exposures())
+            incumbents |= set(self.ledger.followed_leaders())
         except Exception as e:
             log.debug("rescore: incumbent seed from ledger failed: %s", e)
         incumbents |= held
@@ -100,6 +103,14 @@ class Engine:
         if self.settings.copy_vet_leaders:
             ranked = self._vet_leaders(ranked)
         self.leaders = ranked
+        if ranked:
+            # An empty result (funnel starved or API trouble) keeps the old
+            # persisted list: stale incumbents get re-scored on merit next
+            # time, whereas a wiped list forgets full addresses forever.
+            try:
+                self.ledger.set_followed_leaders({r.wallet: r.score for r in ranked})
+            except Exception as e:
+                log.debug("rescore: persisting follow list failed: %s", e)
         # A leader who fell off the ranked list while we still hold positions
         # copied from them stays watched as exit-only: their SELLs are still
         # mirrored so those positions don't ride unmanaged to resolution, but
