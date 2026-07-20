@@ -11,6 +11,7 @@ from pmbot.leaders.config import FilterConfig
 from pmbot.leaders.scoring import (
     WalletStats,
     compute_wallet_stats,
+    failing_filters,
     passes_filters,
     rank_wallets,
 )
@@ -47,15 +48,21 @@ def test_compute_wallet_stats_reconstructs_pnl_and_winrate():
     ]
     resolver = {"A": (True, "A1"), "B": (False, None)}.__getitem__
 
-    st = compute_wallet_stats("0xLEADER", trades, resolver, now=NOW)
+    st = compute_wallet_stats("0xLEADER", trades, resolver, now=NOW,
+                              copyable_notional_min=45.0,
+                              copyable_price_min=0.15, copyable_price_max=0.85)
 
+    # Copyable BUYs at >=$45 notional in band: B1 buy ($60) yes; A1 buy ($40) no.
+    assert st.n_copyable_trades == 1
     assert st.n_trades == 3
     assert st.n_markets == 2
     assert st.n_resolved_markets == 1
     assert st.realized_pnl == pytest.approx(60.0 - 10.0)
     assert st.win_rate == pytest.approx(1.0)        # only resolved market (A) won
     assert st.n_categories == 2
-    assert st.concentration == pytest.approx(110.0 / 150.0)
+    # Best market's profit (A: +60) over net profit (+50): one winner is
+    # propping up losses elsewhere, so concentration exceeds 1.0.
+    assert st.profit_concentration == pytest.approx(60.0 / 50.0)
     assert st.recency_days == pytest.approx(5.0, abs=0.01)
 
 
@@ -69,29 +76,42 @@ def test_compute_wallet_stats_settles_losing_outcome():
     assert st.win_rate == 0.0
 
 
-def test_passes_filters_enforces_sample_and_winrate():
-    base = dict(wallet="w", n_trades=120, n_markets=20, n_resolved_markets=10,
-                realized_pnl=500.0, win_rate=0.6, n_categories=3,
-                recency_days=2.0, concentration=0.2)
-    f = FilterConfig()  # defaults: min_resolved_trades=100, min_win_rate=0.55, cats>=2
+def test_passes_filters_enforces_new_spec():
+    # Defaults: 30d window, ≥50 trades, ≥25 resolved, ≥80% win rate, net-positive,
+    # last trade ≤48h, ≤40% of profit from one market, single-market OK.
+    base = dict(wallet="w", n_trades=120, n_markets=30, n_resolved_markets=30,
+                realized_pnl=500.0, win_rate=0.85, n_categories=1,
+                recency_days=1.0, profit_concentration=0.2, n_copyable_trades=20)
+    f = FilterConfig()
     assert passes_filters(WalletStats(**base), f) is True
 
-    assert passes_filters(WalletStats(**{**base, "n_trades": 50}), f) is False        # sample
-    assert passes_filters(WalletStats(**{**base, "realized_pnl": -1}), f) is False     # pnl
-    assert passes_filters(WalletStats(**{**base, "n_categories": 1}), f) is False      # breadth
-    assert passes_filters(WalletStats(**{**base, "concentration": 0.9}), f) is False   # concentration
-    assert passes_filters(WalletStats(**{**base, "win_rate": 0.4}), f) is False        # win rate
+    assert failing_filters(WalletStats(**{**base, "n_trades": 40}), f) == ["min_trades"]
+    assert failing_filters(WalletStats(**{**base, "recency_days": 3.0}), f) == ["recency"]
+    assert failing_filters(WalletStats(**{**base, "realized_pnl": -1}), f) == ["pnl"]
+    assert failing_filters(WalletStats(**{**base, "n_resolved_markets": 10}), f) == ["resolved_markets"]
+    assert failing_filters(WalletStats(**{**base, "win_rate": 0.7}), f) == ["win_rate"]
+    assert failing_filters(WalletStats(**{**base, "profit_concentration": 0.9}), f) == ["profit_concentration"]
+    # The style gate: perfect stats but nothing our copy side would mirror.
+    assert failing_filters(WalletStats(**{**base, "n_copyable_trades": 2}), f) == ["copyable_trades"]
 
-    # win-rate NOT enforced when too few resolved markets
-    thin = WalletStats(**{**base, "n_resolved_markets": 3, "win_rate": 0.0})
-    assert passes_filters(thin, f) is True
+
+def test_win_rate_enforced_even_on_thin_resolved_samples():
+    # The old ">=5 resolved markets or win rate is waived" bypass is gone:
+    # a 2-0 lucky wallet fails on sample size, not sneaks past on it.
+    base = dict(wallet="w", n_trades=120, n_markets=30, n_resolved_markets=2,
+                realized_pnl=500.0, win_rate=1.0, n_categories=1,
+                recency_days=1.0, profit_concentration=0.2, n_copyable_trades=20)
+    fails = failing_filters(WalletStats(**base), FilterConfig())
+    assert "resolved_markets" in fails
+    zero = WalletStats(**{**base, "win_rate": 0.0})
+    assert "win_rate" in failing_filters(zero, FilterConfig())
 
 
 def test_rank_wallets_orders_by_weighted_score():
-    good = WalletStats("good", 200, 30, 20, 1000, 0.70, 5, 1.0, 0.2)
-    weak = WalletStats("weak", 110, 12, 8, 50, 0.56, 2, 30.0, 0.35)
-    ranked = rank_wallets([weak, good], {"realized_pnl": .35, "win_rate": .25,
-                                         "consistency": .20, "recency": .20})
+    good = WalletStats("good", 200, 30, 28, 1000, 0.90, 5, 1.0, 0.2)
+    weak = WalletStats("weak", 110, 12, 25, 50, 0.81, 2, 30.0, 0.35)
+    ranked = rank_wallets([weak, good], {"realized_pnl": .40, "win_rate": .30,
+                                         "consistency": .00, "recency": .30})
     assert [r.wallet for r in ranked] == ["good", "weak"]
     assert 0.0 <= ranked[-1].score <= 1.0
 

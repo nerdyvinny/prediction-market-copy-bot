@@ -83,7 +83,7 @@ class RiskManager:
             return None
 
         if signal.source_leader:
-            used = abs(self.ledger.exposure_for_leader(signal.source_leader))
+            used = self.ledger.exposure_for_leader(signal.source_leader)
             desired = min(desired, self.max_per_leader - used)
 
         used_market = self.ledger.exposure_for_market(signal.market_id)

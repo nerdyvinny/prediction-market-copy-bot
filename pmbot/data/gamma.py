@@ -148,6 +148,12 @@ class GammaClient:
         liquidity = m.get("liquidityNum")
         if liquidity is None:
             liquidity = m.get("liquidity")
+        prices = [_to_float_or_none(p) for p in _load_json_list(m.get("outcomePrices"))]
+        outcome_prices = {
+            str(t): p
+            for t, p in zip(token_ids, prices)
+            if t is not None and p is not None
+        }
         return Market(
             market_id=str(m.get("conditionId", "")),
             question=str(m.get("question", "")),
@@ -156,6 +162,7 @@ class GammaClient:
             liquidity_usd=_to_float_or_none(liquidity),
             closed=bool(m.get("closed", False)),
             tokens=tokens,
+            outcome_prices=outcome_prices,
         )
 
     @staticmethod

@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     # (Scoring measures THEIR profit; vetting measures OURS, after our sizing,
     # caps and slippage — a leader can be profitable yet not copyable.)
     copy_vet_leaders: bool = True
-    copy_vet_lookback_days: int = 45
+    copy_vet_lookback_days: int = 30   # matches the 30d selection window
     copy_vet_min_pnl_usd: float = 0.0
     # EXPERIMENTAL: scale each leader's copy_fraction by their vet-backtest
     # ROI relative to the pack (clamped 0.5x-2x). Off by default: Data-API

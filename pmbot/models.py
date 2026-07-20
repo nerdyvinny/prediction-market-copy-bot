@@ -57,6 +57,9 @@ class Market:
     liquidity_usd: float | None = None
     closed: bool = False
     tokens: dict[str, str] = field(default_factory=dict)  # outcome -> token_id
+    # token_id -> price at fetch time (final 1.0/0.0 once resolved). Powers
+    # feed-level win-quality estimates without extra per-token quote calls.
+    outcome_prices: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -1,30 +1,42 @@
 # Automatic leader selection + scoring config.
 #
-# The bot pulls Polymarket's PUBLIC leaderboard, scores every candidate wallet,
-# and auto-follows the top_n that pass all `filters`. You don't list wallets
-# here (selection is automatic) — you set the BAR. Tune during paper testing.
+# The bot profiles every wallet visible in the top market feeds, shortlists
+# the ones that already look like winners, deep-scores those, and follows the
+# top_n that pass ALL `filters`. You don't list wallets here (selection is
+# automatic) — you set the BAR. After each rescore the bot prints a rejection
+# report showing how many wallets each rule eliminated: if the pool comes up
+# empty, that report tells you which knob to loosen.
 
 selection:
-  top_n: 8                     # diversify across more leaders instead of just 2
-  rescore_interval_hours: 24   # re-rank the leaderboard on this cadence
+  top_n: 8                     # diversify across up to this many leaders
+  rescore_interval_hours: 24   # re-rank the pool on this cadence
 
-# A wallet must pass ALL of these to be eligible. These sanity caps exist to
-# reject lucky/low-sample wallets (the #1 killer of copy trading).
+# A wallet must pass ALL of these to be eligible. One 30-day window covers
+# everything — recent form only, no credit for ancient history.
 filters:
-  lookback_days: 45            # recent form only (45d won the 2026-07 copy-P&L sweep)
-  min_resolved_trades: 100
-  min_win_rate: 0.55
-  min_realized_pnl_usd: 0
-  min_distinct_categories: 2          # consistency across market types
-  min_avg_market_liquidity_usd: 5000  # leader must trade liquid markets
-  max_position_concentration: 0.40    # largest single position <= 40% of book
+  lookback_days: 30
+  min_trades: 50                    # ≥50 trades in the window (alive + active)
+  min_resolved_markets: 25          # ≥25 FINISHED bets behind the win rate —
+                                    # 80% of 2 is luck; 80% of 25 is a signal
+  min_win_rate: 0.80                # over resolved markets, always enforced
+  min_realized_pnl_usd: 0           # must be net-positive in the window
+  min_distinct_categories: 1        # 1 = single-market specialists welcome
+  max_profit_concentration: 0.40    # no market may be >40% of total profit
+  max_hours_since_last_trade: 96    # dead-account guard (was 48; widened to
+                                    # readmit e.g. sports bettors between
+                                    # game days — biggest reject bucket)
+  min_copyable_trades: 5            # ≥5 BUYs the copy side would actually
+                                    # mirror (≥$500 notional, in price band) —
+                                    # filters out uncopyable penny-bet bots
 
-# Ranking weights for eligible wallets (must sum to ~1.0). Higher total = followed first.
+# Ranking weights for eligible wallets (should sum to ~1.0). Consistency
+# (category spread) is zeroed: with specialists allowed it mostly punishes
+# exactly the profile we now want.
 weights:
-  realized_pnl: 0.35
-  win_rate: 0.25
-  consistency: 0.20            # spread across categories
-  recency: 0.20                # decay-weighted toward recent activity
+  realized_pnl: 0.40
+  win_rate: 0.30
+  consistency: 0.00
+  recency: 0.30
 
 # Manual overrides (optional).
 allowlist: []   # wallet addresses to always include (bypass filters)

@@ -33,14 +33,18 @@ def main() -> int:
     cfg = LeaderConfig(
         selection=SelectionConfig(top_n=3, rescore_interval_hours=24),
         filters=FilterConfig(
-            lookback_days=120, min_resolved_trades=5, min_win_rate=0.0,
-            min_realized_pnl_usd=-1e9, min_distinct_categories=1,
-            min_avg_market_liquidity_usd=0, max_position_concentration=1.0,
+            lookback_days=120, min_trades=5, min_resolved_markets=0,
+            min_win_rate=0.0, min_realized_pnl_usd=-1e9,
+            min_distinct_categories=1, max_profit_concentration=10.0,
+            max_hours_since_last_trade=1e9, min_copyable_trades=0,
         ),
     )
     selector = LeaderSelector(
         data, gamma, config=cfg,
-        max_candidates=8, trades_limit=80, top_markets=3, per_market=20,
+        deep_score_limit=8, explore_n=0, feed_min_trades=1,
+        trades_page=80, trades_cap=80,
+        top_open_markets=3, top_closed_markets=2, per_market_trades=40,
+        max_workers=2,
     )
     strategy = LongTermCopyStrategy(
         data, gamma, ledger,

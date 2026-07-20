@@ -174,13 +174,24 @@ class Ledger:
         return row is not None
 
     def exposure_for_leader(self, leader: str) -> float:
-        """Net USD deployed by following this leader (BUY size - SELL size)."""
-        row = self.conn.execute(
-            """SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN size_usd ELSE -size_usd END), 0) AS net
-               FROM fills WHERE source_leader=?""",
+        """USD still deployed by following this leader, over OPEN positions only.
+
+        Joining fills to nonzero positions is what frees a leader's budget
+        when a market settles: settlement zeroes the position, its token
+        drops out of the join, and the leader's cap headroom returns. (The
+        old all-fills sum counted settled positions forever, so every leader
+        eventually looked "full" and new copies were silently skipped.)
+        Per-token nets are clamped at zero so an over-sold token can't grant
+        negative exposure that hides real deployment elsewhere.
+        """
+        rows = self.conn.execute(
+            """SELECT COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.size_usd ELSE -f.size_usd END), 0) AS net
+               FROM fills f JOIN positions p ON p.token_id = f.token_id
+               WHERE f.source_leader=? AND ABS(p.shares) > 1e-9
+               GROUP BY f.token_id""",
             (leader,),
-        ).fetchone()
-        return float(row["net"] or 0.0)
+        ).fetchall()
+        return sum(max(0.0, float(r["net"] or 0.0)) for r in rows)
 
     def exposure_for_market(self, market_id: str) -> float:
         """Current cost-basis exposure across all outcome tokens in a market."""
@@ -204,13 +215,19 @@ class Ledger:
         return sum(abs(p.shares * p.avg_price) for p in self.get_positions())
 
     def leader_exposures(self) -> dict[str, float]:
-        """Net USD deployed per leader we've followed (BUY - SELL)."""
+        """USD still deployed per leader, over open positions only (same
+        open-position join and per-token clamp as `exposure_for_leader`)."""
         rows = self.conn.execute(
-            """SELECT source_leader AS leader,
-                      COALESCE(SUM(CASE WHEN side='BUY' THEN size_usd ELSE -size_usd END), 0) AS net
-               FROM fills WHERE source_leader IS NOT NULL GROUP BY source_leader"""
+            """SELECT f.source_leader AS leader, f.token_id AS token,
+                      COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.size_usd ELSE -f.size_usd END), 0) AS net
+               FROM fills f JOIN positions p ON p.token_id = f.token_id
+               WHERE f.source_leader IS NOT NULL AND ABS(p.shares) > 1e-9
+               GROUP BY f.source_leader, f.token_id"""
         ).fetchall()
-        return {r["leader"]: float(r["net"] or 0.0) for r in rows}
+        out: dict[str, float] = {}
+        for r in rows:
+            out[r["leader"]] = out.get(r["leader"], 0.0) + max(0.0, float(r["net"] or 0.0))
+        return out
 
     def fees_total(self) -> float:
         row = self.conn.execute(

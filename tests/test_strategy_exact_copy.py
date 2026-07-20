@@ -168,6 +168,36 @@ def test_sell_skipped_when_we_hold_nothing():
     led.close()
 
 
+def test_exit_only_leader_sell_mirrored_buy_ignored():
+    # Leader dropped off the followed list while we still hold their copied
+    # position: SELLs must still be mirrored, BUYs must never be copied.
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1, t2 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=10), NOW
+    # Would pass every entry filter (cf. test_buy_mirrored_and_filtered)…
+    buy_new = _trade("m_ok", "tokNEW", Side.BUY, 0.50, 100, "u-buy-new", ts=t0)
+    # …and a buy adding to the token we hold: no signal, but it must still
+    # feed leader-position tracking so the later sell mirrors proportionally.
+    buy_held = _trade("m_ok", "tokHELD", Side.BUY, 0.50, 100, "u-buy-held", ts=t1)
+    sell = _trade("m_ok", "tokHELD", Side.SELL, 0.55, 40, "u-sell", ts=t2)  # 40% exit
+
+    led = Ledger(":memory:")
+    our_buy = Signal("m_ok", "tokHELD", "Yes", Side.BUY, 0.50, 5, "copy",
+                     source_leader="0xlead", source_uid="u-old")
+    led.record_fill(Fill(signal=our_buy, fill_price=0.50, size_usd=5, shares=10,
+                         timestamp=t1, mode="paper"))
+
+    strat = _strategy([buy_new, buy_held, sell], markets, led)
+    strat.set_leaders([], exit_only=["0xLEAD"])
+    sigs = list(strat.generate())
+    assert len(sigs) == 1
+    s = sigs[0]
+    assert s.side is Side.SELL and s.token_id == "tokHELD"
+    # Leader sold 40 of their tracked 100 shares -> mirror 40% of ours.
+    assert s.size_usd == pytest.approx(5 * 0.4)
+    assert s.size_shares == pytest.approx(10 * 0.4)
+    led.close()
+
+
 class FakeQuote:
     def __init__(self, bid, ask):
         self.bid = bid

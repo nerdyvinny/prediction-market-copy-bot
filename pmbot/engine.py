@@ -14,7 +14,13 @@ import time
 
 from pmbot.backtest import ExactCopyBacktester, vet_weights
 from pmbot.config import Settings, get_settings
-from pmbot.data import GammaClient, KalshiClient, PolymarketDataClient, PriceCache
+from pmbot.data import (
+    GammaClient,
+    KalshiClient,
+    PolymarketDataClient,
+    PriceCache,
+    ResolutionStore,
+)
 from pmbot.execution import PaperExecutor
 from pmbot.execution.executor import TradeExecutor
 from pmbot.leaders import load_leader_config
@@ -51,9 +57,13 @@ class Engine:
         self.ledger = ledger or Ledger(self.settings.db_path)
         self.executor = executor or PaperExecutor(self.ledger, self.price_cache)
         self.risk = risk or RiskManager(self.ledger, self.settings)
-        self.selector = selector or LeaderSelector(
-            self.data, self.gamma, top_markets=30, per_market=100
-        )
+        self._resolution_store: ResolutionStore | None = None
+        if selector is None:
+            self._resolution_store = ResolutionStore(self.settings.db_path)
+            selector = LeaderSelector(
+                self.data, self.gamma, resolution_store=self._resolution_store
+            )
+        self.selector = selector
         self.strategy = strategy or ExactCopyStrategy(
             self.data, self.gamma, self.ledger, leaders=[], price_cache=self.price_cache
         )
@@ -76,17 +86,37 @@ class Engine:
     # -- steps -----------------------------------------------------------
     def rescore(self) -> list[LeaderScore]:
         """Re-rank the leaderboard and update the strategy's watchlist."""
-        ranked = self.selector.select()
+        # Incumbents are always deep-scored: currently followed leaders PLUS
+        # anyone we still hold copied positions from (survives restarts via
+        # the ledger — feed churn must never silently drop a known leader).
+        incumbents = {r.wallet for r in self.leaders}
+        held: set[str] = set()
+        try:
+            held = set(self.ledger.leader_exposures())
+        except Exception as e:
+            log.debug("rescore: incumbent seed from ledger failed: %s", e)
+        incumbents |= held
+        ranked = self.selector.select(incumbents=sorted(incumbents))
         if self.settings.copy_vet_leaders:
             ranked = self._vet_leaders(ranked)
         self.leaders = ranked
-        self.strategy.set_leaders([r.wallet for r in ranked])
+        # A leader who fell off the ranked list while we still hold positions
+        # copied from them stays watched as exit-only: their SELLs are still
+        # mirrored so those positions don't ride unmanaged to resolution, but
+        # their BUYs never open new ones.
+        followed = {r.wallet.lower() for r in ranked}
+        exit_only = sorted(w.lower() for w in held if w.lower() not in followed)
+        self.strategy.set_leaders([r.wallet for r in ranked], exit_only=exit_only)
+        if exit_only:
+            log.info("rescore: %d exit-only leader(s) with open positions: %s",
+                     len(exit_only), ", ".join(w[:10] for w in exit_only))
         for r in ranked:
             st = r.stats
             log.info(
-                "leader %s score=%.3f pnl=$%.0f win=%.0f%% mkts=%d/%d cats=%d",
+                "leader %s score=%.3f pnl=$%.0f win=%.0f%% mkts=%d/%d cats=%d copyable=%d",
                 r.wallet[:10], r.score, st.realized_pnl, st.win_rate * 100,
                 st.n_resolved_markets, st.n_markets, st.n_categories,
+                st.n_copyable_trades,
             )
         return ranked
 
@@ -198,6 +228,7 @@ class Engine:
                         print("· rescoring leaders…")
                         self.rescore()
                         self._last_rescore = now
+                        self._print_funnel_report()
                         self._print_leaders()
 
                     if (now - self._last_settle) >= self._settle_interval:
@@ -227,6 +258,21 @@ class Engine:
         except KeyboardInterrupt:
             print("\nStopped.")
 
+    def _print_funnel_report(self) -> None:
+        """Show what each selection stage / filter rejected, so an empty pool
+        points at the exact leaders.yaml knob to loosen instead of a guess."""
+        rep = getattr(self.selector, "last_report", None)
+        if not rep:
+            return
+        # rep["followed"] is pre-vetting; self.leaders is what survived it.
+        print(f"  funnel: {rep['pool']} in pool -> {rep['deep_scored']} deep-scored "
+              f"-> {rep['eligible']} eligible -> following {len(self.leaders)} after vet")
+        rejects = rep.get("rejects") or {}
+        if rejects:
+            detail = ", ".join(f"{k}={v}" for k, v in
+                               sorted(rejects.items(), key=lambda kv: -kv[1]))
+            print(f"  rejected by: {detail}")
+
     def _print_leaders(self) -> None:
         if not self.leaders:
             print("  (no leaders passed the filters — loosen thresholds in leaders.yaml)")
@@ -236,7 +282,8 @@ class Engine:
             st = r.stats
             print(f"    {r.wallet}  score={r.score:.2f}  "
                   f"pnl=${st.realized_pnl:,.0f}  win={st.win_rate*100:.0f}%  "
-                  f"trades={st.n_trades}  resolved_mkts={st.n_resolved_markets}")
+                  f"trades={st.n_trades}  resolved_mkts={st.n_resolved_markets}  "
+                  f"copyable={st.n_copyable_trades}")
 
     def close(self) -> None:
         for c in (self.data, self.gamma, self.price_cache, self.kalshi):
@@ -250,3 +297,8 @@ class Engine:
             self.ledger.close()
         except Exception:
             pass
+        if self._resolution_store is not None:
+            try:
+                self._resolution_store.close()
+            except Exception:
+                pass

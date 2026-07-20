@@ -4,5 +4,13 @@ from pmbot.data.gamma import GammaClient
 from pmbot.data.kalshi import KalshiBook, KalshiClient
 from pmbot.data.polymarket_data import PolymarketDataClient
 from pmbot.data.price_cache import PriceCache
+from pmbot.data.resolution_cache import ResolutionStore
 
-__all__ = ["GammaClient", "KalshiBook", "KalshiClient", "PolymarketDataClient", "PriceCache"]
+__all__ = [
+    "GammaClient",
+    "KalshiBook",
+    "KalshiClient",
+    "PolymarketDataClient",
+    "PriceCache",
+    "ResolutionStore",
+]

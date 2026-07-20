@@ -100,6 +100,34 @@ def test_ledger_realized_pnl_and_exposures():
     led.close()
 
 
+def test_settlement_frees_leader_budget():
+    """Regression: settled positions must release the leader's exposure cap.
+
+    Settlement fills carry no source_leader, so the old all-fills sum kept
+    counting the BUY forever — leaders eventually looked "full" and every
+    new copy was skipped. Exposure over open positions only fixes that.
+    """
+    led = Ledger(":memory:")
+    _fill(led, _sig(side=Side.BUY, size_usd=50, uid="b1", leader="0xL1",
+                    token="t1", market="m1"), price=0.50)
+    assert led.exposure_for_leader("0xL1") == pytest.approx(50.0)
+
+    # Market resolves against us: settlement SELLs all 100 shares at $0
+    # (no source_leader on settlement fills, same as Settler writes them).
+    from datetime import datetime, timezone
+    from pmbot.models import Fill
+    settle = Signal(market_id="m1", token_id="t1", outcome="Yes", side=Side.SELL,
+                    target_price=0.0, size_usd=0.0, reason="settlement")
+    led.record_fill(Fill(signal=settle, fill_price=0.0, size_usd=0.0, shares=100,
+                         timestamp=datetime.now(timezone.utc), mode="paper"))
+
+    pos = led.get_position("t1")
+    assert pos is not None and pos.shares == pytest.approx(0.0)
+    assert led.exposure_for_leader("0xL1") == pytest.approx(0.0)   # budget freed
+    assert "0xL1" not in led.leader_exposures()
+    led.close()
+
+
 # --- paper executor ------------------------------------------------------
 class FakeCache:
     def __init__(self, quote):

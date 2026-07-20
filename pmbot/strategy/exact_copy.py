@@ -19,6 +19,11 @@ accounting the ledger uses) so a partial exit by the leader becomes a partial
 exit of our own position, not a full liquidation. If the leader's prior
 position is unknown (e.g. it predates when we started following them), we
 conservatively treat the sell as a full exit.
+
+Exit-only leaders: a leader who falls off the followed list while we still
+hold positions copied from them is kept on the watchlist as exit-only — their
+SELLs are still mirrored (so our copied positions don't ride unmanaged to
+resolution) but their BUYs never open new positions.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ class ExactCopyStrategy(Strategy):
         self.ledger = ledger
         self.price_cache = price_cache
         self.leaders = [w.lower() for w in (leaders or [])]
+        self.exit_only_leaders: list[str] = []
         self.min_liquidity = s.min_market_liquidity_usd if min_liquidity is None else min_liquidity
         self.price_min = s.copy_price_min if price_min is None else price_min
         self.price_max = s.copy_price_max if price_max is None else price_max
@@ -82,8 +88,14 @@ class ExactCopyStrategy(Strategy):
         self._leader_shares: dict[tuple[str, str], float] = {}
         self._seen_uids: set[str] = set()
 
-    def set_leaders(self, leaders: list[str]) -> None:
+    def set_leaders(self, leaders: list[str], *, exit_only: list[str] | None = None) -> None:
+        """Update the watchlist. `exit_only` wallets keep their SELLs mirrored
+        but never trigger BUYs; a wallet in both lists is treated as followed."""
         self.leaders = [w.lower() for w in leaders]
+        followed = set(self.leaders)
+        self.exit_only_leaders = [
+            w.lower() for w in (exit_only or []) if w.lower() not in followed
+        ]
 
     def _market(self, condition_id: str) -> Market | None:
         now = time.monotonic()
@@ -117,7 +129,9 @@ class ExactCopyStrategy(Strategy):
 
     def generate(self) -> Iterable[Signal]:
         now = datetime.now(timezone.utc)
-        for leader in self.leaders:
+        watchlist = [(w, False) for w in self.leaders]
+        watchlist += [(w, True) for w in self.exit_only_leaders]
+        for leader, exit_only in watchlist:
             try:
                 trades = self.data.get_trades(user=leader, limit=self.trades_per_leader)
             except Exception as e:
@@ -138,6 +152,9 @@ class ExactCopyStrategy(Strategy):
 
                 if already_seen or self.ledger.has_copied(t.uid):
                     continue
+
+                if exit_only and t.side is Side.BUY:
+                    continue                       # exit-only leader: mirror exits, never new entries
 
                 market = self._market(t.market_id)
                 if market is None or market.closed:
@@ -183,7 +200,8 @@ class ExactCopyStrategy(Strategy):
                         target_price=t.price,
                         size_usd=our_value * sell_fraction,
                         size_shares=abs(our_position.shares) * sell_fraction,
-                        reason=f"copy {leader[:8]}… sell {sell_fraction*100:.0f}%",
+                        reason=(f"copy {leader[:8]}… sell {sell_fraction*100:.0f}%"
+                                + (" (exit-only)" if exit_only else "")),
                         source_leader=leader,
                         source_uid=t.uid,
                     )
