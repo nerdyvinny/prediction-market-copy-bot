@@ -145,7 +145,11 @@ class Backtester:
             try:
                 self._mkt_cache[condition_id] = self.gamma.get_market_with_resolution(condition_id)
             except Exception:
-                self._mkt_cache[condition_id] = (None, None)
+                # Transient failure (rate limit, timeout): skip THIS call but do
+                # NOT cache — a poisoned entry silently drops every trade in the
+                # market for the process lifetime, gutting backtests and vetting.
+                # (Same fix as LeaderSelector._resolver.)
+                return (None, None)
         return self._mkt_cache[condition_id]
 
     def run(self, leaders: list[str], now: datetime | None = None) -> BacktestReport:
@@ -319,7 +323,11 @@ class ExactCopyBacktester:
             try:
                 self._mkt_cache[condition_id] = self.gamma.get_market_with_resolution(condition_id)
             except Exception:
-                self._mkt_cache[condition_id] = (None, None)
+                # Transient failure (rate limit, timeout): skip THIS call but do
+                # NOT cache — a poisoned entry silently drops every trade in the
+                # market for the process lifetime, gutting backtests and vetting.
+                # (Same fix as LeaderSelector._resolver.)
+                return (None, None)
         return self._mkt_cache[condition_id]
 
     def fetch_tapes(self, leaders: list[str]) -> dict[str, list[LeaderTrade]]:

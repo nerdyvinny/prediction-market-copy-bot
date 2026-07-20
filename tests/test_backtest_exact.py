@@ -45,6 +45,27 @@ def _bt(resolutions, **kw):
                                settings=_settings(), **kw)
 
 
+def test_market_lookup_error_not_cached():
+    """A transient Gamma failure (rate limit) must not poison the memo: the
+    next call for the same market retries and succeeds. A poisoned entry
+    silently drops every trade in that market for the whole run."""
+    good = (_mkt("m1"), "tokW")
+
+    class FlakyGamma(FakeGamma):
+        calls = 0
+
+        def get_market_with_resolution(self, cid):
+            FlakyGamma.calls += 1
+            if FlakyGamma.calls == 1:
+                raise RuntimeError("429 rate limited")
+            return good
+
+    bt = ExactCopyBacktester(data=None, gamma=FlakyGamma({}), settings=_settings())
+    assert bt._market("m1") == (None, None)      # failed call: skipped, not stored
+    assert bt._market("m1") == good              # retry succeeds
+    assert bt._market("m1") == good and FlakyGamma.calls == 2   # now memoized
+
+
 def test_buy_and_hold_settles_at_payout():
     res = {"m1": (_mkt("m1"), "tokW")}
     tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.50, 1000, 10, "u1")]}
