@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pmbot</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="wordmark">pmbot</span>
+    <span class="badge" id="mode-badge">—</span>
+    <span class="engine" id="engine">
+      <span class="dot" id="engine-dot"></span><span id="engine-text">checking…</span>
+    </span>
+  </div>
+  <div class="updated" id="updated">loading…</div>
+</header>
+
+<main>
+  <section class="stats" id="stats"></section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Realized P&amp;L</h2>
+      <span class="sub" id="chart-sub"></span>
+    </div>
+    <div id="chart" class="chart"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Open positions</h2>
+      <span class="sub" id="pos-sub"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="positions">
+        <thead><tr>
+          <th class="left">Market</th><th class="left">Side</th>
+          <th>Shares</th><th>Avg</th><th>Last</th>
+          <th>Cost</th><th>Value</th><th>Unrealized</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="cols">
+    <section class="card">
+      <div class="card-head"><h2>Leaders</h2><span class="sub" id="leaders-sub"></span></div>
+      <div class="table-wrap">
+        <table id="leaders">
+          <thead><tr><th class="left">Wallet</th><th>Open exposure</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Bot config</h2></div>
+      <dl class="config" id="config"></dl>
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-head"><h2>Trade log</h2><span class="sub" id="fills-sub"></span></div>
+    <div class="table-wrap">
+      <table id="fills">
+        <thead><tr>
+          <th class="left">Time</th><th class="left">Market</th><th class="left">Action</th>
+          <th>Price</th><th>Size</th><th class="left">Copied from</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>read-only paper ledger · no orders are placed from this page</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

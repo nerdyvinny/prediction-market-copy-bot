@@ -21,6 +21,7 @@ venv/
 
 # Data / runtime artifacts
 *.db
+*.db.*
 *.sqlite
 *.sqlite3
 data/*.json
