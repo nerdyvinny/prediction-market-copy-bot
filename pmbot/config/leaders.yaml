@@ -28,6 +28,13 @@ filters:
   min_copyable_trades: 5            # ≥5 BUYs the copy side would actually
                                     # mirror (≥$500 notional, in price band) —
                                     # filters out uncopyable penny-bet bots
+  min_tape_span_days: 7             # HFT guard: if the ~1500-trade tape we
+                                    # fetch is FULL yet covers under 7 days,
+                                    # the wallet fires hundreds of trades/day —
+                                    # a latency bot (in-game sports sniper /
+                                    # market maker). Its win rate is speed we
+                                    # can't inherit at a 10s poll, and so
+                                    # shallow a tape can't be vetted anyway.
 
 # Ranking weights for eligible wallets (should sum to ~1.0). Consistency
 # (category spread) is zeroed: with specialists allowed it mostly punishes

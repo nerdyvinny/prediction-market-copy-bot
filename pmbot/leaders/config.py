@@ -35,6 +35,12 @@ class FilterConfig:
     # 100%-win-rate penny-grinder bot with zero such trades is unfollowable —
     # every one of its bets dies at our conviction floor.
     min_copyable_trades: int = 5
+    # HFT guard: if a wallet's fetched tape hit the trades cap AND spans fewer
+    # days than this, it trades far too fast to be a market-picker — its edge
+    # is latency (in-game sports sniping, market making), which cannot survive
+    # our polling delay, and a tape that shallow can't be vetted either. An
+    # UNCAPPED short tape is just a quiet wallet and is not rejected here.
+    min_tape_span_days: float = 7.0
 
 
 @dataclass
@@ -85,6 +91,9 @@ def load_leader_config(path: str | Path | None = None) -> LeaderConfig:
             ),
             min_copyable_trades=int(
                 flt.get("min_copyable_trades", d.min_copyable_trades)
+            ),
+            min_tape_span_days=float(
+                flt.get("min_tape_span_days", d.min_tape_span_days)
             ),
         ),
         weights={**LeaderConfig().weights, **(raw.get("weights") or {})},

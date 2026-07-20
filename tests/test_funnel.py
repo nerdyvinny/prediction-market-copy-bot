@@ -186,6 +186,47 @@ def test_selector_funnel_filters_and_reports(tmp_path):
     store.close()
 
 
+def _tape_hft(wallet: str) -> list[LeaderTrade]:
+    """A latency bot: more trades than the fetch cap, all within minutes."""
+    return [LeaderTrade(
+        leader=wallet, market_id=f"M{i % 10}", token_id=f"T{i % 10}", outcome="Yes",
+        side=Side.BUY, price=0.55, shares=100, usd_size=55.0,
+        timestamp=NOW - timedelta(seconds=10 * i),
+        tx_hash=f"{wallet}-{i}", event_slug=f"ev{i % 10}",
+    ) for i in range(80)]
+
+
+class HftData(FunnelData):
+    """Two wallets: a real trader and an in-game sports sniper."""
+
+    def __init__(self):
+        super().__init__()
+        ts = int(NOW.timestamp())
+        self.feeds["mO"] = [
+            {"proxyWallet": w, "asset": "OY", "side": "BUY",
+             "price": 0.40, "size": 10, "timestamp": ts - 600 - k}
+            for w in ("0xgood", "0xhft") for k in range(3)
+        ]
+        self.tapes = {"0xgood": _tape_good("0xgood"), "0xhft": _tape_hft("0xhft")}
+
+
+def test_selector_rejects_hft_wallet_on_tape_span(tmp_path):
+    """With trades_cap=64: 0xhft's 80-trade tape truncates at the cap having
+    covered only ~10 minutes -> tape_span early reject. 0xgood's 60-trade tape
+    spans under 7 days TOO, but it is uncapped (complete), so the HFT guard
+    must leave it alone — short-and-complete just means a quiet wallet."""
+    store = ResolutionStore(str(tmp_path / "res.db"))
+    sel = LeaderSelector(
+        HftData(), FunnelGamma(), config=_config(), resolution_store=store,
+        deep_score_limit=10, explore_n=0, max_workers=1, trades_cap=64,
+        copy_notional_min=0.0, copy_price_min=0.0, copy_price_max=1.0,
+    )
+    top = sel.select(now=NOW)
+    assert [r.wallet for r in top] == ["0xgood"]
+    assert sel.last_report["early_rejects"] == {"tape_span": 1}
+    store.close()
+
+
 def test_selector_uses_cached_resolutions_without_refetching(tmp_path):
     store = ResolutionStore(str(tmp_path / "res.db"))
     store.save_many({f"M{i}": f"T{i}" for i in range(27)})

@@ -37,6 +37,7 @@ def main() -> int:
             min_win_rate=0.0, min_realized_pnl_usd=-1e9,
             min_distinct_categories=1, max_profit_concentration=10.0,
             max_hours_since_last_trade=1e9, min_copyable_trades=0,
+            min_tape_span_days=0.0,
         ),
     )
     selector = LeaderSelector(

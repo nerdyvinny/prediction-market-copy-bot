@@ -56,6 +56,7 @@ Resolver = Callable[[str], tuple[bool, str | None]]
 _REJECT_TRADES = "min_trades"
 _REJECT_RECENCY = "recency"
 _REJECT_COPYABLE = "copyable_trades"
+_REJECT_TAPE_SPAN = "tape_span"
 _REJECT_ERROR = "fetch_error"
 
 
@@ -320,6 +321,17 @@ class LeaderSelector:
         newest = max(t.timestamp for t in trades)
         if (now - newest).total_seconds() / 3600.0 > f.max_hours_since_last_trade:
             return (wallet, None, _REJECT_RECENCY)
+        if len(trades) >= self.trades_cap:
+            # Tape truncated at the cap: `trades` is NOT the whole window, and
+            # how much time the cap covers is the wallet's pace. A capped tape
+            # spanning days = active human; spanning hours = HFT bot whose
+            # leaderboard win rate is latency we can't copy (and whose vet
+            # window we can't even fetch). Uncapped tapes skip this check —
+            # short span there just means few trades, judged by min_trades.
+            oldest = min(t.timestamp for t in trades)
+            span_days = (newest - oldest).total_seconds() / 86_400
+            if span_days < f.min_tape_span_days:
+                return (wallet, None, _REJECT_TAPE_SPAN)
         recent = [t for t in trades if t.timestamp >= cutoff]
         if len(recent) < f.min_trades:
             return (wallet, None, _REJECT_TRADES)
