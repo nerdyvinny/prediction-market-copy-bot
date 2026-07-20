@@ -45,6 +45,21 @@ def _bt(resolutions, **kw):
                                settings=_settings(), **kw)
 
 
+def test_in_game_entry_copied_when_hours_filter_off():
+    """PM daily-sports markets put end_date at START of day, so in-game trades
+    sit 'after close'. With min_hours_to_resolution at its default 0 they must
+    still be copied (the live strategy copies them); only a positive knob may
+    exclude them."""
+    res = {"m1": (_mkt("m1", end_days_ago=2.0), "tokW")}
+    # Trade 1 day ago = a full day AFTER the market's end_date.
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert len(rep.results) == 1                 # copied and settled at payout
+    rep2 = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                             min_hours_to_resolution=6.0)
+    assert len(rep2.results) == 0                # knob ON excludes it
+
+
 def test_market_lookup_error_not_cached():
     """A transient Gamma failure (rate limit) must not poison the memo: the
     next call for the same market retries and succeeds. A poisoned entry

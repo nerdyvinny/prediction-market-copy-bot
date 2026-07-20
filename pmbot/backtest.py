@@ -463,9 +463,16 @@ class ExactCopyBacktester:
                 market, winner = self._market(t.market_id)
                 if market is None or not market.closed or winner is None or market.end_date is None:
                     continue                       # only resolved markets have a known payout
-                hours_left = (market.end_date - t.timestamp).total_seconds() / 3600
-                if hours_left < min_hours_to_resolution:
-                    continue
+                # Only enforce when the knob is ON (matches ExactCopyStrategy).
+                # Daily-sports markets carry end_date at START of day, so every
+                # in-game trade has NEGATIVE hours_left; with the knob at its
+                # default 0 the unguarded compare silently dropped all of them,
+                # while the live bot copies them — backtests wildly undercounted
+                # for sports-heavy leaders.
+                if min_hours_to_resolution > 0:
+                    hours_left = (market.end_date - t.timestamp).total_seconds() / 3600
+                    if hours_left < min_hours_to_resolution:
+                        continue
                 sized = risk.size(Signal(
                     t.market_id, t.token_id, t.outcome, Side.BUY, t.price,
                     t.usd_size, "backtest", source_leader=t.leader.lower(), source_uid=t.uid,
