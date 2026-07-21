@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS resolutions (
 
 class ResolutionStore:
     def __init__(self, db_path: str = "pmbot.db"):
-        self.conn = sqlite3.connect(db_path)
+        # check_same_thread=False: the store is created by the engine (main
+        # thread) but used by whichever single thread runs the rescore — the
+        # engine's background rescore worker in live mode. Access is never
+        # concurrent (one rescore at a time).
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.conn.commit()

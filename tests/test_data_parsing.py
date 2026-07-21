@@ -83,3 +83,20 @@ def test_parse_dt_handles_z_suffix_and_none():
     assert dt is not None and dt.tzinfo is not None
     assert _parse_dt(None) is None
     assert _parse_dt("garbage") is None
+
+
+# --- retry classification -------------------------------------------------
+def test_4xx_is_non_retryable_5xx_and_429_are_retryable():
+    import httpx
+    import pytest
+
+    from pmbot.data.errors import NonRetryableAPIError, raise_for_status_smart
+
+    req = httpx.Request("GET", "http://api.test/x")
+    with pytest.raises(NonRetryableAPIError):
+        raise_for_status_smart(httpx.Response(404, request=req))
+    with pytest.raises(httpx.HTTPStatusError):
+        raise_for_status_smart(httpx.Response(500, request=req))
+    with pytest.raises(httpx.HTTPStatusError):
+        raise_for_status_smart(httpx.Response(429, request=req))
+    raise_for_status_smart(httpx.Response(200, request=req))  # no raise

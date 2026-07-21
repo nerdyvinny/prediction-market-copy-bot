@@ -139,6 +139,24 @@ def test_rescore_persists_follow_list_across_restarts(monkeypatch, tmp_path):
     eng3.close()
 
 
+def test_empty_rescore_keeps_current_leaders_and_watchlist(monkeypatch):
+    """API trouble (or a starved funnel) must not stop copying: an empty
+    rescore keeps the current leader set instead of wiping it and thrashing."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xgood": (25, 40.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    strat = FakeStrategy()
+    eng = Engine(settings=s, selector=FakeSelector(["0xgood"]), strategy=strat)
+    eng.rescore()
+    assert [r.wallet for r in eng.leaders] == ["0xgood"]
+
+    eng.selector = FakeSelector([])              # feeds lose everyone
+    eng.rescore()
+    assert [r.wallet for r in eng.leaders] == ["0xgood"]   # kept, not wiped
+    assert strat.leaders == ["0xgood"]                     # watchlist intact
+    eng.close()
+
+
 def test_rescore_passes_dropped_leaders_with_open_positions_as_exit_only(monkeypatch):
     """A leader missing from the ranked list while we still hold their copied
     positions goes to the strategy as exit-only (SELL mirroring continues)."""

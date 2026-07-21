@@ -213,13 +213,60 @@ def test_paper_executor_sell_honors_size_shares():
     led.close()
 
 
-def test_paper_executor_falls_back_to_target_when_no_quote():
+def test_paper_executor_copy_buy_skipped_without_book():
+    # A copied ENTRY with no live book is skipped, not granted a perfect fill
+    # at the leader's own price — that would inflate paper P&L exactly when
+    # we're blind (CLOB outage).
     led = Ledger(":memory:")
     cache = FakeCache(Quote(token_id="tokA", bid=None, ask=None))
     ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
-    fill = ex.execute(_sig(side=Side.BUY, size_usd=50.0))  # target_price=0.50
-    assert fill.fill_price == pytest.approx(0.50)
+    assert ex.execute(_sig(side=Side.BUY, size_usd=50.0)) is None
     led.close()
+
+
+def test_paper_executor_noncopy_buy_still_falls_back_to_target():
+    # Non-copy signals (arb legs price at scan time) keep the fallback.
+    led = Ledger(":memory:")
+    cache = FakeCache(Quote(token_id="tokA", bid=None, ask=None))
+    ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
+    sig = _sig(side=Side.BUY, size_usd=50.0, leader=None)
+    fill = ex.execute(sig)
+    assert fill is not None and fill.fill_price == pytest.approx(0.50)
+    led.close()
+
+
+def test_paper_executor_copy_buy_respects_limit_price():
+    # Limit semantics: never pay more than leader price + drift budget (0.03).
+    # The strategy's drift guard checks the MID; a thin book's ask can sit far
+    # above it and must not be chased.
+    led = Ledger(":memory:")
+    cache = FakeCache(Quote(token_id="tokA", bid=0.50, ask=0.60))
+    ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
+    assert ex.execute(_sig(side=Side.BUY, size_usd=50.0)) is None  # 0.60 > 0.53
+    ok = FakeCache(Quote(token_id="tokA", bid=0.50, ask=0.52))
+    ex2 = PaperExecutor(led, price_cache=ok, slippage_bps=0)
+    fill = ex2.execute(_sig(side=Side.BUY, size_usd=50.0))
+    assert fill is not None and fill.fill_price == pytest.approx(0.52)
+    led.close()
+
+
+def test_ledger_leader_observation_roundtrip(tmp_path):
+    """Leader position tracking + seen uids survive a restart; pruning drops
+    only uids old enough to have left every fetch window."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    db = str(tmp_path / "led.db")
+    led = Ledger(db)
+    led.record_leader_observation("0xl", "tok", 60.0, "u-old", now - timedelta(days=40))
+    led.record_leader_observation("0xl", "tok", 100.0, "u-new", now)
+    led.close()
+
+    with Ledger(db) as led2:
+        assert led2.load_leader_positions() == {("0xl", "tok"): 100.0}
+        assert led2.load_seen_uids() == {"u-old", "u-new"}
+        led2.prune_seen_trades(older_than_days=30.0)
+        assert led2.load_seen_uids() == {"u-new"}
 
 
 def test_paper_executor_rejects_nonpositive_size():

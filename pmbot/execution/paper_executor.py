@@ -37,6 +37,11 @@ class PaperExecutor(TradeExecutor):
         self.ledger = ledger
         self.price_cache = price_cache or PriceCache()
         self.slippage_bps = settings.slippage_bps if slippage_bps is None else slippage_bps
+        # Limit-order semantics for copied entries: never pay more than the
+        # leader's price + the drift budget. The strategy's drift guard checks
+        # the MID; a thin book's ask can sit far above it, and chasing it
+        # would let live fills run away from what every backtest assumes.
+        self.max_entry_premium = settings.copy_max_price_drift
 
     def execute(self, signal: Signal) -> Fill | None:
         if signal.size_usd <= 0:
@@ -117,9 +122,30 @@ class PaperExecutor(TradeExecutor):
         # CLOB cache can't quote Kalshi tokens, and the scan happened seconds
         # ago in the same cycle. Slippage budget still applies.
 
+        is_copy_buy = (
+            signal.side is Side.BUY
+            and signal.source_leader is not None
+            and signal.venue == Venue.POLYMARKET.value
+        )
         if signal.side is Side.BUY:
-            base = quote.ask if (quote and quote.ask) else signal.target_price
+            if quote and quote.ask:
+                base = quote.ask
+            elif is_copy_buy:
+                # No live book -> no copied entry. Falling back to the leader's
+                # own price would grant perfect fills exactly when we're blind
+                # (CLOB outage), inflating paper P&L with trades a live order
+                # could never get.
+                log.info("paper: no book for %s; skipping copy buy", signal.token_id[:10])
+                return None
+            else:
+                base = signal.target_price
             price = base * (1 + slip) if base else None
+            if price and is_copy_buy and price > signal.target_price + self.max_entry_premium:
+                log.info(
+                    "paper: fill %.4f beyond limit %.4f (leader %.4f); skipping copy buy",
+                    price, signal.target_price + self.max_entry_premium, signal.target_price,
+                )
+                return None
         else:
             base = quote.bid if (quote and quote.bid) else signal.target_price
             price = base * (1 - slip) if base else None

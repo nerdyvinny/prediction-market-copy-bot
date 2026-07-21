@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pmbot.models import Fill, Position, Side
 
@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS followed_leaders (
     wallet        TEXT PRIMARY KEY,
     score         REAL NOT NULL DEFAULT 0,
     followed_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS leader_positions (
+    leader        TEXT NOT NULL,
+    token_id      TEXT NOT NULL,
+    shares        REAL NOT NULL,
+    PRIMARY KEY (leader, token_id)
+);
+CREATE TABLE IF NOT EXISTS seen_trades (
+    uid           TEXT PRIMARY KEY,
+    ts            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fills_source_uid ON fills(source_uid);
 CREATE INDEX IF NOT EXISTS idx_fills_leader ON fills(source_leader);
@@ -254,6 +264,42 @@ class Ledger:
             "SELECT wallet FROM followed_leaders ORDER BY score DESC, wallet"
         ).fetchall()
         return [r["wallet"] for r in rows]
+
+    # -- leader-observation tracking (ExactCopyStrategy persistence) -------
+    def record_leader_observation(
+        self, leader: str, token_id: str, shares: float, uid: str, ts: datetime
+    ) -> None:
+        """Persist one observed leader trade: their running share count for the
+        token plus the trade uid, in a single transaction. Restarts then keep
+        proportional exits proportional (an unknown prior position degrades a
+        leader's 10% trim into a full exit of ours) without ever re-applying a
+        trade the strategy already counted."""
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO leader_positions (leader, token_id, shares)
+                   VALUES (?,?,?)
+                   ON CONFLICT(leader, token_id) DO UPDATE SET shares=excluded.shares""",
+                (leader, token_id, shares),
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO seen_trades (uid, ts) VALUES (?,?)",
+                (uid, ts.isoformat()),
+            )
+
+    def load_leader_positions(self) -> dict[tuple[str, str], float]:
+        rows = self.conn.execute(
+            "SELECT leader, token_id, shares FROM leader_positions"
+        ).fetchall()
+        return {(r["leader"], r["token_id"]): float(r["shares"]) for r in rows}
+
+    def load_seen_uids(self) -> set[str]:
+        return {r["uid"] for r in self.conn.execute("SELECT uid FROM seen_trades")}
+
+    def prune_seen_trades(self, older_than_days: float = 30.0) -> None:
+        """Drop seen-trade uids old enough to have left every fetch window."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        with self.conn:
+            self.conn.execute("DELETE FROM seen_trades WHERE ts < ?", (cutoff,))
 
     def fees_total(self) -> float:
         row = self.conn.execute(

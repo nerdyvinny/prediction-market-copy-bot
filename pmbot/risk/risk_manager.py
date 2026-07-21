@@ -47,10 +47,15 @@ class RiskManager:
 
     def _free_bankroll(self) -> float:
         deployed = sum(abs(p.shares * p.avg_price) for p in self.ledger.get_positions())
+        net_pnl = self.ledger.realized_pnl_total() - self.ledger.fees_total()
         base = self.bankroll
         if self.compound:
             # Winnings compound into deployable capital; losses shrink it.
-            base += self.ledger.realized_pnl_total() - self.ledger.fees_total()
+            base += net_pnl
+        else:
+            # Even without compounding, net losses always shrink what we can
+            # deploy — a real account cannot redeploy money it already lost.
+            base += min(0.0, net_pnl)
         return base - deployed
 
     def size(self, signal: Signal) -> Signal | None:

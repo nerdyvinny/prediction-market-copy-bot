@@ -18,8 +18,11 @@ reconstruction is unit-testable offline.
 
 Reconstruction approach: replay a wallet's trades through the same signed
 average-cost accounting the ledger uses (`apply_fill`). Sells realize P&L vs.
-prior buys; positions still open in a *resolved* market are settled at the
-outcome payout (1.0 winner / 0.0 loser). Win rate is over resolved markets.
+prior buys — clamped to the shares actually tracked in the window, since
+Polymarket has no naked shorts and a sell-from-zero can only be the exit of a
+pre-window position (scoring it as a short would fake losses on winners).
+Positions still open in a *resolved* market are settled at the outcome payout
+(1.0 winner / 0.0 loser). Win rate is over resolved markets.
 
 Honest caveats:
 - "categories" uses distinct event groups (event_slug) as a breadth proxy.
@@ -42,7 +45,8 @@ from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.data.resolution_cache import ResolutionStore
 from pmbot.leaders.config import FilterConfig, LeaderConfig, load_leader_config
-from pmbot.leaders.discovery import profile_candidates
+from pmbot.leaders.discovery import _shrunk_win_frac, profile_candidates
+from pmbot.leaders.records import RecordStore, harvest_resolved_records
 from pmbot.models import LeaderTrade, Side
 from pmbot.portfolio.ledger import apply_fill
 
@@ -113,15 +117,26 @@ def compute_wallet_stats(
     for t in trades:
         if not t.token_id or not t.market_id:
             continue
+        last_ts = t.timestamp              # any trade counts as activity/recency
+        shares, avg = pos.get(t.token_id, (0.0, 0.0))
+        fill_shares = t.shares
+        if t.side is Side.SELL:
+            # Polymarket has no naked shorts: a SELL beyond the shares we've
+            # tracked means the BUY predates this window. Realize only the
+            # tracked part and never fabricate a short position — the old
+            # behavior scored a pre-window winner's profitable exit as a
+            # losing "short" bet, systematically failing exactly the patient
+            # long-horizon wallets the filters are meant to find.
+            fill_shares = min(t.shares, shares) if shares > 0 else 0.0
+            if fill_shares <= 1e-9:
+                continue                   # exit of an untracked position: unscoreable
         token_market[t.token_id] = t.market_id
         market_gross[t.market_id] += t.usd_size
         if t.event_slug:
             categories.add(t.event_slug)
-        shares, avg = pos.get(t.token_id, (0.0, 0.0))
-        eff = apply_fill(shares, avg, t.side, t.shares, t.price)
+        eff = apply_fill(shares, avg, t.side, fill_shares, t.price)
         pos[t.token_id] = (eff.new_shares, eff.new_avg)
         market_realized[t.market_id] += eff.realized_delta
-        last_ts = t.timestamp
 
     # Settle still-open positions in resolved markets; mark resolved markets.
     resolved: set[str] = set()
@@ -227,6 +242,11 @@ class LeaderSelector:
         config: LeaderConfig | None = None,
         *,
         resolution_store: ResolutionStore | None = None,
+        # The resolved-market ledger: accumulated per-wallet win records that
+        # keep winners shortlisted even when today's feeds don't show them.
+        record_store: RecordStore | None = None,
+        records_shortlist_n: int = 300,
+        records_harvest_limit: int = 150,
         # 1000 (was 300): a qualifying wallet fell off the 350 cut between
         # two 2026-07-18 runs purely from feed churn. Early exits + the warm
         # resolution cache make the wider sweep cost ~a minute, not hours.
@@ -255,6 +275,9 @@ class LeaderSelector:
         self.copy_price_min = s.copy_price_min if copy_price_min is None else copy_price_min
         self.copy_price_max = s.copy_price_max if copy_price_max is None else copy_price_max
         self.store = resolution_store
+        self.record_store = record_store
+        self.records_shortlist_n = records_shortlist_n
+        self.records_harvest_limit = records_harvest_limit
         self.deep_score_limit = deep_score_limit
         self.explore_n = explore_n
         self.feed_min_trades = feed_min_trades
@@ -363,7 +386,10 @@ class LeaderSelector:
         allow = set(cfg.allowlist)
         block = set(cfg.blocklist)
 
-        # Stage 1: profile the whole pool from feeds.
+        # Stage 1: profile the whole pool from feeds, and grow the persistent
+        # resolved-market ledger. Feeds see only the loudest markets of the
+        # moment; the accumulated records remember every winner they've ever
+        # covered, so proven wallets stay visible through feed churn.
         profiles = profile_candidates(
             self.data,
             self.gamma,
@@ -372,16 +398,35 @@ class LeaderSelector:
             per_market_trades=self.per_market_trades,
             lookback_days=cfg.filters.lookback_days,
         )
-        pool = (set(profiles) | allow) - block
+        record_quality: dict[str, float] = {}
+        if self.record_store is not None:
+            try:
+                harvest_resolved_records(
+                    self.data, self.gamma, self.record_store,
+                    market_limit=self.records_harvest_limit,
+                    lookback_days=cfg.filters.lookback_days,
+                    per_market_trades=self.per_market_trades,
+                )
+                since = (now - timedelta(days=cfg.filters.lookback_days)).isoformat()
+                for w, (wins, losses, pnl) in self.record_store.wallet_summaries(since).items():
+                    if pnl > 0:            # only net winners earn shortlist slots
+                        record_quality[w] = _shrunk_win_frac(wins, losses)
+            except Exception as e:
+                log.warning("records: harvest failed (%s); continuing without", e)
+        pool = (set(profiles) | set(record_quality) | allow) - block
 
         # Stage 2: shortlist by estimated win quality — NOT by activity, which
         # would hand the deep-score slots to high-frequency market-maker bots.
+        # Two evidence sources: today's feeds and the accumulated records.
         active = [
             w for w in pool
             if w in profiles and profiles[w].n_trades >= self.feed_min_trades
         ]
         shortlist = sorted(active, key=lambda w: profiles[w].quality, reverse=True)
         chosen = set(shortlist[: self.deep_score_limit])
+        if record_quality:
+            by_record = sorted(record_quality, key=record_quality.__getitem__, reverse=True)
+            chosen |= set(by_record[: self.records_shortlist_n]) - block
         chosen |= {w.lower() for w in (incumbents or [])} - block
         chosen |= allow
         rest = sorted(pool - chosen)
@@ -424,6 +469,7 @@ class LeaderSelector:
         rejects.update(filter_fails)
         self.last_report = {
             "pool": len(pool),
+            "record_wallets": len(record_quality),
             "deep_scored": len(targets),
             "early_rejects": dict(early),
             "filter_rejects": dict(filter_fails),

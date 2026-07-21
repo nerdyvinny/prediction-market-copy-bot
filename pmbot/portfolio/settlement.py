@@ -44,6 +44,20 @@ class Settler:
             settled += 1
         return settled
 
+    def force_settle_market(self, market_id: str, price: float) -> int:
+        """Manually settle every open position in one market at `price`.
+
+        Escape hatch for markets that never resolve decisively (final winner
+        price below the 0.99 auto-settle threshold) — without it their
+        positions pin bankroll forever. Returns positions settled.
+        """
+        n = 0
+        for pos in self.ledger.get_positions():
+            if pos.market_id == market_id:
+                self._record_settlement(pos, price)
+                n += 1
+        return n
+
     # -- resolution lookups ------------------------------------------------
     def _settlement_price(self, pos: Position) -> float | None:
         """1.0 / 0.0 once resolved decisively; None while open/undecided."""

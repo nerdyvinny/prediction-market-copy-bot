@@ -11,6 +11,9 @@ mirroring a leader out of a position reduces risk and is never blocked):
     leader's own fill price — if the edge that made the trade worth copying
     has already been arbitraged away by faster bots, skip it rather than
     chase a stale price
+  - the trade is younger than `max_trade_age_minutes` — a newly followed
+    leader's whole recent tape looks "unseen", and old entries whose price
+    merely happens to be unchanged are history, not signals
 
 BUY: same shape as a fresh entry, sized by the RiskManager off leader notional.
 SELL: mirrored *proportionally*. We track each leader's running per-token
@@ -59,6 +62,7 @@ class ExactCopyStrategy(Strategy):
         max_price_drift: float | None = None,
         min_leader_notional: float | None = None,
         min_hours_to_resolution: float | None = None,
+        max_trade_age_minutes: float | None = None,
         trades_per_leader: int = 25,
         market_cache_ttl: float = 300.0,
     ):
@@ -80,13 +84,33 @@ class ExactCopyStrategy(Strategy):
             s.copy_min_hours_to_resolution if min_hours_to_resolution is None
             else min_hours_to_resolution
         )
+        self.max_trade_age_minutes = (
+            s.copy_max_trade_age_minutes if max_trade_age_minutes is None
+            else max_trade_age_minutes
+        )
         self.trades_per_leader = trades_per_leader
         self._market_cache_ttl = market_cache_ttl
         self._market_cache: dict[str, tuple[float, Market | None]] = {}
         # Per (leader, token) running share count, reconstructed from trades
-        # we've observed since we started following this leader.
+        # we've observed since we started following this leader. Persisted in
+        # the ledger so a restart keeps proportional exits proportional
+        # instead of degrading every leader trim into a full exit of ours.
         self._leader_shares: dict[tuple[str, str], float] = {}
+        # Two dedupe sets with different jobs and lifetimes:
+        #   _seen_uids     — "already counted toward leader position tracking";
+        #                    persisted, so restarts never double-count.
+        #   _processed_uids — "copy decision was made" (copied OR deliberately
+        #                    filtered); in-memory only, so a restart re-decides
+        #                    (the ledger's has_copied still dedupes real fills)
+        #                    and a transient skip isn't a permanent one.
         self._seen_uids: set[str] = set()
+        self._processed_uids: set[str] = set()
+        try:
+            self.ledger.prune_seen_trades(older_than_days=30.0)
+            self._leader_shares = self.ledger.load_leader_positions()
+            self._seen_uids = self.ledger.load_seen_uids()
+        except Exception as e:
+            log.debug("strategy: leader-tracking restore failed: %s", e)
 
     def set_leaders(self, leaders: list[str], *, exit_only: list[str] | None = None) -> None:
         """Update the watchlist. `exit_only` wallets keep their SELLs mirrored
@@ -105,26 +129,34 @@ class ExactCopyStrategy(Strategy):
         try:
             m = self.gamma.get_market(condition_id)
         except Exception as e:
+            # Transient failure (rate limit, timeout): serve the stale entry if
+            # we have one, but never CACHE the error — a poisoned entry would
+            # silently drop every trade in the market for the next TTL window.
+            # (Same fix as LeaderSelector._resolver and the backtesters.)
             log.debug("strategy: market lookup failed %s: %s", condition_id[:12], e)
-            m = None
+            return hit[1] if hit else None
         self._market_cache[condition_id] = (now, m)
         return m
 
     def _too_stale(self, token_id: str, leader_price: float) -> bool:
+        """True when the current quote can't confirm the leader's price is
+        still there. Fails CLOSED for entries: no cache client configured is
+        an explicit opt-out (backtests/offline), but a fetch error or an empty
+        book means we cannot verify the edge — don't chase it blind."""
         if not self.price_cache:
             return False
         try:
             quote = self.price_cache.get_quote(token_id)
         except Exception as e:
             log.debug("strategy: quote fetch failed for %s: %s", token_id[:10], e)
-            return False
+            return True
         mid = None
         if quote and quote.bid and quote.ask:
             mid = (quote.bid + quote.ask) / 2
         elif quote and (quote.bid or quote.ask):
             mid = quote.bid or quote.ask
         if mid is None:
-            return False
+            return True
         return abs(mid - leader_price) > self.max_price_drift
 
     def generate(self) -> Iterable[Signal]:
@@ -140,33 +172,56 @@ class ExactCopyStrategy(Strategy):
             # Oldest-first so leader position tracking replays in order.
             for t in sorted(trades, key=lambda tr: tr.timestamp):
                 key = (leader, t.token_id)
-                already_seen = t.uid in self._seen_uids
-                if not already_seen:
-                    # Apply exactly once per trade uid — the same trade stays
-                    # in the fetched window across multiple poll cycles, and
-                    # re-applying it would double-count the leader's position.
+                if t.uid not in self._seen_uids:
+                    # Count toward leader position tracking exactly once per
+                    # trade uid — the same trade stays in the fetched window
+                    # across poll cycles, and re-applying it would double-count
+                    # the leader's position.
                     prior_shares = self._leader_shares.get(key, 0.0)
                     eff = apply_fill(prior_shares, 0.0, t.side, t.shares, t.price)
                     self._seen_uids.add(t.uid)
                     self._leader_shares[key] = eff.new_shares
+                    try:
+                        self.ledger.record_leader_observation(
+                            leader, t.token_id, eff.new_shares, t.uid, t.timestamp
+                        )
+                    except Exception as e:
+                        log.debug("strategy: leader-tracking persist failed: %s", e)
+                elif t.side is Side.SELL:
+                    # Tracked before this process started (restart): the
+                    # stored count is post-sell, so reconstruct the pre-sell
+                    # count for proportional mirroring.
+                    prior_shares = self._leader_shares.get(key, 0.0) + t.shares
+                else:
+                    prior_shares = self._leader_shares.get(key, 0.0)
 
-                if already_seen or self.ledger.has_copied(t.uid):
+                if t.uid in self._processed_uids or self.ledger.has_copied(t.uid):
                     continue
 
                 if exit_only and t.side is Side.BUY:
                     continue                       # exit-only leader: mirror exits, never new entries
 
                 market = self._market(t.market_id)
-                if market is None or market.closed:
-                    continue
 
                 if t.side is Side.BUY:
+                    # Entries need live market metadata; a TRANSIENT lookup
+                    # failure leaves the trade unprocessed so the next cycle
+                    # retries it instead of skipping it forever.
+                    if market is None:
+                        continue
+                    self._processed_uids.add(t.uid)  # decision below is final
+                    if market.closed:
+                        continue
                     # Entry-only filters: exits are never blocked by these —
                     # mirroring a leader out of a position reduces our risk.
                     if not (self.price_min <= t.price <= self.price_max):
                         continue                   # skip extreme-priced, low-edge trades
                     if t.usd_size < self.min_leader_notional:
                         continue                   # low-conviction probe; not worth our slice
+                    if self.max_trade_age_minutes > 0:
+                        age_min = (now - t.timestamp).total_seconds() / 60.0
+                        if age_min > self.max_trade_age_minutes:
+                            continue               # stale history (new follow / downtime), not a fresh signal
                     if self._too_stale(t.token_id, t.price):
                         continue                   # edge likely already gone
                     if market.liquidity_usd is not None and market.liquidity_usd < self.min_liquidity:
@@ -187,6 +242,12 @@ class ExactCopyStrategy(Strategy):
                         source_uid=t.uid,
                     )
                 else:
+                    self._processed_uids.add(t.uid)
+                    # Exits are risk-reducing: a failed market lookup must
+                    # never block one (only a definitively closed market does —
+                    # settlement owns those).
+                    if market is not None and market.closed:
+                        continue
                     our_position = self.ledger.get_position(t.token_id)
                     if our_position is None or abs(our_position.shares) <= 1e-9:
                         continue                   # nothing of ours to mirror-sell

@@ -38,7 +38,10 @@ class Settings(BaseSettings):
     # as fast as is polite to the public Data API (8 leader queries/cycle).
     poll_interval_seconds: float = 10.0
     # How often to check open positions for resolved markets (realize P&L).
-    settle_interval_hours: float = 6.0
+    # Settling is cheap (one Gamma call per open position) and every hour a
+    # resolved position sits unsettled is bankroll that can't fund new copies,
+    # so check often.
+    settle_interval_hours: float = 0.5
 
     # Capital & sizing. Walk-forward validated 2026-07 (tuned on the 45d
     # window ending 45d ago, validated on the most recent 45d): 0.10/100/400
@@ -48,10 +51,11 @@ class Settings(BaseSettings):
     copy_fraction: float = 0.10            # replicate this fraction of leader size
     max_per_market_usd: float = 100.0      # hard cap per market
     max_per_leader_usd: float = 400.0      # hard cap of exposure per leader
-    # Redeploy realized profits (and shrink after losses): free bankroll is
-    # bankroll + realized P&L - deployed, instead of a fixed starting amount.
-    # Off by default: in validation the extra compounding-funded trades were
-    # net losers ($1,333 vs $1,471); flip on for long horizons if desired.
+    # Redeploy realized profits: free bankroll is bankroll + realized P&L -
+    # deployed, instead of a fixed starting amount. Off by default: in
+    # validation the extra compounding-funded trades were net losers ($1,333
+    # vs $1,471). Note: net realized LOSSES always shrink the free bankroll
+    # regardless of this flag — a real account can't redeploy money it lost.
     compound_profits: bool = False
     min_market_liquidity_usd: float = 5000.0  # skip thin markets
 
@@ -74,6 +78,12 @@ class Settings(BaseSettings):
     # bounds how far a live fill can deviate from what the backtests assume
     # (they fill at the leader's price ± slippage), so keep it tight.
     copy_max_price_drift: float = 0.03
+    # Never copy a leader BUY older than this (minutes; 0 = off). Protects
+    # against replaying stale history when a NEW leader is first followed (or
+    # after downtime): their recent tape all looks "unseen", and the drift
+    # guard alone lets through old trades whose price happens to be unchanged.
+    # SELLs are never age-filtered — mirroring an exit reduces risk at any age.
+    copy_max_trade_age_minutes: float = 60.0
     # Only copy leader BUYs at or above this notional: a leader's small probes
     # carry little conviction and our slice of them dies to slippage/dust caps.
     # SELLs are always mirrored (reducing risk should never be filtered).

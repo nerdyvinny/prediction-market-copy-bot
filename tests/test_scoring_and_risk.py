@@ -76,6 +76,33 @@ def test_compute_wallet_stats_settles_losing_outcome():
     assert st.win_rate == 0.0
 
 
+def test_sell_from_zero_is_not_scored_as_short():
+    """A SELL with no tracked prior buy is the exit of a PRE-WINDOW position
+    (Polymarket has no naked shorts). It must be ignored, not booked as a
+    short — the old behavior turned a patient whale's profitable exit on a
+    winning market into a fake loss and failed them on win rate."""
+    trades = [_t("A", "A1", Side.SELL, 0.90, 100, 2, "cat-a")]
+    resolver = {"A": (True, "A1")}.__getitem__   # their token WON
+    st = compute_wallet_stats("0xL", trades, resolver, now=NOW)
+    assert st.realized_pnl == pytest.approx(0.0)   # was -$10 fake short loss
+    assert st.n_resolved_markets == 0              # nothing scoreable in window
+    assert st.recency_days == pytest.approx(2.0, abs=0.01)  # still counts as activity
+
+
+def test_sell_clamped_to_tracked_shares():
+    # Bought 40 in-window; sells 100 (60 predate the window). Realize only
+    # the tracked 40 and leave no phantom short to settle at resolution.
+    trades = [
+        _t("A", "A1", Side.BUY, 0.40, 40, 5, "cat-a"),
+        _t("A", "A1", Side.SELL, 0.90, 100, 2, "cat-a"),
+    ]
+    resolver = {"A": (True, "A1")}.__getitem__
+    st = compute_wallet_stats("0xL", trades, resolver, now=NOW)
+    assert st.realized_pnl == pytest.approx((0.90 - 0.40) * 40)
+    assert st.n_resolved_markets == 1
+    assert st.win_rate == pytest.approx(1.0)
+
+
 def test_passes_filters_enforces_new_spec():
     # Defaults: 30d window, ≥50 trades, ≥25 resolved, ≥80% win rate, net-positive,
     # last trade ≤48h, ≤40% of profit from one market, single-market OK.
@@ -253,4 +280,19 @@ def test_compounding_shrinks_after_losses():
                          timestamp=NOW, mode="paper"))
     rm = RiskManager(led, _settings(bankroll_usd=500.0, compound_profits=True))
     assert rm._free_bankroll() == pytest.approx(300.0)            # 500 - 200
+    led.close()
+
+
+def test_fixed_bankroll_also_shrinks_after_losses():
+    """Losses reduce deployable capital even with compounding OFF — a real
+    account cannot redeploy money it already lost. (Profits still don't add.)"""
+    led = Ledger(":memory:")
+    buy = _sig(400, token="tokL", market="mL")
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=400, shares=800,
+                         timestamp=NOW, mode="paper"))
+    sell = Signal("mL", "tokL", "Yes", Side.SELL, 0.25, 200, "exit", source_uid="s3")
+    led.record_fill(Fill(signal=sell, fill_price=0.25, size_usd=200, shares=800,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(bankroll_usd=500.0, compound_profits=False))
+    assert rm._free_bankroll() == pytest.approx(300.0)            # 500 - 200 loss
     led.close()

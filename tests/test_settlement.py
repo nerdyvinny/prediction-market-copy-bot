@@ -93,6 +93,21 @@ def test_missing_kalshi_client_skips_kalshi_positions():
     led.close()
 
 
+def test_force_settle_market_escape_hatch():
+    """Markets that never resolve decisively (winner below the 0.99 auto
+    threshold) can be settled manually so they stop pinning bankroll."""
+    led = Ledger(":memory:")
+    buy(led, market_id="0xstuck", token_id="tok-yes", outcome="Yes",
+        price=0.40, shares=100, venue=Venue.POLYMARKET.value)
+    buy(led, market_id="0xother", token_id="tok-b", outcome="Yes",
+        price=0.40, shares=10, venue=Venue.POLYMARKET.value)
+    n = Settler(led, FakeGamma({}), None).force_settle_market("0xstuck", 0.0)
+    assert n == 1
+    assert [p.market_id for p in led.get_positions()] == ["0xother"]  # untouched
+    assert abs(led.realized_pnl_total() - (-40.0)) < 1e-6
+    led.close()
+
+
 def test_losing_pm_position_settles_to_zero():
     led = Ledger(":memory:")
     buy(led, market_id="0xmkt", token_id="tok-no", outcome="No",

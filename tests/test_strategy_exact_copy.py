@@ -212,6 +212,127 @@ class FakePriceCache:
         return self._quote
 
 
+def test_old_buys_skipped_but_old_sells_mirrored():
+    """The age guard (default 60 min) keeps a NEW leader's replayed history
+    from being copied as fresh entries; exits are never age-filtered."""
+    markets = {"m_ok": _mkt("m_ok")}
+    old = NOW - timedelta(hours=3)
+    led = Ledger(":memory:")
+    buy = _trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u-old-buy", ts=old)
+    assert list(_strategy([buy], markets, led).generate()) == []
+    led.close()
+
+    led2 = Ledger(":memory:")
+    our_buy = Signal("m_ok", "tokOK", "Yes", Side.BUY, 0.50, 5, "copy",
+                     source_leader="0xlead", source_uid="u-old2")
+    led2.record_fill(Fill(signal=our_buy, fill_price=0.50, size_usd=5, shares=10,
+                          timestamp=old, mode="paper"))
+    sell = _trade("m_ok", "tokOK", Side.SELL, 0.55, 100, "u-old-sell", ts=old)
+    sigs = list(_strategy([sell], markets, led2).generate())
+    assert len(sigs) == 1 and sigs[0].side is Side.SELL
+    led2.close()
+
+
+class FlakyGamma:
+    """Raises for the first `fail_n` lookups, then serves markets."""
+
+    def __init__(self, markets, fail_n=1):
+        self._markets = markets
+        self.calls = 0
+        self.fail_n = fail_n
+
+    def get_market(self, condition_id):
+        self.calls += 1
+        if self.calls <= self.fail_n:
+            raise RuntimeError("rate limited")
+        return self._markets.get(condition_id)
+
+
+def test_transient_market_lookup_failure_retries_next_cycle():
+    """A rate-limited Gamma call must not consume the trade: the entry is
+    retried on the next cycle once the lookup succeeds (errors are neither
+    cached nor treated as a final decision)."""
+    markets = {"m_ok": _mkt("m_ok")}
+    trades = [_trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u1")]
+    led = Ledger(":memory:")
+    strat = ExactCopyStrategy(
+        FakeData(trades), FlakyGamma(markets), led, leaders=["0xlead"],
+        min_liquidity=5000, price_min=0.05, price_max=0.95, min_leader_notional=0.0,
+    )
+    assert list(strat.generate()) == []          # cycle 1: lookup failed
+    sigs = list(strat.generate())                # cycle 2: fresh lookup works
+    assert len(sigs) == 1 and sigs[0].side is Side.BUY
+    led.close()
+
+
+def test_sell_mirrored_even_when_market_lookup_fails():
+    """Exits are risk-reducing and must never be blocked by a dead API."""
+    markets = {}                                  # every lookup fails
+    sell = _trade("m_ok", "tokOK", Side.SELL, 0.55, 100, "u-sell")
+    led = Ledger(":memory:")
+    our_buy = Signal("m_ok", "tokOK", "Yes", Side.BUY, 0.50, 5, "copy",
+                     source_leader="0xlead", source_uid="u-old")
+    led.record_fill(Fill(signal=our_buy, fill_price=0.50, size_usd=5, shares=10,
+                         timestamp=NOW, mode="paper"))
+    strat = ExactCopyStrategy(
+        FakeData([sell]), FlakyGamma({}, fail_n=10**9), led, leaders=["0xlead"],
+        min_liquidity=5000, price_min=0.05, price_max=0.95, min_leader_notional=0.0,
+    )
+    sigs = list(strat.generate())
+    assert len(sigs) == 1 and sigs[0].side is Side.SELL
+    led.close()
+
+
+class RaisingPriceCache:
+    def get_quote(self, token_id):
+        raise RuntimeError("CLOB down")
+
+
+def test_drift_guard_fails_closed_on_quote_errors():
+    """No verifiable quote (error or empty book) -> no copied entry. The old
+    fail-open copied blind during CLOB outages, at fills no live order gets."""
+    markets = {"m_ok": _mkt("m_ok")}
+    trades = [_trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u1")]
+
+    led = Ledger(":memory:")
+    strat = _strategy(trades, markets, led, price_cache=RaisingPriceCache())
+    assert list(strat.generate()) == []
+    led.close()
+
+    led2 = Ledger(":memory:")
+    empty = FakePriceCache(FakeQuote(bid=None, ask=None))
+    strat2 = _strategy(trades, markets, led2, price_cache=empty)
+    assert list(strat2.generate()) == []
+    led2.close()
+
+
+def test_leader_tracking_survives_restart(tmp_path):
+    """Persisted leader positions keep exits PROPORTIONAL across restarts:
+    without them, an unknown prior position degrades a leader's 40% trim
+    into a full exit of ours."""
+    db = str(tmp_path / "led.db")
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1 = NOW - timedelta(minutes=30), NOW
+    buy = _trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u-buy", ts=t0)
+    sell = _trade("m_ok", "tokOK", Side.SELL, 0.55, 40, "u-sell", ts=t1)  # 40% exit
+
+    led = Ledger(db)
+    strat = _strategy([buy], markets, led)
+    list(strat.generate())                        # observes + persists the buy
+    our_buy = Signal("m_ok", "tokOK", "Yes", Side.BUY, 0.50, 5, "copy",
+                     source_leader="0xlead", source_uid="u-buy")
+    led.record_fill(Fill(signal=our_buy, fill_price=0.50, size_usd=5, shares=10,
+                         timestamp=t0, mode="paper"))
+    led.close()
+
+    led2 = Ledger(db)                             # "restart"
+    strat2 = _strategy([buy, sell], markets, led2)
+    sigs = list(strat2.generate())
+    assert len(sigs) == 1 and sigs[0].side is Side.SELL
+    assert sigs[0].size_shares == pytest.approx(10 * 0.4)   # proportional, not full
+    led2.close()
+
+
 def test_staleness_guard_skips_drifted_price():
     markets = {"m_ok": _mkt("m_ok")}
     trades = [_trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u1")]
