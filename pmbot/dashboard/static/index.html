@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pmbot</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
 
@@ -12,23 +12,30 @@
   <div class="brand">
     <span class="wordmark">pmbot</span>
     <span class="badge" id="mode-badge">—</span>
-    <span class="engine" id="engine">
-      <span class="dot" id="engine-dot"></span><span id="engine-text">checking…</span>
-    </span>
   </div>
-  <div class="updated" id="updated">loading…</div>
+  <div class="header-status">
+    <span class="engine" id="engine">
+      <span class="dot" id="engine-dot"></span><span id="engine-text">Checking…</span>
+    </span>
+    <span class="sep">·</span>
+    <span id="updated">Loading…</span>
+  </div>
 </header>
 
 <main>
-  <section class="stats" id="stats"></section>
-
-  <section class="card">
-    <div class="card-head">
-      <h2>Realized P&amp;L</h2>
-      <span class="sub" id="chart-sub"></span>
+  <section class="hero">
+    <div class="hero-tile">
+      <div class="label">Open positions</div>
+      <div class="value" id="open-pnl">—</div>
+      <div class="caption">unrealized P&amp;L at current prices</div>
     </div>
-    <div id="chart" class="chart"></div>
+    <div class="hero-tile">
+      <div class="label">Closed positions</div>
+      <div class="value" id="closed-pnl">—</div>
+      <div class="caption">realized P&amp;L, net of fees</div>
+    </div>
   </section>
+  <p class="strip" id="strip"></p>
 
   <section class="card">
     <div class="card-head">
@@ -39,47 +46,56 @@
       <table id="positions">
         <thead><tr>
           <th class="left">Market</th><th class="left">Side</th>
-          <th>Shares</th><th>Avg</th><th>Last</th>
-          <th>Cost</th><th>Value</th><th>Unrealized</th>
+          <th>Put in</th><th>Worth now</th><th>P&amp;L</th>
         </tr></thead>
         <tbody></tbody>
       </table>
     </div>
   </section>
 
-  <div class="cols">
-    <section class="card">
-      <div class="card-head"><h2>Leaders</h2><span class="sub" id="leaders-sub"></span></div>
-      <div class="table-wrap">
-        <table id="leaders">
-          <thead><tr><th class="left">Wallet</th><th>Open exposure</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card-head"><h2>Bot config</h2></div>
-      <dl class="config" id="config"></dl>
-    </section>
-  </div>
+  <section class="card">
+    <div class="card-head">
+      <h2>Copied trades</h2>
+      <span class="sub" id="trades-sub"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="trades">
+        <thead><tr>
+          <th class="left">Market</th><th>Put in</th>
+          <th class="left">Where it stands</th><th>Net</th><th class="left">Status</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
 
   <section class="card">
-    <div class="card-head"><h2>Trade log</h2><span class="sub" id="fills-sub"></span></div>
+    <div class="card-head">
+      <h2>Trade log</h2>
+      <span class="sub" id="fills-sub"></span>
+    </div>
     <div class="table-wrap">
       <table id="fills">
         <thead><tr>
           <th class="left">Time</th><th class="left">Market</th><th class="left">Action</th>
-          <th>Price</th><th>Size</th><th class="left">Copied from</th>
+          <th>Price</th><th>Amount</th><th class="left">Copied from</th>
         </tr></thead>
         <tbody></tbody>
       </table>
     </div>
   </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Updates</h2>
+      <span class="sub" id="updates-sub"></span>
+    </div>
+    <ul class="updates" id="updates"></ul>
+  </section>
 </main>
 
-<footer>read-only paper ledger · no orders are placed from this page</footer>
+<footer>Read-only paper ledger · no orders are placed from this page</footer>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=2"></script>
 </body>
 </html>

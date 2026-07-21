@@ -1,7 +1,7 @@
 """Local web dashboard for pmbot.
 
 Read-only view over the paper ledger (SQLite) plus live Polymarket quotes.
-Serves a single dark-mode page and a JSON state endpoint the page polls.
+Serves a single page and a JSON state endpoint the page polls.
 
 Run from the repo root:
 
@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
-import yaml
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,13 +25,20 @@ from fastapi.staticfiles import StaticFiles
 from pmbot.config.settings import get_settings
 from pmbot.data import GammaClient
 from pmbot.data.price_cache import PriceCache
-from pmbot.models import Side
-from pmbot.portfolio.ledger import Ledger, apply_fill
+from pmbot.portfolio.ledger import Ledger
 
 app = FastAPI(title="pmbot dashboard")
 
+
+@app.middleware("http")
+async def no_cache(request, call_next):
+    # Local single-user dashboard: force revalidation so edits to the static
+    # files show up on reload instead of being pinned by heuristic caching.
+    resp = await call_next(request)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
 _STATIC = Path(__file__).parent / "static"
-_LEADERS_YAML = Path(__file__).parent.parent / "config" / "leaders.yaml"
 
 # Lazy singletons: market questions never change, quotes have their own TTL.
 _gamma: GammaClient | None = None
@@ -84,38 +90,76 @@ def _engine_running() -> bool:
     return running
 
 
-def _pnl_timeline(fills: list[dict]) -> list[dict]:
-    """Replay fills in order and emit cumulative net realized P&L points.
+def _mid_for(token_id: str, venue: str) -> float | None:
+    if venue != "polymarket":
+        return None  # no public quote source wired for other venues
+    try:
+        return _get_prices().get_quote(token_id).mid
+    except Exception:
+        return None
 
-    Uses the same apply_fill math as the ledger so settlement SELLs and
-    partial exits realize exactly what the ledger realized.
+
+def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
+    """Roll fills up per outcome token: money in, money back, what's left.
+
+    One row = one copied trade (a position in one outcome). `returned_usd`
+    includes settlement payouts because settlement writes SELL fills too.
     """
-    book: dict[str, tuple[float, float]] = {}  # token_id -> (shares, avg)
-    cum = 0.0
-    points = []
+    trades: dict[str, dict] = {}
     for f in fills:
-        shares, avg = book.get(f["token_id"], (0.0, 0.0))
-        side = Side.BUY if f["side"] == "BUY" else Side.SELL
-        fill_shares = f["shares"] if f["shares"] else (
-            f["size_usd"] / f["fill_price"] if f["fill_price"] else 0.0
-        )
-        eff = apply_fill(shares, avg, side, fill_shares, f["fill_price"])
-        book[f["token_id"]] = (eff.new_shares, eff.new_avg)
-        cum += eff.realized_delta - (f["fee_usd"] or 0.0)
-        points.append({"ts": f["ts"], "net_pnl": round(cum, 2)})
-    return points
+        t = trades.setdefault(f["token_id"], {
+            "token_id": f["token_id"],
+            "market_id": f["market_id"],
+            "outcome": f["outcome"],
+            "venue": f["venue"],
+            "leader": None,
+            "invested_usd": 0.0,
+            "returned_usd": 0.0,
+            "fees_usd": 0.0,
+            "first_ts": f["ts"],
+            "last_ts": f["ts"],
+        })
+        if f["side"] == "BUY":
+            t["invested_usd"] += f["size_usd"]
+        else:
+            t["returned_usd"] += f["size_usd"]
+        t["fees_usd"] += f["fee_usd"] or 0.0
+        if t["leader"] is None and f["source_leader"]:
+            t["leader"] = f["source_leader"]
+        t["last_ts"] = f["ts"]
+
+    out = []
+    for t in trades.values():
+        pos = open_pos.get(t["token_id"])
+        is_open = pos is not None
+        mid = mids.get(t["token_id"]) if is_open else None
+        open_value = pos.shares * mid if (is_open and mid is not None) else None
+        if is_open:
+            # Net needs a live quote for the open remainder; without one it's unknown.
+            net = (t["returned_usd"] + open_value - t["invested_usd"] - t["fees_usd"]
+                   ) if open_value is not None else None
+        else:
+            net = t["returned_usd"] - t["invested_usd"] - t["fees_usd"]
+        out.append({
+            **t,
+            "question": _question_for(t["market_id"]),
+            "status": "open" if is_open else "closed",
+            "open_value_usd": round(open_value, 2) if open_value is not None else None,
+            "net_usd": round(net, 2) if net is not None else None,
+        })
+    out.sort(key=lambda t: t["last_ts"], reverse=True)
+    return out
 
 
 @app.get("/api/state")
-def state(fills_limit: int = 100) -> dict:
+def state() -> dict:
     settings = get_settings()
     led = Ledger(settings.db_path)
     try:
         summary = led.summary()
         positions = led.get_positions()
-        leader_exposure = led.leader_exposures()
         rows = led.conn.execute(
-            "SELECT ts, mode, market_id, token_id, outcome, side, fill_price,"
+            "SELECT ts, market_id, token_id, outcome, side, fill_price,"
             "       size_usd, shares, reason, source_leader, venue, fee_usd "
             "FROM fills ORDER BY ts"
         ).fetchall()
@@ -123,17 +167,12 @@ def state(fills_limit: int = 100) -> dict:
         led.close()
 
     all_fills = [dict(r) for r in rows]
-    timeline = _pnl_timeline(all_fills)
+    open_pos = {p.token_id: p for p in positions}
+    mids = {p.token_id: _mid_for(p.token_id, p.venue) for p in positions}
 
-    # Enrich open positions with market names + live quotes.
     pos_out = []
     for p in positions:
-        mid = None
-        if p.venue == "polymarket":
-            try:
-                mid = _get_prices().get_quote(p.token_id).mid
-            except Exception:
-                mid = None
+        mid = mids.get(p.token_id)
         cost = p.shares * p.avg_price
         value = p.shares * mid if mid is not None else None
         pos_out.append({
@@ -143,21 +182,17 @@ def state(fills_limit: int = 100) -> dict:
             "venue": p.venue,
             "shares": p.shares,
             "avg_price": p.avg_price,
-            "cost_usd": cost,
             "mid": mid,
-            "value_usd": value,
-            "unrealized_usd": (value - cost) if value is not None else None,
+            "cost_usd": round(cost, 2),
+            "value_usd": round(value, 2) if value is not None else None,
+            "unrealized_usd": round(value - cost, 2) if value is not None else None,
             "anomaly": p.shares < 0,
         })
+    pos_out.sort(key=lambda p: abs(p["cost_usd"]), reverse=True)
 
-    fills_out = []
-    for f in reversed(all_fills[-fills_limit:]):
-        fills_out.append({**f, "question": _question_for(f["market_id"])})
-
-    try:
-        leaders_cfg = yaml.safe_load(_LEADERS_YAML.read_text()) or {}
-    except Exception:
-        leaders_cfg = {}
+    fills_out = [
+        {**f, "question": _question_for(f["market_id"])} for f in reversed(all_fills)
+    ]
 
     unrealized = sum(
         p["unrealized_usd"] for p in pos_out if p["unrealized_usd"] is not None
@@ -167,32 +202,17 @@ def state(fills_limit: int = 100) -> dict:
         "engine_running": _engine_running(),
         "mode": settings.mode.value,
         "summary": {
-            **summary,
-            "unrealized_pnl": round(unrealized, 2),
+            "open_pnl": round(unrealized, 2),
+            "closed_pnl": round(summary["net_pnl"], 2),
+            "total_pnl": round(unrealized + summary["net_pnl"], 2),
+            "deployed_usd": round(summary["deployed_usd"], 2),
             "bankroll_usd": settings.bankroll_usd,
-        },
-        "settings": {
-            "poll_interval_seconds": settings.poll_interval_seconds,
-            "copy_fraction": settings.copy_fraction,
-            "max_per_market_usd": settings.max_per_market_usd,
-            "max_per_leader_usd": settings.max_per_leader_usd,
-            "copy_price_min": settings.copy_price_min,
-            "copy_price_max": settings.copy_price_max,
-            "copy_min_leader_notional_usd": settings.copy_min_leader_notional_usd,
-            "copy_max_price_drift": settings.copy_max_price_drift,
-            "min_market_liquidity_usd": settings.min_market_liquidity_usd,
-            "slippage_bps": settings.slippage_bps,
-            "arb_enabled": settings.arb_enabled,
-            "db_path": settings.db_path,
-        },
-        "leaders": {
-            "exposure": leader_exposure,
-            "top_n": (leaders_cfg.get("selection") or {}).get("top_n"),
-            "lookback_days": (leaders_cfg.get("filters") or {}).get("lookback_days"),
-            "min_win_rate": (leaders_cfg.get("filters") or {}).get("min_win_rate"),
+            "open_positions": summary["open_positions"],
+            "fills": summary["fills"],
+            "fees_usd": round(summary["fees_usd"], 2),
         },
         "positions": pos_out,
-        "pnl_timeline": timeline,
+        "trades": _group_trades(all_fills, open_pos, mids),
         "fills": fills_out,
     }
 
