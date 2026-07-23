@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient, PriceCache
-from pmbot.models import Market, Side, Signal
+from pmbot.models import LeaderTrade, Market, Side, Signal
 from pmbot.portfolio.ledger import Ledger, apply_fill
 from pmbot.strategy.base import Strategy
 
@@ -138,26 +138,66 @@ class ExactCopyStrategy(Strategy):
         self._market_cache[condition_id] = (now, m)
         return m
 
-    def _too_stale(self, token_id: str, leader_price: float) -> bool:
-        """True when the current quote can't confirm the leader's price is
-        still there. Fails CLOSED for entries: no cache client configured is
-        an explicit opt-out (backtests/offline), but a fetch error or an empty
-        book means we cannot verify the edge — don't chase it blind."""
+    def _price_drift_ok(self, token_id: str, leader_price: float) -> bool | None:
+        """Is the leader's fill price still on the book?
+
+        True  — verified: the quote sits within `max_price_drift`.
+        False — verified: the edge has moved away; don't chase it.
+        None  — COULD NOT VERIFY (fetch error, or a book with no top level).
+                The caller must treat this as a transient skip and retry next
+                cycle, never as a decision. Deciding on "no answer" is what let
+                a single CLOB hiccup retire a copyable trade for the whole
+                process — the trade was never re-quoted again.
+
+        Having no cache client is an explicit opt-out (backtests/offline), so
+        that verifies as True rather than blocking every entry.
+        """
         if not self.price_cache:
-            return False
+            return True
         try:
             quote = self.price_cache.get_quote(token_id)
         except Exception as e:
             log.debug("strategy: quote fetch failed for %s: %s", token_id[:10], e)
-            return True
+            return None
         mid = None
         if quote and quote.bid and quote.ask:
             mid = (quote.bid + quote.ask) / 2
         elif quote and (quote.bid or quote.ask):
             mid = quote.bid or quote.ask
         if mid is None:
-            return True
-        return abs(mid - leader_price) > self.max_price_drift
+            return None
+        return abs(mid - leader_price) <= self.max_price_drift
+
+    def _entry_reject_reason(
+        self, t: LeaderTrade, market: Market, now: datetime
+    ) -> str | None:
+        """Why this entry can never be copied, or None if it's still a candidate.
+
+        Every reason here is settled for the life of the trade — the leader's
+        price and notional are fixed, a closed market never reopens, and both
+        the trade's age and the market's time-to-resolution only move one way —
+        so the caller may retire the uid. (Thin liquidity can in principle
+        recover, but not meaningfully inside the max-trade-age window.)
+        Transient conditions — a failed market lookup, an unverifiable quote —
+        are deliberately NOT decided here.
+        """
+        if market.closed:
+            return "market closed"
+        if not (self.price_min <= t.price <= self.price_max):
+            return "price outside entry band"     # little edge at the extremes
+        if t.usd_size < self.min_leader_notional:
+            return "leader notional too small"    # low-conviction probe
+        if self.max_trade_age_minutes > 0:
+            age_min = (now - t.timestamp).total_seconds() / 60.0
+            if age_min > self.max_trade_age_minutes:
+                return "trade too old"            # stale history, not a fresh signal
+        if market.liquidity_usd is not None and market.liquidity_usd < self.min_liquidity:
+            return "market too thin"
+        if self.min_hours_to_resolution > 0 and market.end_date is not None:
+            hours_left = (market.end_date - now).total_seconds() / 3600
+            if hours_left < self.min_hours_to_resolution:
+                return "too close to resolution"  # lag is adverse here
+        return None
 
     def generate(self) -> Iterable[Signal]:
         now = datetime.now(timezone.utc)
@@ -186,7 +226,10 @@ class ExactCopyStrategy(Strategy):
                             leader, t.token_id, eff.new_shares, t.uid, t.timestamp
                         )
                     except Exception as e:
-                        log.debug("strategy: leader-tracking persist failed: %s", e)
+                        # Both writes share one transaction, so a failure lands
+                        # neither and a restart replays this trade correctly —
+                        # but a DB that keeps failing must not do so silently.
+                        log.warning("strategy: leader-tracking persist failed: %s", e)
                 elif t.side is Side.SELL:
                     # Tracked before this process started (restart): the
                     # stored count is post-sell, so reconstruct the pre-sell
@@ -209,27 +252,18 @@ class ExactCopyStrategy(Strategy):
                     # retries it instead of skipping it forever.
                     if market is None:
                         continue
-                    self._processed_uids.add(t.uid)  # decision below is final
-                    if market.closed:
-                        continue
                     # Entry-only filters: exits are never blocked by these —
                     # mirroring a leader out of a position reduces our risk.
-                    if not (self.price_min <= t.price <= self.price_max):
-                        continue                   # skip extreme-priced, low-edge trades
-                    if t.usd_size < self.min_leader_notional:
-                        continue                   # low-conviction probe; not worth our slice
-                    if self.max_trade_age_minutes > 0:
-                        age_min = (now - t.timestamp).total_seconds() / 60.0
-                        if age_min > self.max_trade_age_minutes:
-                            continue               # stale history (new follow / downtime), not a fresh signal
-                    if self._too_stale(t.token_id, t.price):
-                        continue                   # edge likely already gone
-                    if market.liquidity_usd is not None and market.liquidity_usd < self.min_liquidity:
+                    reason = self._entry_reject_reason(t, market, now)
+                    if reason is not None:
+                        self._processed_uids.add(t.uid)   # settled: never copyable
                         continue
-                    if self.min_hours_to_resolution > 0 and market.end_date is not None:
-                        hours_left = (market.end_date - now).total_seconds() / 3600
-                        if hours_left < self.min_hours_to_resolution:
-                            continue               # too close to resolution; lag is adverse
+                    drift_ok = self._price_drift_ok(t.token_id, t.price)
+                    if drift_ok is None:
+                        continue         # couldn't verify — transient, retry next cycle
+                    self._processed_uids.add(t.uid)       # verified: decision is final
+                    if not drift_ok:
+                        continue         # edge already arbitraged away
                     yield Signal(
                         market_id=t.market_id,
                         token_id=t.token_id,
@@ -242,15 +276,21 @@ class ExactCopyStrategy(Strategy):
                         source_uid=t.uid,
                     )
                 else:
-                    self._processed_uids.add(t.uid)
                     # Exits are risk-reducing: a failed market lookup must
                     # never block one (only a definitively closed market does —
                     # settlement owns those).
                     if market is not None and market.closed:
+                        self._processed_uids.add(t.uid)
                         continue
                     our_position = self.ledger.get_position(t.token_id)
                     if our_position is None or abs(our_position.shares) <= 1e-9:
+                        self._processed_uids.add(t.uid)
                         continue                   # nothing of ours to mirror-sell
+                    # NB: a mirror-exit we yield is deliberately NOT retired
+                    # here. The RiskManager can still reject it (e.g. the slice
+                    # rounds under min_ticket_usd), and retiring it would drop
+                    # the exit for good — `has_copied` already dedupes the ones
+                    # that actually fill.
                     sell_fraction = 1.0 if prior_shares <= 1e-9 else min(1.0, t.shares / prior_shares)
                     our_value = abs(our_position.shares) * our_position.avg_price
                     yield Signal(

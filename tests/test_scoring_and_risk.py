@@ -203,6 +203,26 @@ def test_risk_size_sell_is_not_shrunk_by_copy_fraction():
     led.close()
 
 
+def test_risk_size_sell_without_share_count_stays_proportional():
+    """A partial dollar exit with no explicit share count must sell the
+    matching FRACTION of the position, not all of it.
+
+    The executor trusts size_shares over size_usd, so defaulting to the whole
+    holding here would let size_usd say "half" while the fill sold everything —
+    the same shape as the phantom-short bug.
+    """
+    led = Ledger(":memory:")
+    buy = _sig(100)
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=100, shares=200,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    sized = rm.size(_sell_sig(25))            # a quarter of the $100 basis
+    assert sized is not None
+    assert sized.size_usd == pytest.approx(25.0)
+    assert sized.size_shares == pytest.approx(50.0)   # not 200
+    led.close()
+
+
 def test_risk_size_sell_capped_at_position_value():
     led = Ledger(":memory:")
     buy = _sig(100)

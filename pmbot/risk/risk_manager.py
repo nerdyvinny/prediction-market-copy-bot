@@ -77,7 +77,15 @@ class RiskManager:
             desired = min(signal.size_usd, held_value)
             if desired < self.min_ticket_usd:
                 return None
-            shares = held_shares if signal.size_shares is None else min(signal.size_shares, held_shares)
+            if signal.size_shares is None:
+                # No explicit share count: derive it from the dollar intent so a
+                # partial exit stays partial. Defaulting to the whole position
+                # here would let size_usd say "half" while the executor — which
+                # trusts size_shares — sold everything.
+                frac = min(1.0, desired / held_value) if held_value > 0 else 1.0
+                shares = held_shares * frac
+            else:
+                shares = min(signal.size_shares, held_shares)
             return replace(signal, size_usd=round(desired, 2), size_shares=shares)
 
         fraction = self.copy_fraction

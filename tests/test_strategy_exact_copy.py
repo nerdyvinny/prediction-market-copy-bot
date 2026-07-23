@@ -352,3 +352,112 @@ def test_staleness_guard_allows_close_price():
     strat = _strategy(trades, markets, led, price_cache=close_cache)
     assert len(list(strat.generate())) == 1
     led.close()
+
+
+class FlakyPriceCache:
+    """Raises on the first N calls, then serves a good quote."""
+
+    def __init__(self, quote, failures=1):
+        self._quote = quote
+        self._left = failures
+        self.calls = 0
+
+    def get_quote(self, token_id):
+        self.calls += 1
+        if self._left > 0:
+            self._left -= 1
+            raise RuntimeError("transient CLOB timeout")
+        return self._quote
+
+
+def test_unverifiable_quote_is_retried_not_retired():
+    """A quote we could not FETCH is a transient skip, never a decision.
+
+    Regression: the uid was retired before the drift check ran, so one CLOB
+    hiccup dropped a copyable entry for the life of the process — it was
+    never re-quoted again.
+    """
+    markets = {"m_ok": _mkt("m_ok")}
+    trades = [_trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u1")]
+    led = Ledger(":memory:")
+    cache = FlakyPriceCache(FakeQuote(bid=0.49, ask=0.51), failures=1)
+    strat = _strategy(trades, markets, led, price_cache=cache)
+
+    assert list(strat.generate()) == []          # blip: skipped, not decided
+    assert len(list(strat.generate())) == 1      # recovered: copied
+    assert cache.calls == 2                      # it actually re-quoted
+    assert list(strat.generate()) == []          # now settled: no double-copy
+    led.close()
+
+
+def test_empty_book_is_retried_not_retired():
+    """An empty book verifies nothing either — same transient treatment."""
+    markets = {"m_ok": _mkt("m_ok")}
+    trades = [_trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u1")]
+    led = Ledger(":memory:")
+
+    class EmptyThenReal:
+        def __init__(self):
+            self.calls = 0
+
+        def get_quote(self, token_id):
+            self.calls += 1
+            if self.calls == 1:
+                return FakeQuote(bid=None, ask=None)
+            return FakeQuote(bid=0.49, ask=0.51)
+
+    cache = EmptyThenReal()
+    strat = _strategy(trades, markets, led, price_cache=cache)
+    assert list(strat.generate()) == []
+    assert len(list(strat.generate())) == 1
+    led.close()
+
+
+def test_verified_drift_is_decided_once():
+    """A drift we DID verify stays decided — no re-quoting every cycle."""
+    markets = {"m_ok": _mkt("m_ok")}
+    trades = [_trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u1")]
+    led = Ledger(":memory:")
+    cache = FakePriceCache(FakeQuote(bid=0.89, ask=0.91))
+    strat = _strategy(trades, markets, led, price_cache=cache)
+    assert list(strat.generate()) == []
+    assert list(strat.generate()) == []
+    assert "u1" in strat._processed_uids
+    led.close()
+
+
+def test_permanent_entry_rejects_are_retired():
+    """Settled reasons (band, notional, closed, thin) retire the uid so the
+    strategy doesn't re-decide them every cycle."""
+    markets = {"m_ok": _mkt("m_ok"), "m_thin": _mkt("m_thin", liq=1000)}
+    led = Ledger(":memory:")
+    trades = [
+        _trade("m_ok", "tokHI", Side.BUY, 0.98, 100, "band"),
+        _trade("m_thin", "tokTHIN", Side.BUY, 0.50, 100, "thin"),
+    ]
+    strat = _strategy(trades, markets, led, min_leader_notional=0.0)
+    assert list(strat.generate()) == []
+    assert {"band", "thin"} <= strat._processed_uids
+    led.close()
+
+
+def test_unfilled_mirror_exit_is_retried():
+    """A mirror-exit the RiskManager rejects (dust) must not be retired by the
+    strategy — otherwise the leader's exit is dropped for good and our copied
+    position rides unmanaged to resolution."""
+    markets = {"m_ok": _mkt("m_ok")}
+    led = Ledger(":memory:")
+    buy = Signal("m_ok", "tokOK", "Yes", Side.BUY, 0.50, 30, "seed",
+                 source_leader="0xlead", source_uid="seed-uid")
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=30, shares=60,
+                         timestamp=NOW, mode="paper"))
+    sell = _trade("m_ok", "tokOK", Side.SELL, 0.50, 10, "sell-uid")
+    strat = _strategy([sell], markets, led)
+
+    first = list(strat.generate())
+    assert len(first) == 1 and first[0].side is Side.SELL
+    # Nothing filled it, so the very next cycle offers it again.
+    second = list(strat.generate())
+    assert len(second) == 1 and second[0].side is Side.SELL
+    assert "sell-uid" not in strat._processed_uids
+    led.close()

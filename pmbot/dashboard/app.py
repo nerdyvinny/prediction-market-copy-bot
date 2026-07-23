@@ -65,9 +65,13 @@ def _question_for(market_id: str) -> str:
     if market_id not in _question_cache:
         try:
             m = _get_gamma().get_market(market_id)
-            _question_cache[market_id] = m.question if m else ""
         except Exception:
             return ""  # transient API failure: retry next poll, don't cache
+        if m is None:
+            # Not found *right now* is not an answer either — caching the blank
+            # would leave the row unlabelled for the life of the process.
+            return ""
+        _question_cache[market_id] = m.question
     return _question_cache[market_id]
 
 
