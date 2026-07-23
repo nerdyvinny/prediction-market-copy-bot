@@ -28,6 +28,9 @@ data/*.json
 logs/
 *.log
 
+# Tooling caches (regenerable; never commit)
+graphify-out/
+
 # OS / editor
 .DS_Store
 Thumbs.db
