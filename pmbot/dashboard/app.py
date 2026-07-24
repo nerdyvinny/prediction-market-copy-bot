@@ -155,6 +155,35 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
     return out
 
 
+POLYMARKET_PROFILE = "https://polymarket.com/profile/{}"
+
+
+def _leaders(followed: list[dict], exposure: dict, fills: list[dict]) -> list[dict]:
+    """Who we're following, enriched for the dashboard.
+
+    `followed` is the persisted follow list (wallet + score + when). We fold in
+    live open exposure per leader and how many trades we've copied from each,
+    and hand back a Polymarket profile URL so the row can be clicked through.
+    """
+    copied: dict[str, int] = {}
+    for f in fills:
+        w = f["source_leader"]
+        if w and f["side"] == "BUY":
+            copied[w] = copied.get(w, 0) + 1
+    out = []
+    for row in followed:
+        w = row["wallet"]
+        out.append({
+            "wallet": w,
+            "score": round(float(row["score"]), 3),
+            "followed_at": row["followed_at"],
+            "exposure_usd": round(exposure.get(w, 0.0), 2),
+            "copied_trades": copied.get(w, 0),
+            "profile_url": POLYMARKET_PROFILE.format(w),
+        })
+    return out
+
+
 @app.get("/api/state")
 def state() -> dict:
     settings = get_settings()
@@ -167,12 +196,15 @@ def state() -> dict:
             "       size_usd, shares, reason, source_leader, venue, fee_usd "
             "FROM fills ORDER BY ts"
         ).fetchall()
+        leaders_raw = led.followed_leaders_detail()
+        leader_exposure = led.leader_exposures()
     finally:
         led.close()
 
     all_fills = [dict(r) for r in rows]
     open_pos = {p.token_id: p for p in positions}
     mids = {p.token_id: _mid_for(p.token_id, p.venue) for p in positions}
+    leaders_out = _leaders(leaders_raw, leader_exposure, all_fills)
 
     pos_out = []
     for p in positions:
@@ -218,6 +250,7 @@ def state() -> dict:
         "positions": pos_out,
         "trades": _group_trades(all_fills, open_pos, mids),
         "fills": fills_out,
+        "leaders": leaders_out,
     }
 
 

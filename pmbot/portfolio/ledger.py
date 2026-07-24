@@ -265,6 +265,17 @@ class Ledger:
         ).fetchall()
         return [r["wallet"] for r in rows]
 
+    def followed_leaders_detail(self) -> list[dict]:
+        """Full follow list with score + when we started following, best first.
+
+        Same order as `followed_leaders`; used by the dashboard to list who we
+        copy (the wallet is the Polymarket profile address)."""
+        rows = self.conn.execute(
+            "SELECT wallet, score, followed_at FROM followed_leaders "
+            "ORDER BY score DESC, wallet"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # -- leader-observation tracking (ExactCopyStrategy persistence) -------
     def record_leader_observation(
         self, leader: str, token_id: str, shares: float, uid: str, ts: datetime

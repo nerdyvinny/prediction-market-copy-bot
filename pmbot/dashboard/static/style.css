@@ -226,6 +226,15 @@ td.market {
   color: var(--ink-2);
 }
 
+.leader-link {
+  font-family: "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.leader-link:hover { text-decoration: underline; }
+
 .chip {
   display: inline-block;
   font-size: 12px;

@@ -61,6 +61,30 @@ function renderHero(m) {
     ` &nbsp;·&nbsp; ${m.fills} trade${m.fills === 1 ? "" : "s"} logged`;
 }
 
+/* ---- leaders we follow ----------------------------------------------- */
+
+function renderLeaders(leaders) {
+  const tb = $("#leaders tbody");
+  $("#leaders-sub").textContent = leaders && leaders.length
+    ? `${leaders.length} followed · best first` : "";
+  if (!leaders || !leaders.length) {
+    tb.innerHTML = `<tr><td colspan="5" class="left empty">No leaders followed yet — the bot picks them on its next rescore.</td></tr>`;
+    return;
+  }
+  tb.innerHTML = leaders.map((l) => {
+    const copied = l.copied_trades
+      ? `${l.copied_trades} trade${l.copied_trades === 1 ? "" : "s"}` : "—";
+    return `<tr>
+      <td class="left"><a class="leader-link" href="${l.profile_url}" target="_blank" rel="noopener noreferrer"
+        title="Open ${l.wallet} on Polymarket">${shortAddr(l.wallet)} ↗</a></td>
+      <td>${l.score.toFixed(3)}</td>
+      <td>${fmtUsd(l.exposure_usd)}</td>
+      <td>${copied}</td>
+      <td class="left"></td>
+    </tr>`;
+  }).join("");
+}
+
 /* ---- open positions -------------------------------------------------- */
 
 function renderPositions(positions) {
@@ -218,6 +242,7 @@ async function refresh() {
     $("#updated").textContent = `Updated ${fmtClock(s.now)}`;
 
     renderHero(s.summary);
+    renderLeaders(s.leaders);
     renderPositions(s.positions);
     renderTrades(s.trades);
     renderFills(s.fills);
