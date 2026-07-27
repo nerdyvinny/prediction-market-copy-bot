@@ -16,12 +16,18 @@ mirroring a leader out of a position reduces risk and is never blocked):
     merely happens to be unchanged are history, not signals
 
 BUY: same shape as a fresh entry, sized by the RiskManager off leader notional.
-SELL: mirrored *proportionally*. We track each leader's running per-token
-share count from the trades we've observed (using the same `apply_fill`
-accounting the ledger uses) so a partial exit by the leader becomes a partial
-exit of our own position, not a full liquidation. If the leader's prior
-position is unknown (e.g. it predates when we started following them), we
-conservatively treat the sell as a full exit.
+SELL: mirrored *proportionally*, and only over OUR OWN slice from that leader.
+Two independent quantities drive this:
+  - how much of THEIR position the leader exited — we track each leader's
+    running per-token share count from the trades we've observed (using the
+    same `apply_fill` accounting the ledger uses), so a partial trim becomes a
+    partial exit rather than a full liquidation. If their prior position is
+    unknown (e.g. it predates when we started following them), we
+    conservatively treat the sell as a full exit.
+  - how many shares WE hold because of that leader
+    (`Ledger.copied_shares_for_leader`). Several followed leaders can hold the
+    same outcome token while `positions` knows only the combined total, so
+    sizing off the total let one leader's exit liquidate another's copy.
 
 Exit-only leaders: a leader who falls off the followed list while we still
 hold positions copied from them is kept on the watchlist as exit-only — their
@@ -286,21 +292,37 @@ class ExactCopyStrategy(Strategy):
                     if our_position is None or abs(our_position.shares) <= 1e-9:
                         self._processed_uids.add(t.uid)
                         continue                   # nothing of ours to mirror-sell
+                    # Only THIS leader's slice is ours to exit. `positions`
+                    # holds the combined total, so sizing off it let one
+                    # leader's exit liquidate another leader's copy of the same
+                    # token — a full exit by a leader who contributed 30% of
+                    # our shares sold all 100%. Clamped to the real position,
+                    # which settlement zeroes (settlement fills carry no
+                    # source_leader, so the raw balance can outlive the shares).
+                    held_total = abs(our_position.shares)
+                    from_leader = self.ledger.copied_shares_for_leader(leader, t.token_id)
+                    copied = min(max(0.0, from_leader), held_total)
+                    if copied <= 1e-9:
+                        self._processed_uids.add(t.uid)
+                        continue                   # we hold this token, but not from them
                     # NB: a mirror-exit we yield is deliberately NOT retired
                     # here. The RiskManager can still reject it (e.g. the slice
                     # rounds under min_ticket_usd), and retiring it would drop
                     # the exit for good — `has_copied` already dedupes the ones
                     # that actually fill.
                     sell_fraction = 1.0 if prior_shares <= 1e-9 else min(1.0, t.shares / prior_shares)
-                    our_value = abs(our_position.shares) * our_position.avg_price
+                    sell_shares = copied * sell_fraction
                     yield Signal(
                         market_id=t.market_id,
                         token_id=t.token_id,
                         outcome=t.outcome,
                         side=Side.SELL,
                         target_price=t.price,
-                        size_usd=our_value * sell_fraction,
-                        size_shares=abs(our_position.shares) * sell_fraction,
+                        # Estimate, valued at our blended avg cost across every
+                        # leader in the token; size_shares is what the executor
+                        # actually fills on.
+                        size_usd=sell_shares * our_position.avg_price,
+                        size_shares=sell_shares,
                         reason=(f"copy {leader[:8]}… sell {sell_fraction*100:.0f}%"
                                 + (" (exit-only)" if exit_only else "")),
                         source_leader=leader,

@@ -211,6 +211,30 @@ class Ledger:
         ).fetchall()
         return sum(max(0.0, float(r["net"] or 0.0)) for r in rows)
 
+    def copied_shares_for_leader(self, leader: str, token_id: str) -> float:
+        """Shares of `token_id` we hold *because of* `leader`.
+
+        Derived from the fills we attributed to them (BUY adds, SELL subtracts)
+        rather than kept as separate state, so it can never drift from the
+        ledger and needs no migration — the same reasoning as
+        `exposure_for_leader`.
+
+        This is what keeps one leader's exit from liquidating another's copy:
+        several followed leaders can hold the same outcome token, but
+        `positions` only knows the combined total. Settlement fills carry no
+        `source_leader`, so a settled market leaves a stale non-zero balance
+        here; callers clamp against the real position (which settlement zeroes)
+        instead of trusting this alone.
+        """
+        if not leader:
+            return 0.0
+        row = self.conn.execute(
+            """SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN shares ELSE -shares END), 0) AS net
+               FROM fills WHERE source_leader=? AND token_id=?""",
+            (leader, token_id),
+        ).fetchone()
+        return float(row["net"] or 0.0)
+
     def exposure_for_market(self, market_id: str) -> float:
         """Current cost-basis exposure across all outcome tokens in a market."""
         row = self.conn.execute(
