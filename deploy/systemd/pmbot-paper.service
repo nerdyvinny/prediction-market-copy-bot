@@ -1,0 +1,44 @@
+[Unit]
+Description=PMB paper copy-trading loop (pmbot paper)
+Documentation=https://github.com/nerdyvinny/prediction-market-copy-bot
+# Network-online so the very first API call after a reboot doesn't race DNS.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pmbot
+Group=pmbot
+
+# Repo root MUST be the working dir: python-dotenv loads ./.env from here,
+# and pmbot.db is created/opened relative to it.
+WorkingDirectory=/opt/pmbot/prediction-market-copy-bot
+Environment=PYTHONUNBUFFERED=1
+
+# Absolute venv path — systemd has no shell PATH resolution.
+ExecStart=/opt/pmbot/prediction-market-copy-bot/.venv/bin/pmbot paper
+
+# This is the whole reason to move off Windows: real supervision.
+# On a crash or non-zero exit, restart after 5s, forever. No orphaned
+# cmd.exe holding pmbot.db, no silent log-handle conflict — systemd owns
+# the process tree and SIGKILLs any stragglers on stop/restart.
+Restart=always
+RestartSec=5
+
+# Logs go to the journal: `journalctl -u pmbot-paper -f`.
+# journald rotates them, so the old 30-day log-pruning script is retired.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pmbot-paper
+
+# --- Hardening (safe for a paper bot; loosen only if something needs it) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# strict makes the FS read-only EXCEPT these: the bot writes pmbot.db + logs/
+# under the repo, so the repo dir must be writable.
+ReadWritePaths=/opt/pmbot/prediction-market-copy-bot
+
+[Install]
+WantedBy=multi-user.target
