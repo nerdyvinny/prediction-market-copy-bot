@@ -86,6 +86,8 @@ class ExactCopyStrategy(Strategy):
         self.min_leader_notional = (
             s.copy_min_leader_notional_usd if min_leader_notional is None else min_leader_notional
         )
+        self.sweep_exit_dust = s.sweep_exit_dust
+        self.exit_dust_usd = s.exit_dust_usd
         self.min_hours_to_resolution = (
             s.copy_min_hours_to_resolution if min_hours_to_resolution is None
             else min_hours_to_resolution
@@ -312,6 +314,16 @@ class ExactCopyStrategy(Strategy):
                     # that actually fill.
                     sell_fraction = 1.0 if prior_shares <= 1e-9 else min(1.0, t.shares / prior_shares)
                     sell_shares = copied * sell_fraction
+                    # The leader's exit ratio is rarely exactly 1.0, so a "full"
+                    # exit can leave a sub-cent crumb that the ledger counts as
+                    # an open position forever. Sweep it — but only up to
+                    # `copied`, this leader's own slice, never `held_total`:
+                    # snapping to the combined position is precisely how one
+                    # leader's exit would liquidate another's copy.
+                    if self.sweep_exit_dust:
+                        residual_value = (copied - sell_shares) * our_position.avg_price
+                        if 0 < residual_value < self.exit_dust_usd:
+                            sell_shares = copied
                     yield Signal(
                         market_id=t.market_id,
                         token_id=t.token_id,

@@ -501,6 +501,14 @@ class ExactCopyBacktester:
                     continue                       # nothing of ours to mirror-sell
                 fraction = 1.0 if prior <= 1e-9 else min(1.0, t.shares / prior)
                 sell_shares = tr.shares * fraction
+                # Mirrors ExactCopyStrategy's dust sweep. Tranches are keyed
+                # (leader, token), so tr.shares is already this leader's own
+                # slice — the multi-leader clamp the live path needs is
+                # structural here.
+                if s.sweep_exit_dust:
+                    residual_value = (tr.shares - sell_shares) * tr.avg
+                    if 0 < residual_value < s.exit_dust_usd:
+                        sell_shares = tr.shares
                 exit_price = min(max(t.price * (1 - slip), _MIN_PRICE), _MAX_PRICE)
                 tr.realized += (exit_price - tr.avg) * sell_shares
                 tr.shares -= sell_shares

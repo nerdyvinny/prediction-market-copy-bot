@@ -90,6 +90,22 @@ class Settings(BaseSettings):
     # Swept 2026-07: $500 floor roughly doubled ROI vs $0/$100 at every
     # lookback (12-17% vs 1-8%) — conviction filtering is the biggest lever.
     copy_min_leader_notional_usd: float = 500.0
+    # A mirrored exit sizes off the leader's own exit ratio, which is rarely
+    # exactly 1.0 — a leader who leaves 0.001% behind makes us leave a crumb
+    # too, and the ledger's open test (ABS(shares) > 1e-9) then counts that
+    # fully-closed trade as open forever. When on, an exit that would leave
+    # less than `exit_dust_usd` of THIS leader's slice takes the whole slice.
+    # Clamped to the leader's own slice, never the combined position, so it
+    # can never liquidate another leader's copy of the same token.
+    #
+    # On by default: this is a hygiene fix, not a strategy knob. A backtest
+    # cannot measure it (the harness settles every position, so dust never
+    # survives) — 60d on the 8 live leaders was byte-identical at $5,032.48
+    # net both ways while the branch fired 24 times for $0.016 total. Its real
+    # risk is multi-leader safety, covered by tests/test_multi_leader_exits.py.
+    # Set PMBOT_SWEEP_EXIT_DUST=false to fall back to the old behaviour.
+    sweep_exit_dust: bool = True
+    exit_dust_usd: float = 0.01
     # After scoring, vet each would-be leader by backtesting an exact copy of
     # their recent tape; drop leaders whose copy P&L comes out below the floor.
     # (Scoring measures THEIR profit; vetting measures OURS, after our sizing,

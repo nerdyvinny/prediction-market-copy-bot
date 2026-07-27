@@ -218,3 +218,86 @@ def test_settlement_fills_are_not_attributed_to_any_leader():
         assert _sells(_strategy(led, tapes, [A])) == []         # nothing left to exit
     finally:
         led.close()
+
+
+# -- dust sweep -----------------------------------------------------------
+# A leader's exit ratio is rarely exactly 1.0. Seen live: a leader left
+# 0.0011% behind, so our mirrored "sell 100%" left 0.000676 shares of 61.36
+# (~$0.0005) and the ledger's ABS(shares) > 1e-9 open test counted that
+# fully-closed trade as open forever. `sweep_exit_dust` takes the whole slice
+# when the leftover is worth less than `exit_dust_usd`.
+FULL_EXIT_RATIO = 0.999988976770894      # the exact ratio observed live
+
+
+def _sweeping(led: Ledger, tapes: dict, leaders: list[str], dust_usd: float = 0.01):
+    strat = _strategy(led, tapes, leaders)
+    strat.sweep_exit_dust = True
+    strat.exit_dust_usd = dust_usd
+    return strat
+
+
+def _near_full_tape(leader):
+    """`leader` exits all but a rounding crumb of their own position."""
+    return [_trade(leader, Side.BUY, 200, f"{leader}-1"),
+            _trade(leader, Side.SELL, 200 * FULL_EXIT_RATIO, f"{leader}-2")]
+
+
+def test_near_full_exit_leaves_dust_when_the_sweep_is_off():
+    """The original bug, reproduced. Sets the flag explicitly rather than
+    leaning on the default, which now ships on."""
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 30.0)
+        strat = _strategy(led, {A: _near_full_tape(A)}, [A])
+        strat.sweep_exit_dust = False
+        sells = _sells(strat)
+        assert len(sells) == 1
+        assert sells[0].size_shares < 30.0            # crumb left behind
+        assert 30.0 - sells[0].size_shares < 1e-3     # ...and it is only a crumb
+        assert "sell 100%" in sells[0].reason         # while the label rounds to 100%
+    finally:
+        led.close()
+
+
+def test_sweep_closes_the_crumb_on_a_near_full_exit():
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 30.0)
+        sells = _sells(_sweeping(led, {A: _near_full_tape(A)}, [A]))
+        assert len(sells) == 1
+        assert sells[0].size_shares == 30.0           # exactly flat, no residue
+    finally:
+        led.close()
+
+
+def test_sweep_never_reaches_another_leaders_slice():
+    """The whole point of sizing off the leader's own slice. Sweeping must
+    round up to `copied`, never to the combined position."""
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 30.0)
+        _copy_buy(led, B, 70.0)
+        assert led.get_position(TOK).shares == 100.0
+
+        tapes = {A: _near_full_tape(A), B: [_trade(B, Side.BUY, 200, "b1")]}
+        sells = _sells(_sweeping(led, tapes, [A, B]))
+        assert len(sells) == 1
+        assert sells[0].source_leader == A
+        assert sells[0].size_shares == 30.0           # A's slice in full...
+        assert sells[0].size_shares != 100.0          # ...never B's too
+    finally:
+        led.close()
+
+
+def test_sweep_does_not_touch_a_genuine_partial_exit():
+    """A real 50% trim is worth far more than the dust threshold, so it must
+    stay a 50% trim - the sweep must not promote partials into full exits."""
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 30.0)
+        tapes = {A: [_trade(A, Side.BUY, 200, "a1"), _trade(A, Side.SELL, 100, "a2")]}
+        sells = _sells(_sweeping(led, tapes, [A]))
+        assert len(sells) == 1
+        assert sells[0].size_shares == 15.0
+    finally:
+        led.close()
