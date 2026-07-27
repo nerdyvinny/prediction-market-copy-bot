@@ -103,6 +103,14 @@ def _mid_for(token_id: str, venue: str) -> float | None:
         return None
 
 
+# A "sell 100%" exit sizes the order from a re-derived share count, which can
+# undershoot the held amount by a rounding crumb (seen live: 0.000676 shares
+# left of 61.36, worth $0.0005). The ledger's open test is ABS(shares) > 1e-9,
+# so that crumb keeps a fully-exited trade looking open forever. Anything worth
+# less than a cent is dust, not a position.
+DUST_USD = 0.01
+
+
 def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
     """Roll fills up per outcome token: money in, money back, what's left.
 
@@ -135,7 +143,7 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
     out = []
     for t in trades.values():
         pos = open_pos.get(t["token_id"])
-        is_open = pos is not None
+        is_open = pos is not None and abs(pos.shares * pos.avg_price) >= DUST_USD
         mid = mids.get(t["token_id"]) if is_open else None
         open_value = pos.shares * mid if (is_open and mid is not None) else None
         if is_open:
@@ -153,6 +161,26 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
         })
     out.sort(key=lambda t: t["last_ts"], reverse=True)
     return out
+
+
+def _win_stats(trades: list[dict]) -> dict:
+    """Win rate over *closed* trades only.
+
+    Open trades are excluded: their net moves with the quote, so counting them
+    would make the rate wobble every poll. The same 0.5c dead band the UI uses
+    for colouring P&L splits wins from losses, so a trade that came back at
+    cost is 'flat' rather than a win.
+    """
+    closed = [t for t in trades if t["status"] == "closed"]
+    wins = sum(1 for t in closed if (t["net_usd"] or 0.0) > 0.005)
+    losses = sum(1 for t in closed if (t["net_usd"] or 0.0) < -0.005)
+    return {
+        "closed_trades": len(closed),
+        "wins": wins,
+        "losses": losses,
+        "flat": len(closed) - wins - losses,
+        "win_rate": round(wins / len(closed), 4) if closed else None,
+    }
 
 
 POLYMARKET_PROFILE = "https://polymarket.com/profile/{}"
@@ -233,6 +261,7 @@ def state() -> dict:
     unrealized = sum(
         p["unrealized_usd"] for p in pos_out if p["unrealized_usd"] is not None
     )
+    trades_out = _group_trades(all_fills, open_pos, mids)
     return {
         "now": datetime.now(timezone.utc).isoformat(),
         "engine_running": _engine_running(),
@@ -246,9 +275,10 @@ def state() -> dict:
             "open_positions": summary["open_positions"],
             "fills": summary["fills"],
             "fees_usd": round(summary["fees_usd"], 2),
+            **_win_stats(trades_out),
         },
         "positions": pos_out,
-        "trades": _group_trades(all_fills, open_pos, mids),
+        "trades": trades_out,
         "fills": fills_out,
         "leaders": leaders_out,
     }
@@ -263,6 +293,10 @@ app.mount("/static", StaticFiles(directory=_STATIC), name="static")
 
 
 if __name__ == "__main__":
+    import os
+
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8090)
+    # 8090 by default; PORT lets a second copy run alongside an SSH tunnel
+    # that already holds the usual port.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8090")))

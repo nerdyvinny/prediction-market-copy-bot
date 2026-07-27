@@ -54,6 +54,17 @@ function renderHero(m) {
   $("#open-pnl").className = `value ${pnlClass(m.open_pnl)}`;
   $("#closed-pnl").textContent = fmtUsd(m.closed_pnl, true);
   $("#closed-pnl").className = `value ${pnlClass(m.closed_pnl)}`;
+
+  // Win rate is only meaningful once something has actually closed.
+  const rate = m.win_rate;
+  $("#win-rate").textContent = rate === null || rate === undefined
+    ? "—" : `${(rate * 100).toFixed(0)}%`;
+  $("#win-rate").className = `value ${
+    rate === null || rate === undefined ? "" : rate >= 0.5 ? "pos" : "neg"}`;
+  $("#win-rate-caption").textContent = m.closed_trades
+    ? `${m.wins} of ${m.closed_trades} closed trade${m.closed_trades === 1 ? "" : "s"} in profit` +
+      (m.flat ? ` · ${m.flat} flat` : "")
+    : "no closed trades yet";
   $("#strip").innerHTML =
     `Total <span class="${pnlClass(m.total_pnl)}">${fmtUsd(m.total_pnl, true)}</span>` +
     ` &nbsp;·&nbsp; ${fmtUsd(m.deployed_usd)} of ${fmtUsd(m.bankroll_usd)} deployed` +
@@ -129,8 +140,12 @@ function standsText(t) {
 function renderTrades(trades) {
   const tb = $("#trades tbody");
   const open = trades.filter((t) => t.status === "open").length;
+  const closed = trades.filter((t) => t.status === "closed");
+  const wins = closed.filter((t) => t.net_usd > 0.005).length;
+  const losses = closed.filter((t) => t.net_usd < -0.005).length;
   $("#trades-sub").textContent = trades.length
-    ? `${trades.length} trades · ${open} open, ${trades.length - open} closed`
+    ? `${trades.length} trades · ${open} open, ${closed.length} closed` +
+      (closed.length ? ` (${wins}W / ${losses}L)` : "")
     : "";
   if (!trades.length) {
     tb.innerHTML = `<tr><td colspan="5" class="left empty">No trades copied yet.</td></tr>`;

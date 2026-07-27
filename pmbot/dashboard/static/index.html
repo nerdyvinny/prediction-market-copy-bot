@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pmbot</title>
-<link rel="stylesheet" href="/static/style.css?v=2">
+<link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
 
@@ -33,6 +33,11 @@
       <div class="label">Closed positions</div>
       <div class="value" id="closed-pnl">—</div>
       <div class="caption">realized P&amp;L, net of fees</div>
+    </div>
+    <div class="hero-tile">
+      <div class="label">Win rate</div>
+      <div class="value" id="win-rate">—</div>
+      <div class="caption" id="win-rate-caption">closed trades in profit</div>
     </div>
   </section>
   <p class="strip" id="strip"></p>
@@ -112,6 +117,6 @@
 
 <footer>Read-only paper ledger · no orders are placed from this page</footer>
 
-<script src="/static/app.js?v=2"></script>
+<script src="/static/app.js?v=3"></script>
 </body>
 </html>
