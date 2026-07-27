@@ -75,8 +75,13 @@ class LongTermCopyStrategy(Strategy):
         try:
             m = self.gamma.get_market(condition_id)
         except Exception as e:
+            # Transient failure (rate limit, timeout): serve the stale entry if
+            # we have one, but never CACHE the error — a poisoned entry would
+            # silently drop every trade in the market for the next TTL window.
+            # (Same fix as ExactCopyStrategy._market, LeaderSelector._resolver
+            # and both backtesters.)
             log.debug("strategy: market lookup failed %s: %s", condition_id[:12], e)
-            m = None
+            return hit[1] if hit else None
         self._market_cache[condition_id] = (now, m)
         return m
 

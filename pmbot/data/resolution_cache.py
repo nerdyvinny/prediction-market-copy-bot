@@ -12,8 +12,9 @@ markets, so after the first rescore most resolution lookups are cache hits.
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime, timezone
+
+from pmbot.db import connect as db_connect
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS resolutions (
@@ -29,9 +30,9 @@ class ResolutionStore:
         # check_same_thread=False: the store is created by the engine (main
         # thread) but used by whichever single thread runs the rescore — the
         # engine's background rescore worker in live mode. Access is never
-        # concurrent (one rescore at a time).
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        # concurrent (one rescore at a time). WAL + busy timeout come from
+        # pmbot.db: this file is shared with the ledger and the dashboard.
+        self.conn = db_connect(db_path, check_same_thread=False)
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
 

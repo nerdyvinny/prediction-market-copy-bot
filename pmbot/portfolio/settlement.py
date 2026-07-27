@@ -29,7 +29,8 @@ class Settler:
         """Settle every open position whose market has resolved.
 
         Returns the number of positions settled. Per-position failures are
-        isolated (a dead API can't block the rest).
+        isolated — neither a dead API nor a failed ledger write can block the
+        rest of the sweep.
         """
         settled = 0
         for pos in self.ledger.get_positions():
@@ -40,7 +41,16 @@ class Settler:
                 continue
             if price is None:
                 continue
-            self._record_settlement(pos, price)
+            try:
+                self._record_settlement(pos, price)
+            except Exception as e:
+                # The write used to sit outside the guard, so one failure (a
+                # locked DB, a full disk) aborted the whole sweep and left
+                # every later resolved position unsettled — with its bankroll
+                # pinned until the next interval. A write failure isn't
+                # transient noise, so it logs louder than a lookup miss.
+                log.warning("settle: recording %s failed: %s", pos.token_id[:24], e)
+                continue
             settled += 1
         return settled
 

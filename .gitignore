@@ -22,6 +22,9 @@ venv/
 # Data / runtime artifacts
 *.db
 *.db.*
+# WAL sidecars — the hyphen means *.db.* does NOT cover these.
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 data/*.json

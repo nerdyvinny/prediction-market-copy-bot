@@ -317,16 +317,24 @@ class Engine:
         t = self._rescore_thread
         if t is not None and not t.is_alive():
             self._rescore_thread = None
+            retry_delay = min(self._rescore_retry_s, self._rescore_interval)
             if self._rescore_error is not None:
                 log.error("rescore failed: %s", self._rescore_error)
-                self._next_rescore = now + min(self._rescore_retry_s, self._rescore_interval)
+                self._next_rescore = now + retry_delay
             else:
-                ok = self._apply_rescore(self._rescore_result or [])
-                self._print_funnel_report()
-                self._print_leaders()
-                delay = self._rescore_interval if ok else min(self._rescore_retry_s,
-                                                              self._rescore_interval)
-                self._next_rescore = now + delay
+                # The deadline is armed in `finally`: if adopting the result or
+                # printing the report throws, an un-advanced deadline would
+                # start a fresh ~15-minute network-heavy rescore on EVERY 10s
+                # cycle instead of backing off once.
+                ok = False
+                try:
+                    ok = self._apply_rescore(self._rescore_result or [])
+                    self._print_funnel_report()
+                    self._print_leaders()
+                finally:
+                    self._next_rescore = now + (
+                        self._rescore_interval if ok else retry_delay
+                    )
         if self._rescore_thread is None and now >= self._next_rescore:
             print("· rescoring leaders in the background…")
             self._start_rescore()
@@ -359,8 +367,11 @@ class Engine:
                     self._rescore_tick()
 
                     if (now - self._last_settle) >= self._settle_interval:
-                        n_settled = self.settler.settle_open_positions()
+                        # Arm the next deadline BEFORE sweeping: a throw here
+                        # would otherwise leave it un-advanced and retry the
+                        # whole sweep every cycle instead of every interval.
                         self._last_settle = now
+                        n_settled = self.settler.settle_open_positions()
                         if n_settled:
                             print(f"· settled {n_settled} resolved position(s)")
 

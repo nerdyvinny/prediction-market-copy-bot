@@ -11,6 +11,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from pmbot.db import connect as db_connect
 from pmbot.models import Fill, Position, Side
 
 _SCHEMA = """
@@ -108,8 +109,9 @@ def apply_fill(shares: float, avg: float, side: Side, fill_shares: float, price:
 class Ledger:
     def __init__(self, db_path: str = "pmbot.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
+        # WAL + a real busy timeout: the dashboard opens its own connection to
+        # this same file every 20s while the loop is writing (see pmbot.db).
+        self.conn = db_connect(db_path)
         self.conn.executescript(_SCHEMA)
         self._migrate()
         self.conn.commit()

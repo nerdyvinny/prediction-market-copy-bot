@@ -20,10 +20,10 @@ still goes through the same deep-scoring and filters as everyone else.
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from pmbot.data import GammaClient, PolymarketDataClient
+from pmbot.db import connect as db_connect
 from pmbot.leaders.discovery import (
     _f,
     _fetch_market_trades,
@@ -55,9 +55,10 @@ class RecordStore:
     def __init__(self, db_path: str = "pmbot.db"):
         # check_same_thread=False: the store is only ever used by whichever
         # single thread runs the rescore (main synchronously, or the engine's
-        # background rescore worker) — never concurrently.
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        # background rescore worker) — never concurrently. WAL + busy timeout
+        # come from pmbot.db: this file is shared with the ledger and the
+        # dashboard.
+        self.conn = db_connect(db_path, check_same_thread=False)
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
 
