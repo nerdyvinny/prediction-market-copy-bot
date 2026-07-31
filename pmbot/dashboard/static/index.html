@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pmbot</title>
-<link rel="stylesheet" href="/static/style.css?v=3">
+<link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
 
@@ -41,6 +41,23 @@
     </div>
   </section>
   <p class="strip" id="strip"></p>
+
+  <section class="card">
+    <div class="card-head">
+      <div class="cal-nav">
+        <button id="cal-prev" class="cal-arrow" type="button" aria-label="Previous month">‹</button>
+        <h2 id="cal-month">—</h2>
+        <button id="cal-next" class="cal-arrow" type="button" aria-label="Next month">›</button>
+      </div>
+      <span class="sub" id="cal-sub"></span>
+    </div>
+    <div class="cal-dow">
+      <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span>
+      <span>Thu</span><span>Fri</span><span>Sat</span>
+    </div>
+    <div class="cal-grid" id="cal-grid"></div>
+    <p class="cal-foot">Daily realized P&amp;L, net of fees · trade count is fills that day</p>
+  </section>
 
   <section class="card">
     <div class="card-head">
@@ -117,6 +134,6 @@
 
 <footer>Read-only paper ledger · no orders are placed from this page</footer>
 
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=4"></script>
 </body>
 </html>

@@ -148,6 +148,116 @@ main {
   margin-top: -6px;
 }
 
+/* ---- P&L calendar ----------------------------------------------------- */
+
+.cal-nav { display: flex; align-items: center; gap: 4px; }
+
+.cal-arrow {
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--ink-2);
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.cal-arrow:hover:not(:disabled) { background: var(--chip-closed-bg); color: var(--ink); }
+.cal-arrow:disabled { opacity: 0.3; cursor: default; }
+
+.cal-dow, .cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+}
+
+.cal-dow {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+  text-align: center;
+  margin-bottom: 6px;
+}
+
+.cal-cell {
+  min-height: 62px;
+  border-radius: 10px;
+  border: 1px solid var(--hairline);
+  padding: 5px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+}
+
+.cal-cell.blank { border: none; }
+
+.cal-cell.today { border-color: var(--accent); }
+
+/* --cell-a is set per cell from that day's share of the month's biggest move. */
+.cal-cell.pos { background: color-mix(in srgb, var(--pos) calc(var(--cell-a) * 100%), transparent); }
+.cal-cell.neg { background: color-mix(in srgb, var(--neg) calc(var(--cell-a) * 100%), transparent); }
+.cal-cell.flat { background: var(--chip-closed-bg); }
+
+.cal-d { font-size: 11px; color: var(--ink-3); }
+.cal-cell.has .cal-d { color: var(--ink-2); font-weight: 500; }
+
+.cal-pnl {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cal-n { font-size: 11px; color: var(--ink-2); }
+
+.cal-cell .narrow { display: none; }
+
+.cal-foot { font-size: 12px; color: var(--ink-3); margin-top: 10px; }
+
+@media (max-width: 560px) {
+  .cal-dow, .cal-grid { gap: 3px; }
+  .cal-cell { min-height: 48px; padding: 3px 4px; }
+  .cal-pnl { font-size: 11px; }
+  .cal-n { font-size: 10px; }
+  .cal-cell .wide { display: none; }
+  .cal-cell .narrow { display: inline; }
+}
+
+/* ---- leader drill-down ------------------------------------------------- */
+
+.leader-row { cursor: pointer; }
+.leader-row:hover > td { background: var(--chip-closed-bg); }
+.leader-row.open > td { background: var(--chip-open-bg); }
+
+.caret {
+  display: inline-block;
+  width: 14px;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.lp-row > td { padding: 6px 10px 14px; background: var(--bg); }
+
+.lp-note { font-size: 13px; color: var(--ink-2); padding: 6px 2px; }
+
+.lp-table td { padding: 8px 10px; }
+
+/* The whole point of this panel is spotting what the bot took vs. skipped, so
+   copied rows get a tint + rail, and the skipped ones recede. */
+.lp-table tr.lp-copied > td { background: var(--chip-open-bg); }
+.lp-table tr.lp-copied > td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+  font-weight: 500;
+}
+.lp-table tr:not(.lp-copied) > td:first-child { color: var(--ink-2); }
+
+.lp-skip { font-size: 12px; color: var(--ink-3); }
+
 /* ---- cards ----------------------------------------------------------- */
 
 .card {

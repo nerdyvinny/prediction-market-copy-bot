@@ -16,6 +16,12 @@ const fmtUsd = (v, signed = false) => {
   })}`;
 };
 
+// Whole dollars, for cells too narrow to hold cents.
+const fmtUsdWhole = (v) => {
+  const r = Math.round(v);
+  return `${r < 0 ? "−" : "+"}$${Math.abs(r).toLocaleString("en-US")}`;
+};
+
 const fmtPrice = (v) =>
   v === null || v === undefined ? "—" : v.toFixed(v < 0.01 ? 4 : 2);
 
@@ -72,12 +78,167 @@ function renderHero(m) {
     ` &nbsp;·&nbsp; ${m.fills} trade${m.fills === 1 ? "" : "s"} logged`;
 }
 
+/* ---- P&L calendar ------------------------------------------------------ */
+
+/* Day buckets are keyed in *local* time so a cell lines up with the day the
+   user actually watched the bot trade — the rest of the page prints local
+   clock times too. Fills carry `net_realized_usd` from the server (realized
+   P&L minus that fill's fee), so a month's cells sum to the closed P&L. */
+
+const dayKey = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()).padStart(2, "0")}`;
+
+function bucketDays(fills) {
+  const days = new Map();
+  for (const f of fills) {
+    const d = new Date(f.ts);
+    const k = dayKey(d);
+    let b = days.get(k);
+    if (!b) days.set(k, (b = { pnl: 0, buys: 0, sells: 0, fills: 0 }));
+    b.pnl += f.net_realized_usd || 0;
+    b.fills += 1;
+    if (f.side === "BUY") b.buys += 1; else b.sells += 1;
+  }
+  return days;
+}
+
+// null = "follow the data": pinned to the newest month with activity until the
+// user clicks an arrow, after which their choice sticks across polls.
+let calMonth = null;
+
+function monthLabel(y, m) {
+  return new Date(y, m, 1).toLocaleString(undefined, {
+    month: "long", year: "numeric",
+  });
+}
+
+function renderCalendar(fills) {
+  const days = bucketDays(fills);
+
+  if (calMonth === null) {
+    const latest = fills.length
+      ? new Date(Math.max(...fills.map((f) => new Date(f.ts).getTime())))
+      : new Date();
+    calMonth = { y: latest.getFullYear(), m: latest.getMonth() };
+  }
+  const { y, m } = calMonth;
+
+  const first = new Date(y, m, 1);
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const todayKey = dayKey(new Date());
+
+  let monthPnl = 0, monthFills = 0, monthBuys = 0, activeDays = 0;
+  for (let d = 1; d <= daysInMonth; d++) {
+    const b = days.get(dayKey(new Date(y, m, d)));
+    if (!b) continue;
+    monthPnl += b.pnl; monthFills += b.fills; monthBuys += b.buys; activeDays += 1;
+  }
+  // Shade relative to the month's own biggest day so a quiet month still reads.
+  let peak = 0;
+  for (let d = 1; d <= daysInMonth; d++) {
+    const b = days.get(dayKey(new Date(y, m, d)));
+    if (b) peak = Math.max(peak, Math.abs(b.pnl));
+  }
+
+  $("#cal-month").textContent = monthLabel(y, m);
+  $("#cal-sub").innerHTML = activeDays
+    ? `<span class="${pnlClass(monthPnl)}">${fmtUsd(monthPnl, true)}</span>` +
+      ` · ${monthBuys} entr${monthBuys === 1 ? "y" : "ies"}` +
+      ` · ${monthFills} fill${monthFills === 1 ? "" : "s"} over ${activeDays} day${activeDays === 1 ? "" : "s"}`
+    : "no activity this month";
+
+  const cells = [];
+  for (let i = 0; i < first.getDay(); i++) {
+    cells.push(`<div class="cal-cell blank"></div>`);
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = new Date(y, m, d);
+    const k = dayKey(date);
+    const b = days.get(k);
+    const today = k === todayKey ? " today" : "";
+    if (!b) {
+      cells.push(`<div class="cal-cell${today}"><span class="cal-d">${d}</span></div>`);
+      continue;
+    }
+    const sign = b.pnl > 0.005 ? "pos" : b.pnl < -0.005 ? "neg" : "flat";
+    // 0.12 floor: a tiny-but-real day should still be visibly not-empty.
+    const alpha = peak ? (0.12 + 0.58 * Math.min(1, Math.abs(b.pnl) / peak)) : 0.12;
+    const style = sign === "flat" ? "" :
+      ` style="--cell-a:${alpha.toFixed(3)}"`;
+    const title = `${date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}` +
+      ` — ${fmtUsd(b.pnl, true)} · ${b.buys} entries, ${b.sells} exits`;
+    // Two renderings of the same numbers; CSS picks one by viewport. A phone
+    // cell is ~35px wide, which ellipsises "+$18.19" down to a useless "+$…".
+    cells.push(`<div class="cal-cell has ${sign}${today}"${style} title="${title}">
+      <span class="cal-d">${d}</span>
+      <span class="cal-pnl wide ${pnlClass(b.pnl)}">${fmtUsd(b.pnl, true)}</span>
+      <span class="cal-pnl narrow ${pnlClass(b.pnl)}">${fmtUsdWhole(b.pnl)}</span>
+      <span class="cal-n"><span class="wide">${b.fills} trade${b.fills === 1 ? "" : "s"}</span><span class="narrow">${b.fills}×</span></span>
+    </div>`);
+  }
+  $("#cal-grid").innerHTML = cells.join("");
+
+  // Don't let the user page into an empty future.
+  const now = new Date();
+  $("#cal-next").disabled = y > now.getFullYear() ||
+    (y === now.getFullYear() && m >= now.getMonth());
+}
+
+function shiftMonth(delta) {
+  if (calMonth === null) return;
+  const d = new Date(calMonth.y, calMonth.m + delta, 1);
+  calMonth = { y: d.getFullYear(), m: d.getMonth() };
+  renderCalendar(lastState ? lastState.fills : []);
+}
+
 /* ---- leaders we follow ----------------------------------------------- */
+
+/* Clicking a leader opens their live Polymarket book underneath the row.
+   `leaderBooks` survives the 20s poll re-render so an open panel doesn't
+   flicker or collapse while the user is reading it. */
+const expandedLeaders = new Set();
+const leaderBooks = new Map();  // wallet -> {loading, error, data}
+
+function leaderBookHtml(wallet) {
+  const st = leaderBooks.get(wallet);
+  if (!st || st.loading) return `<div class="lp-note">Loading their open trades…</div>`;
+  if (st.error) return `<div class="lp-note neg">Couldn't load: ${st.error}</div>`;
+  const d = st.data;
+  if (!d.positions.length) {
+    return `<div class="lp-note">No open positions on Polymarket right now.</div>`;
+  }
+  const rows = d.positions.map((p) => {
+    const mine = p.copied
+      ? `<span class="chip ${p.our_status}">${
+          p.copied_from_this_leader ? "Copied" : "Copied (other leader)"}${
+          p.our_status === "open" ? "" : " · closed"}</span>`
+      : `<span class="lp-skip">not copied</span>`;
+    const sub = `${fmtShares(p.shares)} @ ${fmtPrice(p.avg_price)} → ${fmtPrice(p.cur_price)}` +
+      (p.end_date ? ` · ends ${p.end_date}` : "") +
+      (p.our_invested_usd ? ` · we put in ${fmtUsd(p.our_invested_usd)}` : "");
+    return `<tr class="${p.copied ? "lp-copied" : ""}">
+      <td class="left market" title="${p.title}">${p.title || `<span class="mono-id">${p.market_id.slice(0, 18)}…</span>`}
+        <span class="rowsub">${sub}</span></td>
+      <td class="left">${p.outcome}</td>
+      <td>${fmtUsd(p.value_usd)}</td>
+      <td class="${pnlClass(p.pnl_usd)}">${fmtUsd(p.pnl_usd, true)}</td>
+      <td class="left">${mine}</td>
+    </tr>`;
+  }).join("");
+  const head = `<div class="lp-note">${d.positions.length} open · ` +
+    `${d.copied_count} copied by the bot · ${fmtUsd(d.total_value_usd)} on the table` +
+    (d.stale ? ` · <span class="neg">last known book</span>` : "") + `</div>`;
+  return head + `<div class="table-wrap"><table class="lp-table">
+    <thead><tr><th class="left">Market</th><th class="left">Side</th>
+      <th>Worth now</th><th>Their P&amp;L</th><th class="left">Us</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
 
 function renderLeaders(leaders) {
   const tb = $("#leaders tbody");
   $("#leaders-sub").textContent = leaders && leaders.length
-    ? `${leaders.length} followed · best first` : "";
+    ? `${leaders.length} followed · click one to see their open trades` : "";
   if (!leaders || !leaders.length) {
     tb.innerHTML = `<tr><td colspan="5" class="left empty">No leaders followed yet — the bot picks them on its next rescore.</td></tr>`;
     return;
@@ -85,15 +246,44 @@ function renderLeaders(leaders) {
   tb.innerHTML = leaders.map((l) => {
     const copied = l.copied_trades
       ? `${l.copied_trades} trade${l.copied_trades === 1 ? "" : "s"}` : "—";
-    return `<tr>
-      <td class="left"><a class="leader-link" href="${l.profile_url}" target="_blank" rel="noopener noreferrer"
-        title="Open ${l.wallet} on Polymarket">${shortAddr(l.wallet)} ↗</a></td>
+    const open = expandedLeaders.has(l.wallet);
+    const detail = open
+      ? `<tr class="lp-row"><td colspan="5" class="left">${leaderBookHtml(l.wallet)}</td></tr>`
+      : "";
+    return `<tr class="leader-row${open ? " open" : ""}" data-wallet="${l.wallet}"
+        role="button" tabindex="0" aria-expanded="${open}">
+      <td class="left"><span class="caret">${open ? "▾" : "▸"}</span>
+        <span class="mono-id">${shortAddr(l.wallet)}</span></td>
       <td>${l.score.toFixed(3)}</td>
       <td>${fmtUsd(l.exposure_usd)}</td>
       <td>${copied}</td>
-      <td class="left"></td>
-    </tr>`;
+      <td class="left"><a class="leader-link" href="${l.profile_url}" target="_blank"
+        rel="noopener noreferrer" title="Open ${l.wallet} on Polymarket">Polymarket ↗</a></td>
+    </tr>${detail}`;
   }).join("");
+}
+
+async function loadLeaderBook(wallet) {
+  leaderBooks.set(wallet, { loading: true });
+  renderLeaders(lastState ? lastState.leaders : []);
+  try {
+    const res = await fetch(`/api/leader/${wallet}/positions`);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    leaderBooks.set(wallet, { data: await res.json() });
+  } catch (err) {
+    leaderBooks.set(wallet, { error: err.message });
+  }
+  renderLeaders(lastState ? lastState.leaders : []);
+}
+
+function toggleLeader(wallet) {
+  if (expandedLeaders.has(wallet)) {
+    expandedLeaders.delete(wallet);
+    renderLeaders(lastState ? lastState.leaders : []);
+    return;
+  }
+  expandedLeaders.add(wallet);
+  loadLeaderBook(wallet);  // always refetch: their book moves faster than our poll
 }
 
 /* ---- open positions -------------------------------------------------- */
@@ -243,12 +433,14 @@ function describeUpdate(s, prevFills) {
 /* ---- main loop --------------------------------------------------------- */
 
 let lastFillCount = null;
+let lastState = null;
 
 async function refresh() {
   try {
     const res = await fetch("/api/state");
     if (!res.ok) throw new Error(res.statusText);
     const s = await res.json();
+    lastState = s;
 
     $("#mode-badge").textContent = s.mode.toUpperCase();
     $("#mode-badge").classList.toggle("live", s.mode === "live");
@@ -257,6 +449,7 @@ async function refresh() {
     $("#updated").textContent = `Updated ${fmtClock(s.now)}`;
 
     renderHero(s.summary);
+    renderCalendar(s.fills);
     renderLeaders(s.leaders);
     renderPositions(s.positions);
     renderTrades(s.trades);
@@ -272,6 +465,24 @@ async function refresh() {
     });
   }
 }
+
+/* Delegated so handlers survive the poll re-rendering the tables. */
+$("#leaders tbody").addEventListener("click", (e) => {
+  if (e.target.closest("a")) return;  // let the Polymarket link through
+  const row = e.target.closest(".leader-row");
+  if (row) toggleLeader(row.dataset.wallet);
+});
+
+$("#leaders tbody").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const row = e.target.closest(".leader-row");
+  if (!row) return;
+  e.preventDefault();
+  toggleLeader(row.dataset.wallet);
+});
+
+$("#cal-prev").addEventListener("click", () => shiftMonth(-1));
+$("#cal-next").addEventListener("click", () => shiftMonth(1));
 
 renderUpdates(loadUpdates());
 refresh();

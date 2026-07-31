@@ -18,14 +18,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from pmbot.config.settings import get_settings
-from pmbot.data import GammaClient
+from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.data.price_cache import PriceCache
-from pmbot.portfolio.ledger import Ledger
+from pmbot.models import Side
+from pmbot.portfolio.ledger import Ledger, apply_fill
 
 app = FastAPI(title="pmbot dashboard")
 
@@ -43,8 +44,13 @@ _STATIC = Path(__file__).parent / "static"
 # Lazy singletons: market questions never change, quotes have their own TTL.
 _gamma: GammaClient | None = None
 _prices: PriceCache | None = None
+_data: PolymarketDataClient | None = None
 _question_cache: dict[str, str] = {}
 _engine_check: tuple[float, bool] = (0.0, False)
+# wallet -> (fetched_at, raw positions). Leader books move on trades, not ticks,
+# so a short TTL keeps a click-happy user off the public API's rate limit.
+_leader_pos_cache: dict[str, tuple[float, list[dict]]] = {}
+LEADER_POS_TTL = 30.0
 
 
 def _get_gamma() -> GammaClient:
@@ -52,6 +58,13 @@ def _get_gamma() -> GammaClient:
     if _gamma is None:
         _gamma = GammaClient()
     return _gamma
+
+
+def _get_data() -> PolymarketDataClient:
+    global _data
+    if _data is None:
+        _data = PolymarketDataClient()
+    return _data
 
 
 def _get_prices() -> PriceCache:
@@ -163,6 +176,28 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
     return out
 
 
+def _annotate_realized(fills: list[dict]) -> None:
+    """Stamp each fill (oldest first) with the realized P&L it booked.
+
+    The ledger only stores the *running* realized total per token, so a daily
+    breakdown has to replay the tape. This uses the same `apply_fill` the
+    engine does, which means the per-fill deltas sum back to the ledger's
+    realized total — the calendar and the hero tile can't drift apart.
+
+    `net_realized_usd` also subtracts the fill's fee, so a day's column is what
+    that day actually did to the bankroll: BUY days show their fee drag, SELL
+    days show the closed P&L net of cost.
+    """
+    state: dict[str, tuple[float, float]] = {}  # token -> (shares, avg)
+    for f in fills:
+        shares, avg = state.get(f["token_id"], (0.0, 0.0))
+        side = Side.BUY if f["side"] == "BUY" else Side.SELL
+        eff = apply_fill(shares, avg, side, abs(f["shares"]), f["fill_price"])
+        state[f["token_id"]] = (eff.new_shares, eff.new_avg)
+        f["realized_usd"] = round(eff.realized_delta, 4)
+        f["net_realized_usd"] = round(eff.realized_delta - (f["fee_usd"] or 0.0), 4)
+
+
 def _win_stats(trades: list[dict]) -> dict:
     """Win rate over *closed* trades only.
 
@@ -230,6 +265,7 @@ def state() -> dict:
         led.close()
 
     all_fills = [dict(r) for r in rows]
+    _annotate_realized(all_fills)  # oldest-first order matters: this replays the tape
     open_pos = {p.token_id: p for p in positions}
     mids = {p.token_id: _mid_for(p.token_id, p.venue) for p in positions}
     leaders_out = _leaders(leaders_raw, leader_exposure, all_fills)
@@ -282,6 +318,106 @@ def state() -> dict:
         "fills": fills_out,
         "leaders": leaders_out,
     }
+
+
+def _our_book_by_token(fills: list[dict], leader: str) -> dict[str, dict]:
+    """Per-token roll-up of our own fills, tagged with whether this leader
+    is the one we copied it from (the same market can reach us via two)."""
+    book: dict[str, dict] = {}
+    for f in fills:
+        b = book.setdefault(f["token_id"], {
+            "invested_usd": 0.0, "returned_usd": 0.0,
+            "from_this_leader": False, "first_ts": f["ts"],
+        })
+        if f["side"] == "BUY":
+            b["invested_usd"] += f["size_usd"]
+        else:
+            b["returned_usd"] += f["size_usd"]
+        if (f["source_leader"] or "").lower() == leader:
+            b["from_this_leader"] = True
+    return book
+
+
+@app.get("/api/leader/{wallet}/positions")
+def leader_positions(wallet: str) -> dict:
+    """A followed leader's live Polymarket book, flagged with what we copied.
+
+    Restricted to wallets on the follow list on purpose: the dashboard binds
+    0.0.0.0, and an unfiltered wallet parameter would turn it into an open
+    proxy for the public Data API.
+    """
+    key = wallet.lower()
+    settings = get_settings()
+    led = Ledger(settings.db_path)
+    try:
+        followed = {r["wallet"].lower() for r in led.followed_leaders_detail()}
+        if key not in followed:
+            raise HTTPException(status_code=404, detail="not a followed leader")
+        rows = led.conn.execute(
+            "SELECT ts, token_id, side, size_usd, source_leader FROM fills ORDER BY ts"
+        ).fetchall()
+        open_cost = {
+            p.token_id: abs(p.shares * p.avg_price) for p in led.get_positions()
+        }
+    finally:
+        led.close()
+
+    book = _our_book_by_token([dict(r) for r in rows], key)
+
+    now = time.time()
+    cached = _leader_pos_cache.get(key)
+    if cached and now - cached[0] < LEADER_POS_TTL:
+        raw, stale = cached[1], False
+    else:
+        try:
+            raw = _get_data().get_positions(wallet)
+            _leader_pos_cache[key] = (now, raw)
+            stale = False
+        except Exception as exc:
+            if cached is None:
+                raise HTTPException(status_code=502, detail=f"Data API: {exc}") from exc
+            raw, stale = cached[1], True  # serve the last good book rather than a blank panel
+
+    out = []
+    for p in raw:
+        token = str(p.get("asset", ""))
+        ours = book.get(token)
+        held = open_cost.get(token, 0.0) >= DUST_USD
+        out.append({
+            "token_id": token,
+            "market_id": str(p.get("conditionId", "")),
+            "title": p.get("title") or "",
+            "outcome": p.get("outcome") or "",
+            "shares": _f(p.get("size")),
+            "avg_price": _f(p.get("avgPrice")),
+            "cur_price": _f(p.get("curPrice")),
+            "value_usd": round(_f(p.get("currentValue")), 2),
+            "pnl_usd": round(_f(p.get("cashPnl")), 2),
+            "pct_pnl": round(_f(p.get("percentPnl")), 1),
+            "end_date": p.get("endDate"),
+            "redeemable": bool(p.get("redeemable")),
+            "copied": ours is not None,
+            "copied_from_this_leader": bool(ours and ours["from_this_leader"]),
+            "our_status": "open" if (ours and held) else "closed" if ours else None,
+            "our_invested_usd": round(ours["invested_usd"], 2) if ours else None,
+            "our_first_ts": ours["first_ts"] if ours else None,
+        })
+    out.sort(key=lambda p: p["value_usd"], reverse=True)
+    return {
+        "wallet": wallet,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "stale": stale,
+        "positions": out,
+        "copied_count": sum(1 for p in out if p["copied"]),
+        "total_value_usd": round(sum(p["value_usd"] for p in out), 2),
+    }
+
+
+def _f(v: object, default: float = 0.0) -> float:
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 @app.get("/")
