@@ -67,6 +67,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("fills", "venue", "ALTER TABLE fills ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'"),
     ("fills", "fee_usd", "ALTER TABLE fills ADD COLUMN fee_usd REAL NOT NULL DEFAULT 0"),
     ("fills", "leg_group", "ALTER TABLE fills ADD COLUMN leg_group TEXT"),
+    # The price the SIGNAL targeted — for copies, the leader's own fill price.
+    # Without it there is no way to ask the question that actually matters:
+    # are we filling where the leader filled, or paying up for their edge?
+    # NULL on rows written before this column existed.
+    ("fills", "target_price", "ALTER TABLE fills ADD COLUMN target_price REAL"),
     ("positions", "venue", "ALTER TABLE positions ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'"),
 ]
 
@@ -139,13 +144,13 @@ class Ledger:
             """INSERT INTO fills (ts, mode, market_id, token_id, outcome, side,
                                   fill_price, size_usd, shares, slippage_bps,
                                   reason, source_leader, source_uid,
-                                  venue, fee_usd, leg_group)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  venue, fee_usd, leg_group, target_price)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 fill.timestamp.isoformat(), fill.mode, s.market_id, s.token_id,
                 s.outcome, s.side.value, fill.fill_price, fill.size_usd, fill.shares,
                 fill.slippage_bps, s.reason, s.source_leader, s.source_uid,
-                s.venue, fill.fee_usd, s.leg_group,
+                s.venue, fill.fee_usd, s.leg_group, s.target_price,
             ),
         )
         row = cur.execute(

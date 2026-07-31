@@ -39,3 +39,6 @@ graphify-out/
 Thumbs.db
 .vscode/
 .idea/
+
+# Deep-sweep report artifacts (regenerate with scripts/deep_sweep.py)
+deep_sweep_results.json
