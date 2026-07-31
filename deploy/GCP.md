@@ -30,20 +30,24 @@ Compute Engine → **VM instances** → **Create instance**:
 Free-tier egress is 1 GB/month to North America — the bot polls JSON APIs and
 uses a tiny fraction of that.
 
-### A3. Add your SSH key (GCP's format is special)
+### A3. Add your SSH key (bootstrap access only)
 Still on the create page: **Advanced options → Security → Manage Access →
-Add item**, and paste **exactly** this:
+Add item**, and paste your public key in GCP's `username:key` form:
 
 ```
-vinny:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJxYxDjM8/00dnzprRN7Ny4vaqtkuZVjcrAi3jgYPInx vobic-pmbot-vps
+pmbot:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJxYxDjM8/00dnzprRN7Ny4vaqtkuZVjcrAi3jgYPInx vobic-pmbot-vps
 ```
 
-GCP derives the Linux username from the `username:` prefix — that is what makes
-your login `vinny`. Change the prefix if you want a different account name.
+> ⚠️ **You will probably NOT get the username you typed.** GCP's guest agent
+> derives Linux accounts from your Google identity and the key comment, not
+> reliably from the `username:` prefix. This VM ended up with accounts named
+> `veestudios1` (from the billing account's gmail) and `vobic-pmbot-vps` (from
+> the key's trailing comment) — never the requested prefix. Treat whatever you
+> land in as **temporary bootstrap access** and move to a real account in A6.
 
 > ⚠️ **Do NOT enable OS Login.** If `enable-oslogin=TRUE` is set (project- or
-> instance-level), GCP **ignores** this metadata key and your key won't work.
-> The default is off; leave it off.
+> instance-level), GCP **ignores** this metadata key entirely and your key won't
+> work. The default is off; leave it off.
 
 Then click **Create**.
 
@@ -53,12 +57,41 @@ which would break your SSH config and tunnel. VPC network → **IP addresses** �
 find the `pmbot` row → **Reserve**. Free while attached to a running VM.
 
 ### A5. First connect (accepts the host fingerprint)
-From your Windows machine:
+From your Windows machine, using whichever account GCP actually created (see
+the A3 warning — try your gmail localpart first, then the key comment):
 ```bash
-ssh vinny@YOUR_EXTERNAL_IP
+ssh YOUR_GCP_DERIVED_USER@YOUR_EXTERNAL_IP
 ```
 Type `yes` at the fingerprint prompt. If it hangs or refuses, see
-Troubleshooting below.
+Troubleshooting below. `getent passwd | tail` on the box lists what exists.
+
+### A6. Create a stable admin account (do this immediately)
+The guest-agent-managed accounts from A3 are **not durable**: the agent
+rewrites their `~/.ssh/authorized_keys` from instance metadata, so anything you
+add by hand there gets scrubbed, and the account itself can change name or
+vanish if the metadata changes. Every later step — and every future SSH — should
+use an account GCP does not manage.
+
+From the bootstrap session:
+```bash
+sudo adduser --disabled-password --gecos "" pmbadmin
+sudo install -d -m 700 -o pmbadmin -g pmbadmin /home/pmbadmin/.ssh
+sudo tee /home/pmbadmin/.ssh/authorized_keys >/dev/null <<'KEY'
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJxYxDjM8/00dnzprRN7Ny4vaqtkuZVjcrAi3jgYPInx vobic-pmbot-vps
+KEY
+sudo chmod 600 /home/pmbadmin/.ssh/authorized_keys
+sudo chown pmbadmin:pmbadmin /home/pmbadmin/.ssh/authorized_keys
+echo 'pmbadmin ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/pmbadmin
+sudo chmod 440 /etc/sudoers.d/pmbadmin
+```
+
+Verify from a **second terminal** before closing the bootstrap one — locking
+yourself out here means rebuilding the VM:
+```bash
+ssh pmbadmin@YOUR_EXTERNAL_IP "sudo whoami"    # must print: root
+```
+
+`pmbadmin` is the login for everything below and for day-to-day operation.
 
 ---
 
@@ -97,16 +130,24 @@ Follow MIGRATION.md Steps 2-9 exactly as written:
 8. Verify (`status`, `journalctl`, `curl` the dashboard)
 9. Only then: disable the Windows scheduled tasks
 
-The `scp` in Step 5 uses your GCP username:
+The `scp` in Step 5 uses the A6 account:
 ```powershell
-scp .env     vinny@YOUR_EXTERNAL_IP:/tmp/pmbot.env
-scp pmbot.db vinny@YOUR_EXTERNAL_IP:/tmp/pmbot.db
+scp .env     pmbadmin@YOUR_EXTERNAL_IP:/tmp/pmbot.env
+scp pmbot.db pmbadmin@YOUR_EXTERNAL_IP:/tmp/pmbot.db
 ```
+
+> Note the two accounts have different jobs and neither is the other:
+> **`pmbadmin`** is who you log in as. **`pmbot`** is the unprivileged service
+> account created in MIGRATION.md Step 2 that owns `/opt/pmbot` and runs the
+> units — it has no login key. Since `/opt/pmbot` is `pmbot`-owned, git and
+> python commands there run as `sudo -u pmbot …`; plain `cd /opt/pmbot/...` from
+> `pmbadmin` gets Permission denied, and bare `sudo git` trips git's
+> `dubious ownership` guard.
 
 ### Dashboard access
 Unchanged — bound to localhost, reached by tunnel, nothing exposed publicly:
 ```bash
-ssh -N -L 8090:localhost:8090 vinny@YOUR_EXTERNAL_IP
+ssh -N -L 8090:localhost:8090 pmbadmin@YOUR_EXTERNAL_IP
 ```
 Then open <http://localhost:8090>.
 
@@ -116,7 +157,10 @@ Then open <http://localhost:8090>.
 
 | Symptom | Cause / fix |
 |---|---|
-| `Permission denied (publickey)` | OS Login is enabled → disable it, or use `gcloud compute ssh pmbot` instead. Also check the metadata key kept its `vinny:` prefix |
+| `Permission denied (publickey)` as `pmbadmin` | The A6 account or its key is gone. Get back in via the A3 bootstrap account (or `gcloud compute ssh`) and redo A6 |
+| `Permission denied (publickey)` on first connect | OS Login is enabled → disable it, or use `gcloud compute ssh pmbot` instead. Also check you're using the account GCP actually derived, not the `username:` prefix you typed (A3) |
+| SSH key you added by hand stopped working | You added it to a guest-agent-managed account; the agent rewrites those `authorized_keys` from metadata. Use the unmanaged `pmbadmin` account (A6) |
+| `fatal: detected dubious ownership` from git | You ran `sudo git` in `/opt/pmbot/...`, which `pmbot` owns. Use `sudo -u pmbot git -C /opt/pmbot/prediction-market-copy-bot …` |
 | SSH times out | The VM has no external IP, or the default `allow-ssh` firewall rule was deleted. Check VPC → Firewall for a rule allowing tcp:22 |
 | IP changed after a reboot | Ephemeral IP — reserve a static one (A4) |
 | Bot dies silently, `journalctl` shows nothing | Likely OOM. Confirm with `dmesg -T \| grep -i oom`; add swap (B0) |
