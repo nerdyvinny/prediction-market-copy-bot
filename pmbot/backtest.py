@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import heapq
 import logging
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
@@ -330,27 +331,62 @@ class ExactCopyBacktester:
                 return (None, None)
         return self._mkt_cache[condition_id]
 
-    def fetch_tapes(self, leaders: list[str]) -> dict[str, list[LeaderTrade]]:
-        """Fetch each leader's trade tape (paginated, newest-first from API)."""
+    def fetch_tapes(
+        self, leaders: list[str], *, page_attempts: int = 3
+    ) -> dict[str, list[LeaderTrade]]:
+        """Fetch each leader's trade tape (paginated, newest-first from API).
+
+        Pagination stops ONLY on a definitive end-of-tape signal: an empty page,
+        a page carrying no unseen uids, or `trades_limit` reached. A short page
+        is NOT such a signal — the API returns one intermittently, and treating
+        it as the end silently truncated a 3000-trade/113-day tape to 998
+        trades/27 days, quietly changing backtest P&L by ~28%. The extra request
+        that confirms the real end (an empty page) is worth far more than the
+        wrong answer it prevents.
+
+        A page that keeps failing is retried with backoff and then reported at
+        WARNING, never swallowed at DEBUG: `_vet_leaders` keeps or drops live
+        leaders off this tape, so a short one is a wrong trading decision, not
+        just a thin report.
+        """
         tapes: dict[str, list[LeaderTrade]] = {}
         chunk = 500
         for leader in leaders:
             trades: list[LeaderTrade] = []
             seen: set[str] = set()
             offset = 0
+            failure: str | None = None
             while len(trades) < self.trades_limit:
                 want = min(chunk, self.trades_limit - len(trades))
-                try:
-                    page = self.data.get_trades(user=leader, limit=want, offset=offset)
-                except Exception as e:
-                    log.debug("backtest: tape fetch failed for %s: %s", leader[:10], e)
-                    break
+                page = None
+                for attempt in range(1, page_attempts + 1):
+                    try:
+                        page = self.data.get_trades(user=leader, limit=want, offset=offset)
+                        break
+                    except Exception as e:
+                        if attempt == page_attempts:
+                            failure = f"{type(e).__name__}: {e}"
+                            log.debug("backtest: tape page failed for %s at offset %d: %s",
+                                      leader[:10], offset, e)
+                        else:
+                            time.sleep(min(0.5 * 2 ** (attempt - 1), 4.0))
+                if page is None:
+                    break                          # exhausted retries; reported below
+                if not page:
+                    break                          # empty page = true end of tape
                 fresh = [t for t in page if t.uid not in seen]
+                if not fresh:
+                    break                          # only duplicates: not advancing
                 seen.update(t.uid for t in fresh)
                 trades.extend(fresh)
-                if len(page) < want:
-                    break
                 offset += len(page)
+            if failure is not None:
+                log.warning(
+                    "backtest: tape for %s TRUNCATED at %d trades after %d failed "
+                    "attempts (%s) — this leader's window covers less history than "
+                    "requested; vetting and backtests over it are understated",
+                    leader[:10], len(trades), page_attempts, failure,
+                )
             tapes[leader.lower()] = trades
         return tapes
 
