@@ -93,6 +93,54 @@ def by_leader(rep):
         print(f"{w[:16]:16s} {n:5d} ${inv:10,.0f} ${pnl:9,.0f} {wins/n*100:5.1f}")
 
 
+def windows(rep, days, n_win=6):
+    """Per-window bucket P&L — is 'resolution is profitable' stable, or is it
+    one lucky stretch? A single span's aggregate cannot tell those apart, and
+    the whole reason we are here is that two losses in one week looked like a
+    trend (pmb-copy-params: read the curve across windows, not the argmax).
+    """
+    if not rep.results:
+        return
+    end = max(r.resolve_ts for r in rep.results)
+    start = end - timedelta(days=days)
+    width = (end - start) / n_win
+    print(f"\n=== per-window ({n_win} x {width.days}d), resolution bucket ===")
+    print(f"{'window':14s} {'n':>5s} {'net':>9s} {'win%':>6s}   {'leader-exit net':>15s}")
+    neg = 0
+    for i in range(n_win):
+        a, b = start + i * width, start + (i + 1) * width
+        res = [r for r in rep.results if a <= r.resolve_ts < b and r.closed_by == "resolution"]
+        exi = [r for r in rep.results if a <= r.resolve_ts < b and r.closed_by == "leader-exit"]
+        if not res:
+            continue
+        net = sum(r.pnl for r in res)
+        neg += net < 0
+        wins = sum(1 for r in res if r.pnl > 0)
+        print(f"{a:%m-%d}..{b:%m-%d}   {len(res):5d} ${net:8,.0f} {wins/len(res)*100:5.1f} "
+              f"  ${sum(r.pnl for r in exi):14,.0f}")
+    print(f"  -> resolution bucket negative in {neg}/{n_win} windows")
+
+
+def drawdown(rep):
+    """Worst peak-to-trough on the cumulative curve, whole book and per bucket.
+
+    Expectancy being positive does not make the tail affordable on a $500
+    bankroll — that is the question the two live losses actually raised.
+    """
+    from pmbot.backtest import max_drawdown
+    print(f"\n=== drawdown ===")
+    for label, rs in (("whole book", rep.results),
+                      ("resolution only",
+                       [r for r in rep.results if r.closed_by == "resolution"])):
+        by_t = sorted(rs, key=lambda r: r.resolve_ts)
+        cum, run = [], 0.0
+        for r in by_t:
+            run += r.pnl
+            cum.append(run)
+        print(f"  {label:18s} maxDD ${max_drawdown(cum):8,.0f}   "
+              f"worst single ${min((r.pnl for r in rs), default=0):,.0f}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=90)
@@ -131,6 +179,8 @@ def main() -> int:
     base = run()
     show(base, f"BASELINE — live params, {args.days}d")
     by_leader(base)
+    windows(base, args.days)
+    drawdown(base)
 
     # Candidate mitigation: skip entries placed close to the market's close.
     # These are the in-game bets our lag copies worst AND the ones with no time
