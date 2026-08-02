@@ -14,6 +14,11 @@ mirroring a leader out of a position reduces risk and is never blocked):
   - the trade is younger than `max_trade_age_minutes` — a newly followed
     leader's whole recent tape looks "unseen", and old entries whose price
     merely happens to be unchanged are history, not signals
+  - the leader hasn't already fully exited it inside the same fetched tape
+    (`skip_round_tripped_entries`) — both halves of a completed round-trip
+    arrive in one poll cycle, and copying the entry then immediately
+    mirroring the exit fills both legs at the same current price, banking the
+    spread as a loss and none of the leader's move
 
 BUY: same shape as a fresh entry, sized by the RiskManager off leader notional.
 SELL: mirrored *proportionally*, and only over OUR OWN slice from that leader.
@@ -88,6 +93,7 @@ class ExactCopyStrategy(Strategy):
         )
         self.sweep_exit_dust = s.sweep_exit_dust
         self.exit_dust_usd = s.exit_dust_usd
+        self.skip_round_tripped_entries = s.skip_round_tripped_entries
         self.min_hours_to_resolution = (
             s.copy_min_hours_to_resolution if min_hours_to_resolution is None
             else min_hours_to_resolution
@@ -207,6 +213,44 @@ class ExactCopyStrategy(Strategy):
                 return "too close to resolution"  # lag is adverse here
         return None
 
+    @staticmethod
+    def _round_tripped_entry_uids(ordered: list[LeaderTrade]) -> set[str]:
+        """UIDs of BUYs the leader has already fully exited *within this tape*.
+
+        One `get_trades` window routinely holds both halves of a completed
+        round-trip — increasingly so since the notional floor dropped to $50
+        and began admitting fast in-game scalps. Replaying both halves in a
+        single poll cycle opens and closes our copy at the same current price:
+        we capture none of the leader's move and pay the spread twice. The age
+        filter can't catch these — the entry really is minutes old, it is just
+        already dead.
+
+        Only FULL exits retire an entry. A leader who trimmed and still holds
+        is still expressing conviction, and mirroring that is the strategy
+        working as intended.
+        """
+        held: dict[str, float] = {}
+        bought: dict[str, float] = {}          # gross shares opened in-window
+        open_uids: dict[str, list[str]] = {}
+        closed: set[str] = set()
+        for t in ordered:
+            prior = held.get(t.token_id, 0.0)
+            if t.side is Side.BUY:
+                held[t.token_id] = prior + t.shares
+                bought[t.token_id] = bought.get(t.token_id, 0.0) + t.shares
+                open_uids.setdefault(t.token_id, []).append(t.uid)
+                continue
+            # A sell whose position predates the window drives this negative;
+            # clamp so it can't retire a later, unrelated entry.
+            remaining = max(0.0, prior - t.shares)
+            held[t.token_id] = remaining
+            # A "full" exit routinely undershoots by a rounding crumb, so test
+            # against the size of the position rather than an absolute epsilon.
+            if remaining <= max(1e-9, 1e-6 * bought.get(t.token_id, 0.0)):
+                closed.update(open_uids.pop(t.token_id, []))
+                bought.pop(t.token_id, None)
+        return closed
+
     def generate(self) -> Iterable[Signal]:
         now = datetime.now(timezone.utc)
         watchlist = [(w, False) for w in self.leaders]
@@ -218,7 +262,12 @@ class ExactCopyStrategy(Strategy):
                 log.debug("strategy: trades fetch failed for %s: %s", leader[:10], e)
                 continue
             # Oldest-first so leader position tracking replays in order.
-            for t in sorted(trades, key=lambda tr: tr.timestamp):
+            ordered = sorted(trades, key=lambda tr: tr.timestamp)
+            round_tripped = (
+                self._round_tripped_entry_uids(ordered)
+                if self.skip_round_tripped_entries else set()
+            )
+            for t in ordered:
                 key = (leader, t.token_id)
                 if t.uid not in self._seen_uids:
                     # Count toward leader position tracking exactly once per
@@ -251,6 +300,13 @@ class ExactCopyStrategy(Strategy):
 
                 if exit_only and t.side is Side.BUY:
                     continue                       # exit-only leader: mirror exits, never new entries
+
+                if t.side is Side.BUY and t.uid in round_tripped:
+                    # Settled, and checked before the market lookup so a dead
+                    # entry costs no API call: the leader's exit is history and
+                    # can never un-happen, so this uid is never copyable.
+                    self._processed_uids.add(t.uid)
+                    continue
 
                 market = self._market(t.market_id)
 

@@ -53,7 +53,8 @@ class NoopSelector:
         return []
 
 
-def test_same_batch_buy_then_sell_is_fully_mirrored():
+def _round_trip_engine(*, skip_round_tripped: bool):
+    """Engine whose leader tape holds both halves of one completed round-trip."""
     markets = {"m": Market(market_id="m", question="m", end_date=None,
                            liquidity_usd=10_000, closed=False)}
     t0, t1 = NOW - timedelta(minutes=5), NOW
@@ -72,12 +73,38 @@ def test_same_batch_buy_then_sell_is_fully_mirrored():
         price_cache=quote, min_liquidity=0, price_min=0.0, price_max=1.0,
         min_leader_notional=0.0,
     )
+    strategy.skip_round_tripped_entries = skip_round_tripped
     eng = Engine(
         settings=s, data=FakeData([]), gamma=FakeGamma(markets), price_cache=quote,
         ledger=ledger, executor=PaperExecutor(ledger, price_cache=quote, slippage_bps=0),
         risk=RiskManager(ledger, s), selector=NoopSelector(), strategy=strategy,
     )
+    return eng, ledger
 
+
+def test_same_batch_round_trip_is_never_opened():
+    """The leader is already out, so we never go in.
+
+    Both halves arrive in one poll, so copying the entry would fill at the ask
+    and mirror the exit at the bid in the same instant — the leader's move
+    banked by nobody and the spread paid twice.
+    """
+    eng, ledger = _round_trip_engine(skip_round_tripped=True)
+    fills, n_signals = eng.poll_once()
+
+    assert (n_signals, fills) == (0, 0)
+    assert ledger.get_position("tok") is None       # nothing opened, nothing to manage
+    eng.close()
+
+
+def test_same_batch_round_trip_still_fully_mirrored_when_filter_disabled():
+    """The escape hatch must not resurrect the bag-holding bug.
+
+    With PMBOT_SKIP_ROUND_TRIPPED_ENTRIES=false we copy the entry again — but
+    the exit must still be mirrored in the same batch, leaving the position
+    flat rather than riding to resolution unmanaged.
+    """
+    eng, ledger = _round_trip_engine(skip_round_tripped=False)
     fills, n_signals = eng.poll_once()
 
     assert n_signals == 2
@@ -86,7 +113,7 @@ def test_same_batch_buy_then_sell_is_fully_mirrored():
     assert pos is not None and pos.shares == pytest.approx(0.0, abs=1e-9)
     assert pos.realized_pnl == pytest.approx((0.49 - 0.51) * (5.0 / 0.51))
     # (bought $5 at the 0.51 ask, exited at the 0.49 bid — paid the spread,
-    # but the position is MANAGED instead of riding to resolution)
+    # which is exactly what the filter above now avoids)
     eng.close()
 
 

@@ -160,6 +160,58 @@ def test_extreme_price_sell_still_mirrored():
     led.close()
 
 
+def test_round_tripped_entry_not_copied():
+    # Both halves of a completed round-trip land in one tape. Copying the entry
+    # would open and close at the same current price — pure spread loss.
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=5)
+    buy = _trade("m_ok", "tokRT", Side.BUY, 0.50, 100, "u-buy", ts=t0)
+    sell = _trade("m_ok", "tokRT", Side.SELL, 0.48, 100, "u-sell", ts=t1)
+    led = Ledger(":memory:")
+    # No BUY signal, and no SELL either: we never opened, so there's nothing
+    # of ours to mirror out of.
+    assert list(_strategy([buy, sell], markets, led).generate()) == []
+    led.close()
+
+
+def test_round_trip_filter_ignores_partial_exit():
+    # The leader trimmed but still holds — that's conviction, still copyable.
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=5)
+    buy = _trade("m_ok", "tokPT", Side.BUY, 0.50, 100, "u-buy", ts=t0)
+    sell = _trade("m_ok", "tokPT", Side.SELL, 0.55, 40, "u-sell", ts=t1)
+    led = Ledger(":memory:")
+    sigs = list(_strategy([buy, sell], markets, led).generate())
+    assert len(sigs) == 1
+    assert sigs[0].side is Side.BUY and sigs[0].source_uid == "u-buy"
+    led.close()
+
+
+def test_round_trip_filter_tolerates_dust_crumb():
+    # A "full" exit that undershoots by a rounding crumb is still a full exit.
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=5)
+    buy = _trade("m_ok", "tokRT", Side.BUY, 0.50, 100, "u-buy", ts=t0)
+    sell = _trade("m_ok", "tokRT", Side.SELL, 0.48, 99.99999, "u-sell", ts=t1)
+    led = Ledger(":memory:")
+    assert list(_strategy([buy, sell], markets, led).generate()) == []
+    led.close()
+
+
+def test_round_trip_filter_does_not_retire_unrelated_entry():
+    # A sell whose position predates the window must not retire a LATER buy of
+    # the same token — that buy is a fresh, live signal.
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=5)
+    sell = _trade("m_ok", "tokOK", Side.SELL, 0.55, 500, "u-sell", ts=t0)
+    buy = _trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u-buy", ts=t1)
+    led = Ledger(":memory:")
+    sigs = list(_strategy([sell, buy], markets, led).generate())
+    assert len(sigs) == 1
+    assert sigs[0].side is Side.BUY and sigs[0].source_uid == "u-buy"
+    led.close()
+
+
 def test_sell_skipped_when_we_hold_nothing():
     markets = {"m_ok": _mkt("m_ok")}
     sell = _trade("m_ok", "tokOK", Side.SELL, 0.55, 40, "u-sell")

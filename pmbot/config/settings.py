@@ -106,6 +106,15 @@ class Settings(BaseSettings):
     # Set PMBOT_SWEEP_EXIT_DUST=false to fall back to the old behaviour.
     sweep_exit_dust: bool = True
     exit_dust_usd: float = 0.01
+    # Don't copy a leader BUY when the same `get_trades` window already shows
+    # them fully back out of it. Both halves of a completed round-trip land in
+    # one poll cycle, so we'd open and close at the same current price —
+    # capturing none of the leader's move and paying the spread twice. The age
+    # filter can't catch these: the entry really is minutes old, just already
+    # dead. Only FULL exits retire an entry; a leader who trimmed and still
+    # holds is still expressing conviction. Set PMBOT_SKIP_ROUND_TRIPPED_ENTRIES
+    # =false to fall back to the old behaviour.
+    skip_round_tripped_entries: bool = True
     # After scoring, vet each would-be leader by backtesting an exact copy of
     # their recent tape; drop leaders whose copy P&L comes out below the floor.
     # (Scoring measures THEIR profit; vetting measures OURS, after our sizing,
