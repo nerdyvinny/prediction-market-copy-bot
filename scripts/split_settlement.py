@@ -101,7 +101,11 @@ def windows(rep, days, n_win=6):
     """
     if not rep.results:
         return
-    end = max(r.resolve_ts for r in rep.results)
+    # Window by ENTRY time, not resolve_ts: daily-sports markets stamp
+    # end_date at the start of the day, so resolve_ts is routinely earlier than
+    # the entry and sorting on it scrambles the timeline (it made this table
+    # come back empty). entry_ts is always the real instant we would have filled.
+    end = max(r.entry_ts for r in rep.results)
     start = end - timedelta(days=days)
     width = (end - start) / n_win
     print(f"\n=== per-window ({n_win} x {width.days}d), resolution bucket ===")
@@ -109,8 +113,8 @@ def windows(rep, days, n_win=6):
     neg = 0
     for i in range(n_win):
         a, b = start + i * width, start + (i + 1) * width
-        res = [r for r in rep.results if a <= r.resolve_ts < b and r.closed_by == "resolution"]
-        exi = [r for r in rep.results if a <= r.resolve_ts < b and r.closed_by == "leader-exit"]
+        res = [r for r in rep.results if a <= r.entry_ts < b and r.closed_by == "resolution"]
+        exi = [r for r in rep.results if a <= r.entry_ts < b and r.closed_by == "leader-exit"]
         if not res:
             continue
         net = sum(r.pnl for r in res)
@@ -132,7 +136,7 @@ def drawdown(rep):
     for label, rs in (("whole book", rep.results),
                       ("resolution only",
                        [r for r in rep.results if r.closed_by == "resolution"])):
-        by_t = sorted(rs, key=lambda r: r.resolve_ts)
+        by_t = sorted(rs, key=lambda r: r.entry_ts)   # see windows() on resolve_ts
         cum, run = [], 0.0
         for r in by_t:
             run += r.pnl
