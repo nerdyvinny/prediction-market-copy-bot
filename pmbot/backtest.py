@@ -43,6 +43,9 @@ class CopyResult:
     shares: float
     won: bool
     pnl: float
+    token_id: str = ""
+    # "resolution" | "leader-exit" | "stop-loss" — how the tranche ended.
+    closed_by: str = "resolution"
 
 
 def max_drawdown(cumulative: list[float]) -> float:
@@ -419,6 +422,9 @@ class ExactCopyBacktester:
         slippage_bps: float | None = None,
         leader_weights: dict[str, float] | None = None,
         min_hours_to_resolution: float = 0.0,
+        stop_loss_frac: float | None = None,
+        price_series: dict[str, list[tuple[int, float]]] | None = None,
+        resolve_at: dict[str, datetime] | None = None,
     ) -> BacktestReport:
         """Simulate the tapes over the window [now - lookback_days, now].
 
@@ -430,6 +436,21 @@ class ExactCopyBacktester:
         `vet_weights`); `min_hours_to_resolution` skips entries placed within
         that many hours of the market's close (in-game/near-resolution trades
         are the ones our live lag copies worst).
+
+        `stop_loss_frac` arms a protective exit: if the token's observed price
+        falls to `avg_entry * (1 - frac)` before the leader exits or the market
+        resolves, the whole tranche is sold there. It needs `price_series`
+        ({token_id: [(unix_ts, price), …]}, ascending) — the CLOB price history
+        is hourly by default, so a stop can only fire as fast as that sampling
+        and will MISS intra-hour spikes through the level. Both default to off,
+        leaving live leader-vetting behaviour untouched.
+
+        `resolve_at` ({token_id: datetime}) overrides Gamma's `end_date` as the
+        settlement instant. Daily-sports markets stamp end_date at the START of
+        the day, so an in-game entry "resolves" before it was opened and the
+        tranche settles instantly — fine for P&L (the payout is still right),
+        useless for anything time-dependent. A stop needs a real holding
+        window, so pass a data-derived resolution for those markets.
         """
         s = settings or self.s
         slip = self.slip if slippage_bps is None else slippage_bps / 10_000
@@ -453,13 +474,68 @@ class ExactCopyBacktester:
         settled: set[tuple[str, str]] = set()
         seq = 0
 
+        def _resolves(token: str, market: Market) -> datetime:
+            """When this position actually settles (override beats Gamma)."""
+            if resolve_at and token in resolve_at:
+                return resolve_at[token]
+            return market.end_date
+
+        armed: dict[tuple[str, str], tuple[datetime, float]] = {}  # key -> (trigger_ts, price)
+
+        def arm_stop(key: tuple[str, str], after: datetime) -> None:
+            """(Re)compute when this tranche's stop would trigger, if ever."""
+            if stop_loss_frac is None or not price_series:
+                return
+            armed.pop(key, None)
+            tr = tranches.get(key)
+            if tr is None or tr.shares <= 1e-9 or key in settled:
+                return
+            series = price_series.get(key[1])
+            if not series:
+                return
+            threshold = tr.avg * (1 - stop_loss_frac)
+            after_u, until_u = after.timestamp(), _resolves(key[1], tr.market).timestamp()
+            for t, p in series:                     # ascending
+                if t <= after_u:
+                    continue
+                if t > until_u:
+                    break
+                if p <= threshold:
+                    armed[key] = (datetime.fromtimestamp(t, tz=timezone.utc), p)
+                    return
+
+        def stop_out(key: tuple[str, str], sts: datetime, price: float) -> None:
+            """Sell the whole tranche at the stop price; tranche is then done."""
+            tr = tranches[key]
+            leader, token = key
+            exit_price = min(max(price * (1 - slip), _MIN_PRICE), _MAX_PRICE)
+            tr.realized += (exit_price - tr.avg) * tr.shares
+            ledger.record_fill(Fill(
+                signal=Signal(tr.market.market_id, token, tr.outcome, Side.SELL,
+                              exit_price, exit_price * tr.shares, "backtest-stop",
+                              source_leader=leader),
+                fill_price=exit_price, size_usd=exit_price * tr.shares,
+                shares=tr.shares, timestamp=sts, mode="backtest",
+            ))
+            tr.shares = 0.0
+            settled.add(key)
+            armed.pop(key, None)
+            results.append(CopyResult(
+                leader=leader, market_id=tr.market.market_id, outcome=tr.outcome,
+                entry_ts=tr.entry_ts, resolve_ts=sts, entry_price=tr.avg,
+                size_usd=tr.cost, shares=tr.bought, won=tr.realized > 0,
+                pnl=tr.realized, token_id=token, closed_by="stop-loss",
+            ))
+
         def finish(key: tuple[str, str], rts: datetime, winner: str) -> None:
             if key in settled:
                 return
             settled.add(key)
+            armed.pop(key, None)
             tr = tranches[key]
             leader, token = key
-            if tr.shares > 1e-9:
+            held_to_resolution = tr.shares > 1e-9
+            if held_to_resolution:
                 payout = 1.0 if token == winner else 0.0
                 tr.realized += (payout - tr.avg) * tr.shares
                 ledger.record_fill(Fill(
@@ -474,13 +550,30 @@ class ExactCopyBacktester:
                 leader=leader, market_id=tr.market.market_id, outcome=tr.outcome,
                 entry_ts=tr.entry_ts, resolve_ts=rts, entry_price=tr.avg,
                 size_usd=tr.cost, shares=tr.bought, won=tr.realized > 0,
-                pnl=tr.realized,
+                pnl=tr.realized, token_id=token,
+                closed_by="resolution" if held_to_resolution else "leader-exit",
             ))
 
         def settle_until(ts: datetime) -> None:
-            while pending and pending[0][0] <= ts:
-                rts, _, key, winner = heapq.heappop(pending)
-                finish(key, rts, winner)
+            """Fire stops and resolutions up to `ts`, in true chronological order."""
+            while True:
+                nxt_settle = pending[0][0] if pending else None
+                stop_key, stop_at = None, None
+                for k, (sts, _px) in armed.items():
+                    if stop_at is None or sts < stop_at:
+                        stop_key, stop_at = k, sts
+                events = []
+                if nxt_settle is not None and nxt_settle <= ts:
+                    events.append((nxt_settle, 1))
+                if stop_at is not None and stop_at <= ts:
+                    events.append((stop_at, 0))     # stop wins an exact tie
+                if not events:
+                    return
+                if min(events)[1] == 0:
+                    stop_out(stop_key, stop_at, armed[stop_key][1])
+                else:
+                    rts, _, key, winner = heapq.heappop(pending)
+                    finish(key, rts, winner)
 
         for t in all_trades:
             if not t.token_id or not t.market_id:
@@ -526,11 +619,12 @@ class ExactCopyBacktester:
                     settled.discard(lkey)
                     tr = _Tranche(market=market, outcome=t.outcome, entry_ts=t.timestamp)
                     tranches[lkey] = tr
-                    heapq.heappush(pending, (market.end_date, seq, lkey, winner))
+                    heapq.heappush(pending, (_resolves(t.token_id, market), seq, lkey, winner))
                     seq += 1
                 tr.shares += shares
                 tr.bought += shares
                 tr.cost += sized.size_usd
+                arm_stop(lkey, t.timestamp)        # avg moved: recompute trigger
             else:
                 tr = tranches.get(lkey)
                 if tr is None or lkey in settled or tr.shares <= 1e-9:
@@ -555,7 +649,14 @@ class ExactCopyBacktester:
                     fill_price=exit_price, size_usd=exit_price * sell_shares,
                     shares=sell_shares, timestamp=t.timestamp, mode="backtest",
                 ))
+                arm_stop(lkey, t.timestamp)        # position shrank (maybe to zero)
 
+        # Drain: stops still pending fire at their own time, ahead of resolution.
+        if pending or armed:
+            horizon = max(
+                [p[0] for p in pending] + [sts for sts, _ in armed.values()]
+            )
+            settle_until(horizon)
         while pending:
             rts, _, key, winner = heapq.heappop(pending)
             finish(key, rts, winner)

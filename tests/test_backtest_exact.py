@@ -223,3 +223,86 @@ def test_bankroll_frees_after_resolution():
     assert len(rep.results) == 2
     assert all(r.size_usd == pytest.approx(50.0) for r in rep.results)
     assert all(r.won for r in rep.results)
+
+
+# --- protective stop-loss (opt-in; off by default) -------------------------
+
+def _series(*points):
+    """(hours_before_NOW, price) -> the (unix_ts, price) shape simulate() wants."""
+    return [(int((NOW - timedelta(hours=h)).timestamp()), p) for h, p in points]
+
+
+def test_stop_fires_before_resolution_and_caps_the_loss():
+    """A loser that drifts down must be cut at the stop instead of settling at 0."""
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokLOSE")}   # our token loses
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 2, "u1")]}
+    # entry 48h before NOW at 0.80; price slides to 0.40 (a -50% drawdown) at 24h.
+    prices = {"tokW": _series((47, 0.78), (24, 0.40), (2, 0.05))}
+
+    held = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert held.results[0].closed_by == "resolution"
+
+    stopped = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                                stop_loss_frac=0.30, price_series=prices)
+    r = stopped.results[0]
+    assert r.closed_by == "stop-loss"
+    assert r.pnl > held.results[0].pnl           # cutting beat riding it to zero
+    assert r.resolve_ts == NOW - timedelta(hours=24)   # fired at the first breach
+
+
+def test_stop_does_not_fire_when_price_holds_above_trigger():
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokW")}      # our token wins
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 2, "u1")]}
+    prices = {"tokW": _series((47, 0.75), (24, 0.70), (2, 0.95))}   # dips to -12% only
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                            stop_loss_frac=0.30, price_series=prices)
+    assert rep.results[0].closed_by == "resolution"
+
+
+def test_stop_is_off_by_default_and_needs_a_price_series():
+    """Live leader-vetting calls simulate() with neither arg — behaviour must
+    be untouched, and a stop without prices must not silently half-apply."""
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokLOSE")}
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 2, "u1")]}
+    prices = {"tokW": _series((24, 0.10))}
+
+    plain = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    no_prices = _bt(res).simulate(tapes, lookback_days=30, now=NOW, stop_loss_frac=0.30)
+    assert [r.pnl for r in plain.results] == [r.pnl for r in no_prices.results]
+    armed = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                              stop_loss_frac=0.30, price_series=prices)
+    assert armed.results[0].pnl != plain.results[0].pnl   # prices supplied: it bites
+
+
+def test_leader_exit_before_the_stop_wins():
+    """If the leader bails first, that's the exit we copy — no later stop fires."""
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokLOSE")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokW", Side.BUY, 0.80, 1000, 3, "u1"),
+        _trade("m1", "tokW", Side.SELL, 0.70, 1000, 2, "u2"),   # full exit at 48h
+    ]}
+    prices = {"tokW": _series((24, 0.10))}                       # breach comes later
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                            stop_loss_frac=0.30, price_series=prices)
+    assert len(rep.results) == 1
+    assert rep.results[0].closed_by == "leader-exit"
+
+
+def test_resolve_at_override_gives_in_game_trades_a_real_holding_window():
+    """Sports end_date precedes an in-game entry, so the tranche settles at once
+    and no stop can ever bite. An override restores a real window."""
+    res = {"m1": (_mkt("m1", end_days_ago=2.0), "tokLOSE")}   # end_date BEFORE entry
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 1, "u1")]}
+    prices = {"tokW": _series((12, 0.30))}                    # -62% twelve hours out
+
+    # Without the override the position is already "resolved" at entry.
+    blind = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                              stop_loss_frac=0.30, price_series=prices)
+    assert blind.results[0].closed_by == "resolution"
+
+    fixed = _bt(res).simulate(
+        tapes, lookback_days=30, now=NOW, stop_loss_frac=0.30, price_series=prices,
+        resolve_at={"tokW": NOW - timedelta(hours=6)},
+    )
+    assert fixed.results[0].closed_by == "stop-loss"
+    assert fixed.results[0].pnl > blind.results[0].pnl
