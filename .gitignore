@@ -42,3 +42,6 @@ Thumbs.db
 
 # Deep-sweep report artifacts (regenerate with scripts/deep_sweep.py)
 deep_sweep_results.json
+
+# Cached leader tapes from research scripts (multi-MB, refetchable).
+.tapes_*.pkl
