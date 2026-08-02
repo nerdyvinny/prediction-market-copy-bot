@@ -189,12 +189,34 @@ def test_round_trip_filter_ignores_partial_exit():
 
 def test_round_trip_filter_tolerates_dust_crumb():
     # A "full" exit that undershoots by a rounding crumb is still a full exit.
+    # The crumb is 2-decimal truncation, NOT float noise: these are the exact
+    # share counts from the 2026-08-02 15:35 round-trip that leaked through a
+    # 1e-6-relative threshold and cost us the spread twice.
     markets = {"m_ok": _mkt("m_ok")}
     t0, t1 = NOW - timedelta(minutes=20), NOW - timedelta(minutes=5)
-    buy = _trade("m_ok", "tokRT", Side.BUY, 0.50, 100, "u-buy", ts=t0)
-    sell = _trade("m_ok", "tokRT", Side.SELL, 0.48, 99.99999, "u-sell", ts=t1)
+    buy = _trade("m_ok", "tokRT", Side.BUY, 0.42, 183.314053, "u-buy", ts=t0)
+    sell = _trade("m_ok", "tokRT", Side.SELL, 0.46, 183.31, "u-sell", ts=t1)
     led = Ledger(":memory:")
     assert list(_strategy([buy, sell], markets, led).generate()) == []
+    led.close()
+
+
+def test_round_trip_filter_survives_accumulated_crumbs():
+    # Each truncated exit strands up to 0.01 shares. Carried forward, three
+    # trips sum past any fixed tolerance and every later exit reads as partial
+    # — so the filter must snap the position flat, not just tolerate one crumb.
+    # Trips 2 and 3 balance exactly; only inherited residue can break them.
+    markets = {"m_ok": _mkt("m_ok")}
+    trades, t = [], NOW - timedelta(minutes=50)
+    for i, (bought, sold) in enumerate(
+        [(183.314053, 183.31), (9.004312, 9.0), (366.006001, 366.0)]
+    ):
+        trades.append(_trade("m_ok", "tokRT", Side.BUY, 0.42, bought, f"u-buy{i}", ts=t))
+        t += timedelta(minutes=2)
+        trades.append(_trade("m_ok", "tokRT", Side.SELL, 0.46, sold, f"u-sell{i}", ts=t))
+        t += timedelta(minutes=2)
+    led = Ledger(":memory:")
+    assert list(_strategy(trades, markets, led).generate()) == []
     led.close()
 
 

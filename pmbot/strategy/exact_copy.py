@@ -55,6 +55,11 @@ from pmbot.strategy.base import Strategy
 
 log = logging.getLogger(__name__)
 
+# Polymarket reports share counts truncated to 2 decimals, so a leader's "full"
+# exit routinely sells fractionally fewer shares than the entry bought and
+# leaves a sub-0.01 crumb behind. Treat a position this small as flat.
+EXIT_CRUMB_SHARES = 0.01
+
 
 class ExactCopyStrategy(Strategy):
     name = "exact_copy"
@@ -243,12 +248,21 @@ class ExactCopyStrategy(Strategy):
             # A sell whose position predates the window drives this negative;
             # clamp so it can't retire a later, unrelated entry.
             remaining = max(0.0, prior - t.shares)
-            held[t.token_id] = remaining
-            # A "full" exit routinely undershoots by a rounding crumb, so test
-            # against the size of the position rather than an absolute epsilon.
-            if remaining <= max(1e-9, 1e-6 * bought.get(t.token_id, 0.0)):
+            # A "full" exit undershoots by a truncation crumb (see
+            # EXIT_CRUMB_SHARES), so an exact-zero test never fires. The old
+            # 1e-6-relative epsilon was ~20x too tight to see one: a 183.314053
+            # -share entry exits as 183.31, leaving 0.004053 against a 0.000183
+            # threshold. Scale the tolerance for big positions, but never below
+            # one crumb.
+            if remaining <= max(EXIT_CRUMB_SHARES, 1e-4 * bought.get(t.token_id, 0.0)):
+                # Snap to flat rather than carrying the crumb forward. Crumbs
+                # accumulate — three round-trips on one token sum past any fixed
+                # tolerance, and every later exit on that token then reads as
+                # partial no matter how tidy it is.
+                remaining = 0.0
                 closed.update(open_uids.pop(t.token_id, []))
                 bought.pop(t.token_id, None)
+            held[t.token_id] = remaining
         return closed
 
     def generate(self) -> Iterable[Signal]:
