@@ -52,9 +52,12 @@ class PaperExecutor(TradeExecutor):
             return None
         self.ledger.record_fill(fill)
         log.info(
+            # fill.size_usd, not signal.size_usd: a SELL's requested size is
+            # valued at our avg cost, so logging it printed the cost basis
+            # instead of the proceeds and made every exit look flat.
             "paper %s %s %.2f sh @ %.4f ($%.2f) %s",
             signal.side.value, signal.outcome, fill.shares, fill.fill_price,
-            signal.size_usd, signal.reason,
+            fill.size_usd, signal.reason,
         )
         return fill
 

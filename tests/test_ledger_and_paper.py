@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from pmbot.execution.paper_executor import PaperExecutor
@@ -167,6 +169,24 @@ def test_paper_executor_sell_fills_at_bid_minus_slippage():
     _fill(led, _sig(side=Side.BUY, size_usd=50.0, uid="entry"), price=0.50)  # 100 sh
     fill = ex.execute(_sig(side=Side.SELL, size_usd=48.0))
     assert fill.fill_price == pytest.approx(0.48 * 0.99)
+    led.close()
+
+
+def test_paper_executor_logs_sell_proceeds_not_cost_basis(caplog):
+    # Mirrored exits carry size_shares, so the signal's size_usd stays valued at
+    # our avg cost while the fill realises something else entirely. The log line
+    # must report the proceeds, or a winner reads as flat.
+    from dataclasses import replace as dc_replace
+    led = Ledger(":memory:")
+    cache = FakeCache(Quote(token_id="tokA", bid=0.90, ask=0.92))
+    ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
+    _fill(led, _sig(side=Side.BUY, size_usd=50.0, uid="entry"), price=0.50)  # 100 sh
+    sig = dc_replace(_sig(side=Side.SELL, size_usd=50.0, uid="exit"), size_shares=100.0)
+    with caplog.at_level(logging.INFO, logger="pmbot.execution.paper_executor"):
+        fill = ex.execute(sig)
+    assert fill.size_usd == pytest.approx(100 * 0.90)   # 100 sh out at the bid
+    assert "($90.00)" in caplog.text                     # proceeds, not the $50 basis
+    assert "($50.00)" not in caplog.text
     led.close()
 
 
