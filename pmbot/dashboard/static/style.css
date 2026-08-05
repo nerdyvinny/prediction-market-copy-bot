@@ -345,6 +345,25 @@ td.market {
 }
 .leader-link:hover { text-decoration: underline; }
 
+/* Market name → the market's page on polymarket.com. Flex so a long question
+   ellipsises on its own and the ↗ stays visible instead of being the first
+   thing the truncation eats. */
+a.mkt-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  max-width: 100%;
+  color: var(--accent);
+  text-decoration: none;
+}
+a.mkt-link .mkt-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+a.mkt-link:hover .mkt-name { text-decoration: underline; }
+.mkt-arrow { flex: none; font-size: 11px; opacity: 0.7; }
+
 .chip {
   display: inline-block;
   font-size: 12px;

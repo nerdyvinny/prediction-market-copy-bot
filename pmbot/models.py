@@ -60,6 +60,11 @@ class Market:
     # token_id -> price at fetch time (final 1.0/0.0 once resolved). Powers
     # feed-level win-quality estimates without extra per-token quote calls.
     outcome_prices: dict[str, float] = field(default_factory=dict)
+    # URL slugs, appended so the existing positional order is untouched.
+    # polymarket.com addresses a market as /event/<event_slug>/<slug>; the
+    # condition id alone can't be turned into a link.
+    slug: str | None = None
+    event_slug: str | None = None
 
 
 @dataclass(frozen=True)

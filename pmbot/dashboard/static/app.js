@@ -53,6 +53,16 @@ const fmtStamp = (iso) => {
 const pnlClass = (v) =>
   v === null || v === undefined ? "" : v > 0.005 ? "pos" : v < -0.005 ? "neg" : "";
 
+/* Market name as a click-through to that market on polymarket.com. `url` is
+   null whenever the server has no slug for the row — a market Gamma has never
+   heard of, or a lookup that was still failing on this poll — so the name
+   falls back to plain text rather than a link that goes nowhere. */
+const marketLink = (name, url) =>
+  url
+    ? `<a class="mkt-link" href="${url}" target="_blank" rel="noopener noreferrer"
+        ><span class="mkt-name">${name}</span><span class="mkt-arrow">↗</span></a>`
+    : name;
+
 /* ---- hero ----------------------------------------------------------- */
 
 function renderHero(m) {
@@ -217,8 +227,9 @@ function leaderBookHtml(wallet) {
     const sub = `${fmtShares(p.shares)} @ ${fmtPrice(p.avg_price)} → ${fmtPrice(p.cur_price)}` +
       (p.end_date ? ` · ends ${p.end_date}` : "") +
       (p.our_invested_usd ? ` · we put in ${fmtUsd(p.our_invested_usd)}` : "");
+    const name = p.title || `<span class="mono-id">${p.market_id.slice(0, 18)}…</span>`;
     return `<tr class="${p.copied ? "lp-copied" : ""}">
-      <td class="left market" title="${p.title}">${p.title || `<span class="mono-id">${p.market_id.slice(0, 18)}…</span>`}
+      <td class="left market" title="${p.title}">${marketLink(name, p.url)}
         <span class="rowsub">${sub}</span></td>
       <td class="left">${p.outcome}</td>
       <td>${fmtUsd(p.value_usd)}</td>
@@ -302,7 +313,7 @@ function renderPositions(positions) {
     const sub = `${fmtShares(p.shares)} shares @ ${fmtPrice(p.avg_price)}` +
       (p.mid !== null ? ` · now ${fmtPrice(p.mid)}` : " · no quote");
     return `<tr>
-      <td class="left market" title="${p.question || p.market_id}">${name}${flag}
+      <td class="left market" title="${p.question || p.market_id}">${marketLink(name, p.url)}${flag}
         <span class="rowsub">${sub}</span></td>
       <td class="left">${p.outcome}</td>
       <td>${fmtUsd(p.cost_usd)}</td>
@@ -349,7 +360,7 @@ function renderTrades(trades) {
       : "";
     const sub = [t.outcome, from, fmtTime(t.first_ts)].filter(Boolean).join(" · ");
     return `<tr>
-      <td class="left market" title="${t.question || t.market_id}">${name}
+      <td class="left market" title="${t.question || t.market_id}">${marketLink(name, t.url)}
         <span class="rowsub">${sub}</span></td>
       <td>${fmtUsd(t.invested_usd)}</td>
       <td class="left">${standsText(t)}</td>
@@ -379,7 +390,7 @@ function renderFills(fills) {
       : (f.reason === "settlement" ? "Settlement" : "—");
     return `<tr>
       <td class="left">${fmtTime(f.ts)}</td>
-      <td class="left market" title="${f.question || f.market_id}">${name}</td>
+      <td class="left market" title="${f.question || f.market_id}">${marketLink(name, f.url)}</td>
       <td class="left">${act}</td>
       <td>${fmtPrice(f.fill_price)}</td>
       <td>${fmtUsd(f.size_usd)}</td>

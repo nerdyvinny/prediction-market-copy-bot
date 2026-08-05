@@ -94,6 +94,79 @@ def test_partial_exit_realizes_only_the_shares_sold(ledger):
     assert fills[1]["realized_usd"] == pytest.approx(8.0)  # 40 * 0.20
 
 
+# --- polymarket deep links -------------------------------------------------
+
+def test_market_url_prefers_the_two_segment_event_form():
+    """An event groups siblings, so the event slug alone is the wrong market."""
+    assert dash._market_url("lol-navi-shft-2026-08-03-game2", "lol-navi-shft-2026-08-03") == (
+        "https://polymarket.com/event/lol-navi-shft-2026-08-03/lol-navi-shft-2026-08-03-game2"
+    )
+
+
+def test_market_url_falls_back_when_a_slug_is_missing():
+    assert dash._market_url(None, "mo-01-democratic-primary-winner") == (
+        "https://polymarket.com/event/mo-01-democratic-primary-winner"
+    )
+    assert dash._market_url("some-market", None) == "https://polymarket.com/market/some-market"
+    # No slug at all → no link, rather than one that 404s.
+    assert dash._market_url(None, None) is None
+    assert dash._market_url("", "") is None
+
+
+def test_market_url_encodes_slugs_it_did_not_write():
+    """Slugs are third-party strings landing in an href — they can't break out."""
+    url = dash._market_url('x" onmouseover="alert(1)', "evt")
+    assert '"' not in url
+    assert url.startswith("https://polymarket.com/event/evt/")
+    # A slug can't smuggle in extra path segments either.
+    assert dash._market_url("a/b", "evt") == "https://polymarket.com/event/evt/a%2Fb"
+
+
+def test_state_rows_carry_a_link(tmp_path, monkeypatch):
+    """Every market-bearing table gets its URL from one cached Gamma lookup."""
+    from fastapi.testclient import TestClient
+
+    from pmbot.models import Market
+
+    db = str(tmp_path / "t.db")
+    led = Ledger(db)
+    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    _fill(led, token="held", side=Side.BUY, price=0.40, shares=100, uid="1", ts=t0)
+    led.close()
+    monkeypatch.setattr(dash.get_settings(), "db_path", db)
+
+    calls = {"n": 0}
+
+    class FakeGamma:
+        def get_market(self, condition_id):
+            calls["n"] += 1
+            return Market(market_id=condition_id, question="Will it?",
+                          slug="will-it", event_slug="the-event")
+
+    monkeypatch.setattr(dash, "_get_gamma", lambda: FakeGamma())
+    monkeypatch.setattr(dash, "_mid_for", lambda token_id, venue: 0.5)
+    dash._market_cache.clear()
+
+    body = TestClient(dash.app).get("/api/state").json()
+    expected = "https://polymarket.com/event/the-event/will-it"
+    assert body["trades"][0]["url"] == expected
+    assert body["positions"][0]["url"] == expected
+    assert body["fills"][0]["url"] == expected
+    assert calls["n"] == 1  # three tables, one lookup
+
+
+def test_market_lookup_failure_is_not_cached(monkeypatch):
+    """A blank row must retry next poll instead of staying unlabelled forever."""
+    class DeadGamma:
+        def get_market(self, condition_id):
+            raise RuntimeError("gamma down")
+
+    monkeypatch.setattr(dash, "_get_gamma", lambda: DeadGamma())
+    dash._market_cache.clear()
+    assert dash._market_meta("0xdead") == ("", None)
+    assert "0xdead" not in dash._market_cache
+
+
 # --- leader drill-down -----------------------------------------------------
 
 def test_our_book_tags_the_leader_we_copied_from(ledger):
@@ -140,6 +213,7 @@ def test_leader_positions_marks_copies_and_rejects_strangers(tmp_path, monkeypat
         def get_positions(self, wallet, limit=500):
             return [
                 {"asset": "held", "conditionId": MKT, "title": "Held one",
+                 "slug": "held-one", "eventSlug": "held-event",
                  "outcome": "Yes", "size": 100, "avgPrice": 0.4, "curPrice": 0.55,
                  "currentValue": 55.0, "cashPnl": 15.0, "percentPnl": 37.5},
                 {"asset": "exited", "conditionId": MKT, "title": "Exited one",
@@ -163,6 +237,9 @@ def test_leader_positions_marks_copies_and_rejects_strangers(tmp_path, monkeypat
     assert by_token["exited"]["our_status"] == "closed"    # sold out, still theirs
     assert by_token["skipped"]["copied"] is False
     assert by_token["skipped"]["our_status"] is None
+    # Slugs ride along in the Data API payload — no second lookup to link out.
+    assert by_token["held"]["url"] == "https://polymarket.com/event/held-event/held-one"
+    assert by_token["skipped"]["url"] is None   # this fake row carries no slug
     assert body["total_value_usd"] == pytest.approx(92.0)
     # Biggest position first, so the panel leads with what matters.
     assert [p["token_id"] for p in body["positions"]] == ["held", "exited", "skipped"]

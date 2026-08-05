@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import psutil
 from fastapi import FastAPI, HTTPException
@@ -45,7 +46,8 @@ _STATIC = Path(__file__).parent / "static"
 _gamma: GammaClient | None = None
 _prices: PriceCache | None = None
 _data: PolymarketDataClient | None = None
-_question_cache: dict[str, str] = {}
+# condition id -> (question, polymarket URL). Both come from one Gamma lookup.
+_market_cache: dict[str, tuple[str, str | None]] = {}
 _engine_check: tuple[float, bool] = (0.0, False)
 # wallet -> (fetched_at, raw positions). Leader books move on trades, not ticks,
 # so a short TTL keeps a click-happy user off the public API's rate limit.
@@ -74,18 +76,45 @@ def _get_prices() -> PriceCache:
     return _prices
 
 
-def _question_for(market_id: str) -> str:
-    if market_id not in _question_cache:
+POLYMARKET_BASE = "https://polymarket.com"
+
+
+def _market_url(slug: object, event_slug: object) -> str | None:
+    """Public polymarket.com address for a market, or None if unlinkable.
+
+    An event groups sibling markets ("Game 2 winner", "1st half O/U 1.5"), so
+    the event page alone lands on whichever one Polymarket picks — the
+    two-segment form is what actually opens the market we copied. `/market/`
+    is the fallback for the rare row Gamma returns without an event.
+
+    Slugs are third-party strings that end up in an `href`, so they are
+    percent-encoded: ordinary slugs pass through untouched and anything that
+    could break out of the attribute does not.
+    """
+    s = quote(str(slug), safe="") if slug else ""
+    e = quote(str(event_slug), safe="") if event_slug else ""
+    if e and s:
+        return f"{POLYMARKET_BASE}/event/{e}/{s}"
+    if e:
+        return f"{POLYMARKET_BASE}/event/{e}"
+    if s:
+        return f"{POLYMARKET_BASE}/market/{s}"
+    return None
+
+
+def _market_meta(market_id: str) -> tuple[str, str | None]:
+    """(question, polymarket URL) for a condition id, cached for the process."""
+    if market_id not in _market_cache:
         try:
             m = _get_gamma().get_market(market_id)
         except Exception:
-            return ""  # transient API failure: retry next poll, don't cache
+            return ("", None)  # transient API failure: retry next poll, don't cache
         if m is None:
             # Not found *right now* is not an answer either — caching the blank
             # would leave the row unlabelled for the life of the process.
-            return ""
-        _question_cache[market_id] = m.question
-    return _question_cache[market_id]
+            return ("", None)
+        _market_cache[market_id] = (m.question, _market_url(m.slug, m.event_slug))
+    return _market_cache[market_id]
 
 
 def _engine_running() -> bool:
@@ -165,9 +194,11 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
                    ) if open_value is not None else None
         else:
             net = t["returned_usd"] - t["invested_usd"] - t["fees_usd"]
+        question, url = _market_meta(t["market_id"])
         out.append({
             **t,
-            "question": _question_for(t["market_id"]),
+            "question": question,
+            "url": url,
             "status": "open" if is_open else "closed",
             "open_value_usd": round(open_value, 2) if open_value is not None else None,
             "net_usd": round(net, 2) if net is not None else None,
@@ -275,9 +306,11 @@ def state() -> dict:
         mid = mids.get(p.token_id)
         cost = p.shares * p.avg_price
         value = p.shares * mid if mid is not None else None
+        question, url = _market_meta(p.market_id)
         pos_out.append({
             "market_id": p.market_id,
-            "question": _question_for(p.market_id),
+            "question": question,
+            "url": url,
             "outcome": p.outcome,
             "venue": p.venue,
             "shares": p.shares,
@@ -290,9 +323,10 @@ def state() -> dict:
         })
     pos_out.sort(key=lambda p: abs(p["cost_usd"]), reverse=True)
 
-    fills_out = [
-        {**f, "question": _question_for(f["market_id"])} for f in reversed(all_fills)
-    ]
+    fills_out = []
+    for f in reversed(all_fills):
+        question, url = _market_meta(f["market_id"])
+        fills_out.append({**f, "question": question, "url": url})
 
     unrealized = sum(
         p["unrealized_usd"] for p in pos_out if p["unrealized_usd"] is not None
@@ -387,6 +421,8 @@ def leader_positions(wallet: str) -> dict:
             "token_id": token,
             "market_id": str(p.get("conditionId", "")),
             "title": p.get("title") or "",
+            # The Data API ships slugs inline, so their book links out for free.
+            "url": _market_url(p.get("slug"), p.get("eventSlug")),
             "outcome": p.get("outcome") or "",
             "shares": _f(p.get("size")),
             "avg_price": _f(p.get("avgPrice")),

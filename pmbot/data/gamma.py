@@ -164,6 +164,8 @@ class GammaClient:
             closed=bool(m.get("closed", False)),
             tokens=tokens,
             outcome_prices=outcome_prices,
+            slug=_to_str_or_none(m.get("slug")),
+            event_slug=cls._extract_event_slug(m),
         )
 
     @staticmethod
@@ -177,6 +179,18 @@ class GammaClient:
                 if isinstance(first, dict):
                     return first.get("label") or first.get("slug")
                 return str(first)
+        return None
+
+    @staticmethod
+    def _extract_event_slug(m: dict) -> str | None:
+        """Slug of the event this market belongs to.
+
+        Events group sibling markets ("Game 2 winner", "1st half O/U 1.5"), and
+        the event slug is the first segment of the market's public URL.
+        """
+        events = m.get("events")
+        if isinstance(events, list) and events and isinstance(events[0], dict):
+            return _to_str_or_none(events[0].get("slug"))
         return None
 
 
@@ -210,3 +224,8 @@ def _to_float_or_none(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _to_str_or_none(v: Any) -> str | None:
+    """Empty and missing both mean 'no value' — never an empty-string slug."""
+    return str(v) if v else None

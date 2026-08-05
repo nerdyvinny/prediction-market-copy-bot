@@ -27,13 +27,14 @@ TRADE = {
 MARKET = {
     "conditionId": "0xbaf7780f9059e34b84301fd411f8dc573b4d56adfe6e0cda33daf304b1438da4",
     "question": "Will Ecuador win the 2026 FIFA World Cup?",
+    "slug": "will-ecuador-win-the-2026-fifa-world-cup",
     "endDate": "2026-07-20T00:00:00Z",
     "endDateIso": "2026-07-20T00:00:00Z",
     "liquidityNum": 4278326.19904,
     "closed": False,
     "outcomes": '["Yes", "No"]',
     "clobTokenIds": '["39971087496427056640429359043364261029374524049464674733142166279730655826181", "76638532101043658630369484092110685720624002077285242368448475410253808399541"]',
-    "events": [{"tags": [{"label": "Sports", "slug": "sports"}]}],
+    "events": [{"slug": "world-cup-winner", "tags": [{"label": "Sports", "slug": "sports"}]}],
 }
 
 
@@ -69,6 +70,22 @@ def test_parse_market_decodes_json_strings_and_tokens():
     assert m.end_date is not None and m.end_date.year == 2026
     assert m.category == "Sports"
     assert m.closed is False
+
+
+def test_parse_market_keeps_the_slugs_a_public_url_needs():
+    """The condition id can't be turned into a link; the slug pair can."""
+    m = GammaClient._parse_market(MARKET)
+    assert m.slug == "will-ecuador-win-the-2026-fifa-world-cup"
+    assert m.event_slug == "world-cup-winner"   # events[0].slug, not the tag slug
+
+
+def test_parse_market_slugs_are_none_when_gamma_omits_them():
+    bare = {"conditionId": "0xabc", "question": "q"}
+    m = GammaClient._parse_market(bare)
+    assert m.slug is None and m.event_slug is None
+    # An empty string is 'missing', not a slug that would build a broken URL.
+    assert GammaClient._parse_market({**bare, "slug": "", "events": [{"slug": ""}]}).slug is None
+    assert GammaClient._parse_market({**bare, "events": [{"tags": []}]}).event_slug is None
 
 
 def test_load_json_list_variants():
