@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 from pmbot.backtest import ExactCopyBacktester, vet_weights
 from pmbot.config import Settings, get_settings
@@ -186,45 +187,102 @@ class Engine:
         return True
 
     def _vet_leaders(self, ranked: list[LeaderScore]) -> list[LeaderScore]:
-        """Keep only leaders whose recent tape backtests profitably as a copy.
+        """Keep only leaders PROVEN copyable — recently, and before that too.
 
-        Scoring measures the LEADER's profit; this measures OURS — after our
-        sizing, caps and slippage. Leaders with no copyable resolved trades in
-        the window pass through (no evidence either way), as do vetting errors
-        (fail open: vetting is a refinement, not a gate that can brick the bot).
+        Scoring measures the LEADER's profit; this measures OURS, after our
+        sizing, caps and slippage. Three things now have to hold, and a wallet
+        that cannot demonstrate all three is dropped rather than kept:
+
+        1. Enough copyable resolved trades to judge at all (`min_trades`).
+           This used to fail OPEN — "no evidence either way, keep" — which let
+           a wallet that makes zero trades we would mirror sit in the lineup
+           indefinitely, and let brand-new wallets in with no record at all.
+        2. Recent copy P&L at or above the floor.
+        3. An OLDER, non-overlapping window that is also profitable. One
+           window cannot separate skill from a hot streak: the same 30-45 days
+           that surface a wallet are then used to score it, so the test is
+           in-sample by construction and a lucky month passes it. Requiring the
+           preceding window to hold up is the cheapest available out-of-sample
+           check.
+
+        The lineup is whatever survives — `selection.top_n` is a ceiling, not a
+        quota, so a day with three proven wallets follows three.
         """
         # Same tape depth as selection (trades_cap 1500): at 500 a heavy
         # trader's vet window spanned only days, came back "no copyable
         # resolved trades", and fail-open kept them — the most active leaders
-        # were effectively unvetted.
-        vetter = ExactCopyBacktester(self.data, self.gamma, self.settings, trades_limit=1500)
+        # were effectively unvetted. The consistency window needs more history
+        # still, so the tape has to cover oos_lookback_days, not just lookback.
+        s = self.settings
+        vetter = ExactCopyBacktester(self.data, self.gamma, s, trades_limit=4000)
         kept: list[LeaderScore] = []
         rois: dict[str, float] = {}
+        now = datetime.now(timezone.utc)
+        recent_days = s.copy_vet_lookback_days
         for r in ranked:
             try:
-                rep = vetter.run(
-                    [r.wallet],
-                    lookback_days=self.settings.copy_vet_lookback_days,
-                    min_leader_notional=self.settings.copy_min_leader_notional_usd,
-                )
-                m = rep.metrics()
+                tapes = vetter.fetch_tapes([r.wallet])
+
+                def _sim(days: int, end: datetime) -> dict:
+                    return vetter.simulate(
+                        tapes, lookback_days=days, now=end,
+                        min_leader_notional=s.copy_min_leader_notional_usd,
+                        skip_round_tripped_entries=s.skip_round_tripped_entries,
+                    ).metrics()
+
+                m = _sim(recent_days, now)
             except Exception as e:
-                log.warning("vet: backtest failed for %s (%s); keeping", r.wallet[:10], e)
-                kept.append(r)
+                if s.copy_vet_fail_open:
+                    log.warning("vet: backtest failed for %s (%s); keeping", r.wallet[:10], e)
+                    kept.append(r)
+                else:
+                    log.warning("vet: backtest failed for %s (%s); SKIPPING this "
+                                "rescore (unproven)", r.wallet[:10], e)
                 continue
-            if m["n_trades"] == 0:
-                log.info("vet: %s no copyable resolved trades; keeping", r.wallet[:10])
-                kept.append(r)
-            elif m["net_pnl"] >= self.settings.copy_vet_min_pnl_usd:
-                log.info("vet: %s copy-pnl $%.2f over %d trades; keeping",
-                         r.wallet[:10], m["net_pnl"], m["n_trades"])
-                kept.append(r)
-                invested = m.get("invested", 0.0)
-                if invested > 0:
-                    rois[r.wallet] = m["net_pnl"] / invested
-            else:
+
+            if m["n_trades"] < s.copy_vet_min_trades:
+                log.info("vet: %s DROPPED (only %d copyable resolved trades, need %d)",
+                         r.wallet[:10], m["n_trades"], s.copy_vet_min_trades)
+                continue
+            if m["net_pnl"] < s.copy_vet_min_pnl_usd:
                 log.info("vet: %s DROPPED (copy-pnl $%.2f over %d trades)",
                          r.wallet[:10], m["net_pnl"], m["n_trades"])
+                continue
+
+            if s.copy_vet_require_consistency:
+                # Older window: [now - oos_lookback, now - lookback]. Ending it
+                # at the start of the recent window keeps the two disjoint, so
+                # a single streak cannot satisfy both.
+                span = max(1, s.copy_vet_oos_lookback_days - recent_days)
+                try:
+                    prior = _sim(span, now - timedelta(days=recent_days))
+                except Exception as e:
+                    log.warning("vet: %s prior-window backtest failed (%s); "
+                                "SKIPPING this rescore", r.wallet[:10], e)
+                    continue
+                if prior["n_trades"] < s.copy_vet_oos_min_trades:
+                    log.info("vet: %s DROPPED (no track record before the scoring "
+                             "window — %d trades in the prior %dd)",
+                             r.wallet[:10], prior["n_trades"], span)
+                    continue
+                if prior["net_pnl"] < s.copy_vet_min_pnl_usd:
+                    log.info("vet: %s DROPPED (profitable recently, $%.2f, but lost "
+                             "$%.2f over the prior %dd — not out-of-sample proven)",
+                             r.wallet[:10], m["net_pnl"], prior["net_pnl"], span)
+                    continue
+                log.info("vet: %s KEPT (recent $%.2f/%dt, prior $%.2f/%dt)",
+                         r.wallet[:10], m["net_pnl"], m["n_trades"],
+                         prior["net_pnl"], prior["n_trades"])
+            else:
+                log.info("vet: %s KEPT (copy-pnl $%.2f over %d trades)",
+                         r.wallet[:10], m["net_pnl"], m["n_trades"])
+
+            kept.append(r)
+            invested = m.get("invested", 0.0)
+            if invested > 0:
+                rois[r.wallet] = m["net_pnl"] / invested
+
+        log.info("vet: %d of %d candidates proven copyable", len(kept), len(ranked))
 
         if self.settings.copy_weight_by_vet:
             weights = vet_weights(rois)

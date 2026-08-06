@@ -122,6 +122,23 @@ class Settings(BaseSettings):
     copy_vet_leaders: bool = True
     copy_vet_lookback_days: int = 30   # matches the 30d selection window
     copy_vet_min_pnl_usd: float = 0.0
+    # --- proof requirements (2026-08-06) --------------------------------
+    # Vetting used to fail OPEN: a wallet with no copyable resolved trades was
+    # kept "no evidence either way". That is how an unfollowable wallet held a
+    # slot for weeks making zero trades, and how wallets with no history at all
+    # got followed. Absence of evidence is now a rejection, not a pass.
+    copy_vet_min_trades: int = 10      # copyable resolved trades needed to judge
+    # A single recent window is in-sample by construction: the same window that
+    # picks a wallet also scores it, so one hot month reads as skill. Require a
+    # SECOND, older, non-overlapping window to be profitable too. The older
+    # window is [now - oos_lookback_days, now - lookback_days].
+    copy_vet_require_consistency: bool = True
+    copy_vet_oos_lookback_days: int = 90
+    copy_vet_oos_min_trades: int = 5   # lower bar: older tape is thinner
+    # Vetting can no longer be bricked open, but a transient backtest error is
+    # not proof of anything either — such a wallet is skipped for this rescore.
+    # `_apply_rescore` already keeps the last good set if everything drops out.
+    copy_vet_fail_open: bool = False
     # EXPERIMENTAL: scale each leader's copy_fraction by their vet-backtest
     # ROI relative to the pack (clamped 0.5x-2x). Off by default: Data-API
     # tape depth couldn't reach the tune window for heavy traders, so this

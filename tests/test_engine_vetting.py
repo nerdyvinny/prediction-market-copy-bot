@@ -48,31 +48,109 @@ class FakeReport:
 
 
 class FakeVetter:
-    """Stub for ExactCopyBacktester: per-wallet canned results."""
+    """Stub for ExactCopyBacktester: canned results per wallet per window.
 
-    outcomes = {}
+    The engine calls simulate() twice per wallet — recent window first, then
+    the older consistency window — so a call counter picks the answer. Wallets
+    absent from `prior` get a clean older record, keeping tests that only care
+    about recent behaviour short.
+    """
+
+    outcomes = {}                  # wallet -> (n_trades, net_pnl), recent window
+    prior = {}                     # wallet -> (n_trades, net_pnl), older window
+    DEFAULT_PRIOR = (25, 40.0)
 
     def __init__(self, *a, **kw):
-        pass
+        self._calls = {}
 
-    def run(self, leaders, **kw):
-        return FakeReport(*self.outcomes[leaders[0]])
+    def fetch_tapes(self, leaders, **kw):
+        return {leaders[0]: []}    # content unused; simulate() is canned
+
+    def simulate(self, tapes, **kw):
+        wallet = next(iter(tapes))
+        n = self._calls.get(wallet, 0)
+        self._calls[wallet] = n + 1
+        if n == 0:
+            return FakeReport(*self.outcomes[wallet])
+        return FakeReport(*self.prior.get(wallet, self.DEFAULT_PRIOR))
 
 
-def test_vetting_drops_unprofitable_keeps_profitable_and_unknown(monkeypatch):
+def test_vetting_drops_unprofitable_and_unproven(monkeypatch):
+    """Absence of evidence is a rejection now, not a free pass."""
     monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
     FakeVetter.outcomes = {
         "0xgood": (25, 40.0),     # profitable copy -> keep
         "0xbad": (25, -30.0),     # loses money when copied -> drop
-        "0xthin": (0, 0.0),       # no evidence -> keep
+        "0xthin": (0, 0.0),       # never makes a trade we'd mirror -> drop
     }
+    FakeVetter.prior = {}
     s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
     strat = FakeStrategy()
     eng = Engine(settings=s, selector=FakeSelector(["0xgood", "0xbad", "0xthin"]),
                  strategy=strat)
     ranked = eng.rescore()
-    assert [r.wallet for r in ranked] == ["0xgood", "0xthin"]
-    assert strat.leaders == ["0xgood", "0xthin"]
+    assert [r.wallet for r in ranked] == ["0xgood"]
+    assert strat.leaders == ["0xgood"]
+    eng.close()
+
+
+def test_vetting_drops_too_few_trades_to_judge(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xlucky": (3, 90.0)}   # 3 wins is not a track record
+    FakeVetter.prior = {}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_min_trades=10)
+    eng = Engine(settings=s, selector=FakeSelector(["0xlucky"]), strategy=FakeStrategy())
+    assert eng.rescore() == []
+    eng.close()
+
+
+def test_vetting_drops_hot_streak_that_fails_out_of_sample(monkeypatch):
+    """Profitable in the scoring window, a loser before it — that's the luck
+    case the single-window test could never separate from skill."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xhot": (25, 120.0), "0xreal": (25, 60.0)}
+    FakeVetter.prior = {"0xhot": (20, -80.0), "0xreal": (20, 45.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xhot", "0xreal"]),
+                 strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xreal"]
+    eng.close()
+
+
+def test_vetting_drops_wallet_with_no_history_before_the_window(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xbrandnew": (25, 70.0)}
+    FakeVetter.prior = {"0xbrandnew": (0, 0.0)}     # tape starts inside the window
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xbrandnew"]),
+                 strategy=FakeStrategy())
+    assert eng.rescore() == []
+    eng.close()
+
+
+def test_consistency_check_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xhot": (25, 120.0)}
+    FakeVetter.prior = {"0xhot": (20, -80.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_require_consistency=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xhot"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xhot"]
+    eng.close()
+
+
+def test_lineup_is_not_padded_to_top_n(monkeypatch):
+    """The follow list is however many wallets are proven — not a quota."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {f"0xw{i}": (25, 40.0 if i < 3 else -10.0) for i in range(8)}
+    FakeVetter.prior = {}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    strat = FakeStrategy()
+    eng = Engine(settings=s, selector=FakeSelector([f"0xw{i}" for i in range(8)]),
+                 strategy=strat)
+    assert len(eng.rescore()) == 3
+    assert strat.leaders == ["0xw0", "0xw1", "0xw2"]
     eng.close()
 
 
