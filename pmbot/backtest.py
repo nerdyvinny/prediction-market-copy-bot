@@ -24,11 +24,65 @@ from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.models import Fill, LeaderTrade, Market, Side, Signal
 from pmbot.portfolio.ledger import Ledger
 from pmbot.risk import RiskManager
+from pmbot.strategy.exact_copy import EXIT_CRUMB_SHARES
 
 log = logging.getLogger(__name__)
 
 _MIN_PRICE = 1e-4
 _MAX_PRICE = 1 - 1e-4
+
+# What the live loop can actually see when it decides on an entry: it polls
+# every `poll_interval_seconds` and fetches `trades_per_leader` trades.
+_LIVE_POLL_SECONDS = 10.0
+_LIVE_TAPE_DEPTH = 25
+
+
+def round_tripped_entry_uids(
+    ordered: list[LeaderTrade],
+    *,
+    window_seconds: float | None = _LIVE_POLL_SECONDS,
+    tape_depth: int | None = _LIVE_TAPE_DEPTH,
+) -> set[str]:
+    """BUY uids the live bot would skip as already-round-tripped.
+
+    Share accounting (including the crumb tolerance) mirrors
+    `ExactCopyStrategy._round_tripped_entry_uids` exactly — see that docstring
+    for why only FULL exits retire an entry.
+
+    The two limits here are what a whole-tape scan gets wrong. Live, an entry
+    is evaluated at the FIRST poll after it appears and then marked seen, so it
+    is skipped only if the leader's full exit has already landed by that poll:
+    within one `poll_interval_seconds`, and still inside the 25-trade window
+    the strategy fetches. Scanning a deep research tape instead retires entries
+    the leader exited hours later — which the live bot copied long before that
+    exit existed. That is the difference between "44% of entries are
+    round-tripped" (measured on a deep tape) and the far smaller share the bot
+    actually declines. Pass `None`/`None` to reproduce the whole-tape number.
+    """
+    held: dict[str, float] = {}
+    bought: dict[str, float] = {}
+    open_uids: dict[str, list[tuple[str, datetime, int]]] = {}
+    closed: set[str] = set()
+    for idx, t in enumerate(ordered):
+        prior = held.get(t.token_id, 0.0)
+        if t.side is Side.BUY:
+            held[t.token_id] = prior + t.shares
+            bought[t.token_id] = bought.get(t.token_id, 0.0) + t.shares
+            open_uids.setdefault(t.token_id, []).append((t.uid, t.timestamp, idx))
+            continue
+        remaining = max(0.0, prior - t.shares)
+        if remaining <= max(EXIT_CRUMB_SHARES, 1e-4 * bought.get(t.token_id, 0.0)):
+            remaining = 0.0
+            for uid, ts, i in open_uids.pop(t.token_id, []):
+                if (window_seconds is not None
+                        and (t.timestamp - ts).total_seconds() > window_seconds):
+                    continue                       # we had already copied it
+                if tape_depth is not None and (idx - i) >= tape_depth:
+                    continue                       # entry had scrolled off the window
+                closed.add(uid)
+            bought.pop(t.token_id, None)
+        held[t.token_id] = remaining
+    return closed
 
 
 @dataclass
@@ -422,9 +476,11 @@ class ExactCopyBacktester:
         slippage_bps: float | None = None,
         leader_weights: dict[str, float] | None = None,
         min_hours_to_resolution: float = 0.0,
+        max_hours_to_resolution: float = 0.0,
         stop_loss_frac: float | None = None,
         price_series: dict[str, list[tuple[int, float]]] | None = None,
         resolve_at: dict[str, datetime] | None = None,
+        skip_round_tripped_entries: bool = False,
     ) -> BacktestReport:
         """Simulate the tapes over the window [now - lookback_days, now].
 
@@ -435,7 +491,17 @@ class ExactCopyBacktester:
         `leader_weights` are per-leader copy_fraction multipliers (see
         `vet_weights`); `min_hours_to_resolution` skips entries placed within
         that many hours of the market's close (in-game/near-resolution trades
-        are the ones our live lag copies worst).
+        are the ones our live lag copies worst); `max_hours_to_resolution`
+        skips entries placed more than that many hours before it, capping how
+        long a copy can tie up bankroll.
+
+        Both horizon knobs read Gamma's `end_date`, never `resolve_at`: that
+        stamp is the only horizon the LIVE bot has at entry time, so scoring
+        them against a data-derived resolution would validate a rule we cannot
+        actually run. The max knob is also unharmed by the start-of-day
+        `end_date` quirk described below — that quirk makes `hours_left`
+        negative, which sits under any positive ceiling, so in-game sports
+        entries pass the max filter exactly as they do live.
 
         `stop_loss_frac` arms a protective exit: if the token's observed price
         falls to `avg_entry * (1 - frac)` before the leader exits or the market
@@ -458,6 +524,17 @@ class ExactCopyBacktester:
         cutoff = now - timedelta(days=lookback_days)
         p_min = s.copy_price_min if price_min is None else price_min
         p_max = s.copy_price_max if price_max is None else price_max
+
+        # Detect per leader on that leader's own tape, and only on trades at or
+        # before `now` — using an exit the live bot could not yet have seen
+        # would leak the future into a walk-forward test.
+        round_tripped: set[str] = set()
+        if skip_round_tripped_entries:
+            for tape in tapes.values():
+                visible = sorted(
+                    (t for t in tape if t.timestamp <= now), key=lambda t: t.timestamp
+                )
+                round_tripped |= round_tripped_entry_uids(visible)
 
         all_trades = [t for tape in tapes.values() for t in tape if cutoff <= t.timestamp <= now]
         all_trades.sort(key=lambda t: t.timestamp)
@@ -585,6 +662,8 @@ class ExactCopyBacktester:
             leader_pos[lkey] = max(0.0, prior + delta)
 
             if t.side is Side.BUY:
+                if t.uid in round_tripped:
+                    continue                       # leader already flat before our next poll
                 if not (p_min <= t.price <= p_max):
                     continue
                 if t.usd_size < min_leader_notional:
@@ -598,9 +677,16 @@ class ExactCopyBacktester:
                 # default 0 the unguarded compare silently dropped all of them,
                 # while the live bot copies them — backtests wildly undercounted
                 # for sports-heavy leaders.
-                if min_hours_to_resolution > 0:
+                if min_hours_to_resolution > 0 or max_hours_to_resolution > 0:
                     hours_left = (market.end_date - t.timestamp).total_seconds() / 3600
-                    if hours_left < min_hours_to_resolution:
+                    if min_hours_to_resolution > 0 and hours_left < min_hours_to_resolution:
+                        continue
+                    # No symmetric guard needed on the max side: the same
+                    # start-of-day stamp that makes hours_left negative for
+                    # in-game trades keeps them under every ceiling, which is
+                    # what we want — the ceiling is aimed at months-out macro
+                    # markets, not at sports.
+                    if max_hours_to_resolution > 0 and hours_left > max_hours_to_resolution:
                         continue
                 sized = risk.size(Signal(
                     t.market_id, t.token_id, t.outcome, Side.BUY, t.price,
