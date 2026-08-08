@@ -535,3 +535,138 @@ def test_unfilled_mirror_exit_is_retried():
     assert len(second) == 1 and second[0].side is Side.SELL
     assert "sell-uid" not in strat._processed_uids
     led.close()
+
+
+# --- leader position tracking (regression: trims read as full liquidations) ---
+
+def test_pre_follow_sell_does_not_latch_tracking_negative():
+    """A leader exiting a position that predates us must not poison later trims.
+
+    `apply_fill` models a book that can go short, so the first observed SELL
+    used to drive the tracked count to -900 and it stayed negative through the
+    next BUY. `sell_fraction` then read every subsequent trim as an unknown
+    prior and liquidated our whole slice. 65 of 466 rows in the live DB were
+    in this state when the bug was found.
+    """
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1, t2 = NOW - timedelta(minutes=40), NOW - timedelta(minutes=20), NOW
+    pre = _trade("m_ok", "tokOK", Side.SELL, 0.50, 900, "u-pre", ts=t0)
+    buy = _trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u-buy", ts=t1)
+    trim = _trade("m_ok", "tokOK", Side.SELL, 0.55, 50, "u-trim", ts=t2)
+
+    led = Ledger(":memory:")
+    strat = _strategy([pre], markets, led)
+
+    # Cycle 1: they exit a position that predates us. We hold nothing, so
+    # there is nothing to mirror — and the tracked count must land at 0, not
+    # -900, or every later trim reads as an unknown prior.
+    assert list(strat.generate()) == []
+    assert strat._leader_shares[("0xlead", "tokOK")] == 0.0
+
+    # Cycle 2: they open a position and we copy it.
+    strat.data._trades = [pre, buy]
+    assert [s.side for s in strat.generate()] == [Side.BUY]
+    our_buy = Signal("m_ok", "tokOK", "Yes", Side.BUY, 0.50, 5, "copy",
+                     source_leader="0xlead", source_uid="u-buy")
+    led.record_fill(Fill(signal=our_buy, fill_price=0.50, size_usd=5, shares=10,
+                         timestamp=t1, mode="paper"))
+
+    # Cycle 3: they trim half of what we watched them build.
+    strat.data._trades = [pre, buy, trim]
+    sells = [s for s in strat.generate() if s.side is Side.SELL]
+    assert len(sells) == 1
+    assert sells[0].size_shares == pytest.approx(5.0)   # half our slice, not all
+    assert strat._leader_shares[("0xlead", "tokOK")] == pytest.approx(50.0)
+    led.close()
+
+
+def test_tracking_never_goes_negative():
+    """The observed count is clamped at zero, so a sell we can't account for
+    can never persist as a phantom short."""
+    markets = {"m_ok": _mkt("m_ok")}
+    tape = [_trade("m_ok", "tokOK", Side.SELL, 0.50, 900, "u-pre")]
+    led = Ledger(":memory:")
+    strat = _strategy(tape, markets, led)
+    list(strat.generate())
+    assert strat._leader_shares[("0xlead", "tokOK")] == 0.0
+    led.close()
+
+
+def test_replayed_sells_keep_their_own_prior():
+    """Two sells on one token, re-decided (restart / rejected exit).
+
+    The old `stored + t.shares` reconstruction is only right for the LAST sell
+    on a token: on replay the earlier 30%-of-100 trim reconstructed a prior of
+    30 and read as a 100% exit. The prior recorded at first observation makes
+    the second pass agree with the first.
+    """
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1, t2 = NOW - timedelta(minutes=40), NOW - timedelta(minutes=20), NOW
+    tape = [
+        _trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u-buy", ts=t0),
+        _trade("m_ok", "tokOK", Side.SELL, 0.55, 30, "u-s1", ts=t1),
+        _trade("m_ok", "tokOK", Side.SELL, 0.55, 70, "u-s2", ts=t2),
+    ]
+    led = Ledger(":memory:")
+    our_buy = Signal("m_ok", "tokOK", "Yes", Side.BUY, 0.50, 50, "copy",
+                     source_leader="0xlead", source_uid="u-buy")
+    led.record_fill(Fill(signal=our_buy, fill_price=0.50, size_usd=50, shares=100,
+                         timestamp=t0, mode="paper"))
+
+    strat = _strategy(tape, markets, led)
+    first = {s.source_uid: s.size_shares for s in strat.generate() if s.side is Side.SELL}
+    # Nothing filled them, so the next cycle re-decides both.
+    second = {s.source_uid: s.size_shares for s in strat.generate() if s.side is Side.SELL}
+
+    # u-s1 trimmed 30 of their 100 -> 30% of our 100 shares, on BOTH passes.
+    # Under the old reconstruction the replay recomputed its prior as 30,
+    # read the trim as a 100% exit, and offered all 100 of our shares.
+    assert first["u-s1"] == pytest.approx(30.0)
+    assert second["u-s1"] == pytest.approx(30.0)
+    assert second == pytest.approx(first)          # replay agrees with the first pass
+    led.close()
+
+
+def test_replayed_sell_priors_survive_restart(tmp_path):
+    """The recorded priors are persisted, so the replay fix survives a restart
+    — which is the case that actually produced the wrong sizing live."""
+    db = str(tmp_path / "led.db")
+    markets = {"m_ok": _mkt("m_ok")}
+    t0, t1, t2 = NOW - timedelta(minutes=40), NOW - timedelta(minutes=20), NOW
+    tape = [
+        _trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u-buy", ts=t0),
+        _trade("m_ok", "tokOK", Side.SELL, 0.55, 30, "u-s1", ts=t1),
+        _trade("m_ok", "tokOK", Side.SELL, 0.55, 70, "u-s2", ts=t2),
+    ]
+    led = Ledger(db)
+    our_buy = Signal("m_ok", "tokOK", "Yes", Side.BUY, 0.50, 50, "copy",
+                     source_leader="0xlead", source_uid="u-buy")
+    led.record_fill(Fill(signal=our_buy, fill_price=0.50, size_usd=50, shares=100,
+                         timestamp=t0, mode="paper"))
+    before = {s.source_uid: s.size_shares
+              for s in _strategy(tape, markets, led).generate() if s.side is Side.SELL}
+    led.close()
+
+    led2 = Ledger(db)                                   # "restart"
+    after = {s.source_uid: s.size_shares
+             for s in _strategy(tape, markets, led2).generate() if s.side is Side.SELL}
+    assert after == pytest.approx(before)
+    assert after["u-s1"] == pytest.approx(30.0)
+    led2.close()
+
+
+def test_migration_heals_negative_leader_positions(tmp_path):
+    """DBs written before the clamp carry negative rows; opening a Ledger
+    zeroes them, otherwise the fix is inert on the live database."""
+    db = str(tmp_path / "led.db")
+    led = Ledger(db)
+    led.conn.execute(
+        "INSERT INTO leader_positions (leader, token_id, shares) VALUES (?,?,?)",
+        ("0xlead", "tokOK", -800.0),
+    )
+    led.conn.commit()
+    led.close()
+
+    led2 = Ledger(db)
+    assert led2.load_leader_positions()[("0xlead", "tokOK")] == 0.0
+    led2.close()

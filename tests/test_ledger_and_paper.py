@@ -108,8 +108,11 @@ def test_ledger_realized_pnl_and_exposures():
     pos = led.get_position("tokA")
     assert pos.shares == pytest.approx(50.0)
     assert pos.realized_pnl == pytest.approx((0.70 - 0.50) * 50)
-    # net USD via leader = 50 (buy) - 35 (sell) = 15
-    assert led.exposure_for_leader("0xLEAD") == pytest.approx(15.0)
+    # Exposure is a COST BASIS: 50 shares still held x $0.50 paid = $25.
+    # This used to net buy cost against sell PROCEEDS (50 - 35 = 15), mixing
+    # units — and backwards, since a loser's cheap exit subtracts less and
+    # makes them look MORE exposed than they are.
+    assert led.exposure_for_leader("0xLEAD") == pytest.approx(25.0)
     assert led.exposure_for_market("mktA") > 0
     led.close()
 
@@ -295,3 +298,45 @@ def test_paper_executor_rejects_nonpositive_size():
     ex = PaperExecutor(led, price_cache=cache)
     assert ex.execute(_sig(size_usd=0)) is None
     led.close()
+
+
+def test_paper_executor_copy_sell_skipped_without_book():
+    """A copied exit with no live bid must not fill at the leader's price.
+
+    Symmetric with test_paper_executor_copy_buy_skipped_without_book: an empty
+    book means a dead, illiquid, or already-resolved market, and inventing a
+    fill there books paper P&L no live order could have earned.
+    """
+    led = Ledger(":memory:")
+    _fill(led, _sig(side=Side.BUY, size_usd=50, uid="b1"), price=0.50)  # 100 sh
+    ex = PaperExecutor(led, price_cache=FakeCache(Quote(token_id="tokA")), slippage_bps=0)
+    sell = _sig(side=Side.SELL, size_usd=25, uid="s1")
+    assert ex.execute(sell) is None
+    assert led.get_position("tokA").shares == pytest.approx(100.0)  # untouched
+    led.close()
+
+
+def test_paper_executor_settlement_sell_still_uses_target_price():
+    """Settlement and arb legs carry no source_leader and keep the fallback —
+    settlement's target IS the true payout, not a leader's quote."""
+    led = Ledger(":memory:")
+    _fill(led, _sig(side=Side.BUY, size_usd=50, uid="b1"), price=0.50)
+    ex = PaperExecutor(led, price_cache=FakeCache(Quote(token_id="tokA")), slippage_bps=0)
+    sell = Signal(market_id="mktA", token_id="tokA", outcome="Yes", side=Side.SELL,
+                  target_price=0.80, size_usd=40, reason="settlement")
+    fill = ex.execute(sell)
+    assert fill is not None and fill.fill_price == pytest.approx(0.80)
+    led.close()
+
+
+def test_best_level_ignores_zero_size_levels():
+    """A zero-size level is not tradeable and must not become the best ask."""
+    from pmbot.data.price_cache import _best_level
+
+    asks = [{"price": "0.0001", "size": "0"}, {"price": "0.62", "size": "500"}]
+    assert _best_level(asks, want_max=False) == (0.62, 500.0)
+
+    bids = [{"price": "0.99", "size": "0"}, {"price": "0.58", "size": "300"}]
+    assert _best_level(bids, want_max=True) == (0.58, 300.0)
+
+    assert _best_level([{"price": "0.5", "size": "0"}], want_max=False) is None

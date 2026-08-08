@@ -24,11 +24,12 @@ BUY: same shape as a fresh entry, sized by the RiskManager off leader notional.
 SELL: mirrored *proportionally*, and only over OUR OWN slice from that leader.
 Two independent quantities drive this:
   - how much of THEIR position the leader exited — we track each leader's
-    running per-token share count from the trades we've observed (using the
-    same `apply_fill` accounting the ledger uses), so a partial trim becomes a
-    partial exit rather than a full liquidation. If their prior position is
-    unknown (e.g. it predates when we started following them), we
-    conservatively treat the sell as a full exit.
+    running per-token share count from the trades we've observed
+    (`observe_leader_fill`, shared with the backtester), so a partial trim
+    becomes a partial exit rather than a full liquidation. The count never
+    goes negative: Polymarket has no naked shorts, so a sell we can't account
+    for means the buy predates us. When the observed count is zero their prior
+    position is unknown, and we conservatively treat the sell as a full exit.
   - how many shares WE hold because of that leader
     (`Ledger.copied_shares_for_leader`). Several followed leaders can hold the
     same outcome token while `positions` knows only the combined total, so
@@ -50,7 +51,7 @@ from datetime import datetime, timezone
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient, PriceCache
 from pmbot.models import LeaderTrade, Market, Side, Signal
-from pmbot.portfolio.ledger import Ledger, apply_fill
+from pmbot.portfolio.ledger import Ledger
 from pmbot.strategy.base import Strategy
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,26 @@ log = logging.getLogger(__name__)
 # exit routinely sells fractionally fewer shares than the entry bought and
 # leaves a sub-0.01 crumb behind. Treat a position this small as flat.
 EXIT_CRUMB_SHARES = 0.01
+
+
+def observe_leader_fill(prior_shares: float, side: Side, shares: float) -> float:
+    """The leader's share count after this trade — never negative.
+
+    THE source of truth for reconstructing a watched wallet's position; the
+    backtester imports it so live and simulated exits cannot drift apart.
+
+    This deliberately does NOT use `apply_fill`. That function is the ledger's
+    *trading* accounting, built for a book that can go short: a SELL from zero
+    opens a negative position. Polymarket has no naked shorts — a sell we can't
+    account for means the buy predates our observation, not that the leader is
+    short — and the negative then persisted through later buys, so
+    `sell_fraction` fell to its "unknown prior -> full exit" branch on every
+    subsequent trim. Clamping at zero is both correct and self-consistent: we
+    only ever bought alongside observed BUYs, so an observed count of zero
+    means they have sold everything we mirrored, and a full exit IS right.
+    """
+    delta = shares if side is Side.BUY else -shares
+    return max(0.0, prior_shares + delta)
 
 
 class ExactCopyStrategy(Strategy):
@@ -124,10 +145,15 @@ class ExactCopyStrategy(Strategy):
         #                    and a transient skip isn't a permanent one.
         self._seen_uids: set[str] = set()
         self._processed_uids: set[str] = set()
+        # uid -> the leader's share count immediately BEFORE that trade (SELLs
+        # only). Lets a re-decided exit size off what we observed at the time
+        # instead of reconstructing it; see `generate`.
+        self._seen_priors: dict[str, float] = {}
         try:
             self.ledger.prune_seen_trades(older_than_days=30.0)
             self._leader_shares = self.ledger.load_leader_positions()
             self._seen_uids = self.ledger.load_seen_uids()
+            self._seen_priors = self.ledger.load_seen_priors()
         except Exception as e:
             log.debug("strategy: leader-tracking restore failed: %s", e)
 
@@ -282,131 +308,157 @@ class ExactCopyStrategy(Strategy):
                 if self.skip_round_tripped_entries else set()
             )
             for t in ordered:
-                key = (leader, t.token_id)
-                if t.uid not in self._seen_uids:
-                    # Count toward leader position tracking exactly once per
-                    # trade uid — the same trade stays in the fetched window
-                    # across poll cycles, and re-applying it would double-count
-                    # the leader's position.
-                    prior_shares = self._leader_shares.get(key, 0.0)
-                    eff = apply_fill(prior_shares, 0.0, t.side, t.shares, t.price)
-                    self._seen_uids.add(t.uid)
-                    self._leader_shares[key] = eff.new_shares
-                    try:
-                        self.ledger.record_leader_observation(
-                            leader, t.token_id, eff.new_shares, t.uid, t.timestamp
-                        )
-                    except Exception as e:
-                        # Both writes share one transaction, so a failure lands
-                        # neither and a restart replays this trade correctly —
-                        # but a DB that keeps failing must not do so silently.
-                        log.warning("strategy: leader-tracking persist failed: %s", e)
-                elif t.side is Side.SELL:
-                    # Tracked before this process started (restart): the
-                    # stored count is post-sell, so reconstruct the pre-sell
-                    # count for proportional mirroring.
-                    prior_shares = self._leader_shares.get(key, 0.0) + t.shares
-                else:
-                    prior_shares = self._leader_shares.get(key, 0.0)
-
-                if t.uid in self._processed_uids or self.ledger.has_copied(t.uid):
-                    continue
-
-                if exit_only and t.side is Side.BUY:
-                    continue                       # exit-only leader: mirror exits, never new entries
-
-                if t.side is Side.BUY and t.uid in round_tripped:
-                    # Settled, and checked before the market lookup so a dead
-                    # entry costs no API call: the leader's exit is history and
-                    # can never un-happen, so this uid is never copyable.
-                    self._processed_uids.add(t.uid)
-                    continue
-
-                market = self._market(t.market_id)
-
-                if t.side is Side.BUY:
-                    # Entries need live market metadata; a TRANSIENT lookup
-                    # failure leaves the trade unprocessed so the next cycle
-                    # retries it instead of skipping it forever.
-                    if market is None:
-                        continue
-                    # Entry-only filters: exits are never blocked by these —
-                    # mirroring a leader out of a position reduces our risk.
-                    reason = self._entry_reject_reason(t, market, now)
-                    if reason is not None:
-                        self._processed_uids.add(t.uid)   # settled: never copyable
-                        continue
-                    drift_ok = self._price_drift_ok(t.token_id, t.price)
-                    if drift_ok is None:
-                        continue         # couldn't verify — transient, retry next cycle
-                    self._processed_uids.add(t.uid)       # verified: decision is final
-                    if not drift_ok:
-                        continue         # edge already arbitraged away
-                    yield Signal(
-                        market_id=t.market_id,
-                        token_id=t.token_id,
-                        outcome=t.outcome,
-                        side=Side.BUY,
-                        target_price=t.price,
-                        size_usd=t.usd_size,       # leader notional = copy target
-                        reason=f"copy {leader[:8]}… buy",
-                        source_leader=leader,
-                        source_uid=t.uid,
+                try:
+                    yield from self._signals_for_trade(
+                        leader, exit_only, t, round_tripped, now
                     )
-                else:
-                    # Exits are risk-reducing: a failed market lookup must
-                    # never block one (only a definitively closed market does —
-                    # settlement owns those).
-                    if market is not None and market.closed:
-                        self._processed_uids.add(t.uid)
-                        continue
-                    our_position = self.ledger.get_position(t.token_id)
-                    if our_position is None or abs(our_position.shares) <= 1e-9:
-                        self._processed_uids.add(t.uid)
-                        continue                   # nothing of ours to mirror-sell
-                    # Only THIS leader's slice is ours to exit. `positions`
-                    # holds the combined total, so sizing off it let one
-                    # leader's exit liquidate another leader's copy of the same
-                    # token — a full exit by a leader who contributed 30% of
-                    # our shares sold all 100%. Clamped to the real position,
-                    # which settlement zeroes (settlement fills carry no
-                    # source_leader, so the raw balance can outlive the shares).
-                    held_total = abs(our_position.shares)
-                    from_leader = self.ledger.copied_shares_for_leader(leader, t.token_id)
-                    copied = min(max(0.0, from_leader), held_total)
-                    if copied <= 1e-9:
-                        self._processed_uids.add(t.uid)
-                        continue                   # we hold this token, but not from them
-                    # NB: a mirror-exit we yield is deliberately NOT retired
-                    # here. The RiskManager can still reject it (e.g. the slice
-                    # rounds under min_ticket_usd), and retiring it would drop
-                    # the exit for good — `has_copied` already dedupes the ones
-                    # that actually fill.
-                    sell_fraction = 1.0 if prior_shares <= 1e-9 else min(1.0, t.shares / prior_shares)
-                    sell_shares = copied * sell_fraction
-                    # The leader's exit ratio is rarely exactly 1.0, so a "full"
-                    # exit can leave a sub-cent crumb that the ledger counts as
-                    # an open position forever. Sweep it — but only up to
-                    # `copied`, this leader's own slice, never `held_total`:
-                    # snapping to the combined position is precisely how one
-                    # leader's exit would liquidate another's copy.
-                    if self.sweep_exit_dust:
-                        residual_value = (copied - sell_shares) * our_position.avg_price
-                        if 0 < residual_value < self.exit_dust_usd:
-                            sell_shares = copied
-                    yield Signal(
-                        market_id=t.market_id,
-                        token_id=t.token_id,
-                        outcome=t.outcome,
-                        side=Side.SELL,
-                        target_price=t.price,
-                        # Estimate, valued at our blended avg cost across every
-                        # leader in the token; size_shares is what the executor
-                        # actually fills on.
-                        size_usd=sell_shares * our_position.avg_price,
-                        size_shares=sell_shares,
-                        reason=(f"copy {leader[:8]}… sell {sell_fraction*100:.0f}%"
-                                + (" (exit-only)" if exit_only else "")),
-                        source_leader=leader,
-                        source_uid=t.uid,
-                    )
+                except Exception as e:
+                    # One trade must not take the watchlist down with it. Only
+                    # `get_trades` was guarded before, so a ledger read that
+                    # threw here ("database is locked" — the dashboard opens
+                    # the same file every 20s) escaped `poll_once` into the
+                    # engine's cycle backoff, and every leader after this one
+                    # went unpolled for that cycle.
+                    log.warning("strategy: skipped trade %s from %s: %s",
+                                (t.uid or "?")[:12], leader[:10], e)
+
+    def _signals_for_trade(
+        self, leader: str, exit_only: bool, t: LeaderTrade,
+        round_tripped: set[str], now: datetime,
+    ) -> Iterable[Signal]:
+        """Decide one observed leader trade: track it, then yield 0 or 1 signals."""
+        key = (leader, t.token_id)
+        if t.uid not in self._seen_uids:
+            # Count toward leader position tracking exactly once per
+            # trade uid — the same trade stays in the fetched window
+            # across poll cycles, and re-applying it would double-count
+            # the leader's position.
+            prior_shares = self._leader_shares.get(key, 0.0)
+            new_shares = observe_leader_fill(prior_shares, t.side, t.shares)
+            self._seen_uids.add(t.uid)
+            self._leader_shares[key] = new_shares
+            if t.side is Side.SELL:
+                self._seen_priors[t.uid] = prior_shares
+            try:
+                self.ledger.record_leader_observation(
+                    leader, t.token_id, new_shares, t.uid, t.timestamp,
+                    prior_shares=prior_shares if t.side is Side.SELL else None,
+                )
+            except Exception as e:
+                # Both writes share one transaction, so a failure lands
+                # neither and a restart replays this trade correctly —
+                # but a DB that keeps failing must not do so silently.
+                log.warning("strategy: leader-tracking persist failed: %s", e)
+        else:
+            # Already counted, and now being re-decided: a restart
+            # (`_processed_uids` is in-memory), or an exit the
+            # RiskManager rejected. Use the count recorded at first
+            # observation. This used to reconstruct it as
+            # `stored + t.shares`, which is only right for the LAST
+            # sell on a token — with two sells in the window the
+            # earlier partial trim read as a 100% exit.
+            prior_shares = self._seen_priors.get(
+                t.uid, self._leader_shares.get(key, 0.0)
+            )
+
+        if t.uid in self._processed_uids or self.ledger.has_copied(t.uid):
+            return
+
+        if exit_only and t.side is Side.BUY:
+            return                       # exit-only leader: mirror exits, never new entries
+
+        if t.side is Side.BUY and t.uid in round_tripped:
+            # Settled, and checked before the market lookup so a dead
+            # entry costs no API call: the leader's exit is history and
+            # can never un-happen, so this uid is never copyable.
+            self._processed_uids.add(t.uid)
+            return
+
+        market = self._market(t.market_id)
+
+        if t.side is Side.BUY:
+            # Entries need live market metadata; a TRANSIENT lookup
+            # failure leaves the trade unprocessed so the next cycle
+            # retries it instead of skipping it forever.
+            if market is None:
+                return
+            # Entry-only filters: exits are never blocked by these —
+            # mirroring a leader out of a position reduces our risk.
+            reason = self._entry_reject_reason(t, market, now)
+            if reason is not None:
+                self._processed_uids.add(t.uid)   # settled: never copyable
+                return
+            drift_ok = self._price_drift_ok(t.token_id, t.price)
+            if drift_ok is None:
+                return         # couldn't verify — transient, retry next cycle
+            self._processed_uids.add(t.uid)       # verified: decision is final
+            if not drift_ok:
+                return         # edge already arbitraged away
+            yield Signal(
+                market_id=t.market_id,
+                token_id=t.token_id,
+                outcome=t.outcome,
+                side=Side.BUY,
+                target_price=t.price,
+                size_usd=t.usd_size,       # leader notional = copy target
+                reason=f"copy {leader[:8]}… buy",
+                source_leader=leader,
+                source_uid=t.uid,
+            )
+        else:
+            # Exits are risk-reducing: a failed market lookup must
+            # never block one (only a definitively closed market does —
+            # settlement owns those).
+            if market is not None and market.closed:
+                self._processed_uids.add(t.uid)
+                return
+            our_position = self.ledger.get_position(t.token_id)
+            if our_position is None or abs(our_position.shares) <= 1e-9:
+                self._processed_uids.add(t.uid)
+                return                   # nothing of ours to mirror-sell
+            # Only THIS leader's slice is ours to exit. `positions`
+            # holds the combined total, so sizing off it let one
+            # leader's exit liquidate another leader's copy of the same
+            # token — a full exit by a leader who contributed 30% of
+            # our shares sold all 100%. Clamped to the real position,
+            # which settlement zeroes (settlement fills carry no
+            # source_leader, so the raw balance can outlive the shares).
+            held_total = abs(our_position.shares)
+            from_leader = self.ledger.copied_shares_for_leader(leader, t.token_id)
+            copied = min(max(0.0, from_leader), held_total)
+            if copied <= 1e-9:
+                self._processed_uids.add(t.uid)
+                return                   # we hold this token, but not from them
+            # NB: a mirror-exit we yield is deliberately NOT retired
+            # here. The RiskManager can still reject it (e.g. the slice
+            # rounds under min_ticket_usd), and retiring it would drop
+            # the exit for good — `has_copied` already dedupes the ones
+            # that actually fill.
+            sell_fraction = 1.0 if prior_shares <= 1e-9 else min(1.0, t.shares / prior_shares)
+            sell_shares = copied * sell_fraction
+            # The leader's exit ratio is rarely exactly 1.0, so a "full"
+            # exit can leave a sub-cent crumb that the ledger counts as
+            # an open position forever. Sweep it — but only up to
+            # `copied`, this leader's own slice, never `held_total`:
+            # snapping to the combined position is precisely how one
+            # leader's exit would liquidate another's copy.
+            if self.sweep_exit_dust:
+                residual_value = (copied - sell_shares) * our_position.avg_price
+                if 0 < residual_value < self.exit_dust_usd:
+                    sell_shares = copied
+            yield Signal(
+                market_id=t.market_id,
+                token_id=t.token_id,
+                outcome=t.outcome,
+                side=Side.SELL,
+                target_price=t.price,
+                # Estimate, valued at our blended avg cost across every
+                # leader in the token; size_shares is what the executor
+                # actually fills on.
+                size_usd=sell_shares * our_position.avg_price,
+                size_shares=sell_shares,
+                reason=(f"copy {leader[:8]}… sell {sell_fraction*100:.0f}%"
+                        + (" (exit-only)" if exit_only else "")),
+                source_leader=leader,
+                source_uid=t.uid,
+            )

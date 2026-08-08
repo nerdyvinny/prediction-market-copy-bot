@@ -316,3 +316,32 @@ def test_fixed_bankroll_also_shrinks_after_losses():
     rm = RiskManager(led, _settings(bankroll_usd=500.0, compound_profits=False))
     assert rm._free_bankroll() == pytest.approx(300.0)            # 500 - 200 loss
     led.close()
+
+
+def test_risk_size_sell_below_entry_floor_is_still_allowed():
+    """A small mirrored exit must not be blocked by the ENTRY dust floor.
+
+    The $1 floor exists to stop dust copies dying to slippage. Applied to
+    exits it made small slices permanently un-closeable: rejected at DEBUG,
+    then re-offered every 10s until the trade scrolled out of the window.
+    """
+    led = Ledger(":memory:")
+    buy = _sig(100)
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=100, shares=200,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    sized = rm.size(_sell_sig(0.40))
+    assert sized is not None
+    assert sized.size_usd == pytest.approx(0.40)
+    led.close()
+
+
+def test_risk_size_sell_below_dust_floor_is_refused():
+    """A true crumb is still refused — that is what exit_dust_usd is for."""
+    led = Ledger(":memory:")
+    buy = _sig(100)
+    led.record_fill(Fill(signal=buy, fill_price=0.50, size_usd=100, shares=200,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(), min_ticket_usd=1.0)
+    assert rm.size(_sell_sig(0.001)) is None
+    led.close()

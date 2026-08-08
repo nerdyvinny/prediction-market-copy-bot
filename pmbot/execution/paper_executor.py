@@ -150,7 +150,26 @@ class PaperExecutor(TradeExecutor):
                 )
                 return None
         else:
-            base = quote.bid if (quote and quote.bid) else signal.target_price
+            is_copy_sell = (
+                signal.source_leader is not None
+                and signal.venue == Venue.POLYMARKET.value
+            )
+            if quote and quote.bid:
+                base = quote.bid
+            elif is_copy_sell:
+                # Symmetric with the copy-BUY guard above. Falling back to the
+                # leader's own price grants an exit no live order could get —
+                # and an empty book is exactly where that bites: a dead,
+                # illiquid, or already-resolved market (the strategy's market
+                # cache is 300s stale, so "closed since we last looked" is
+                # routine). The uid is not retired, so this retries every poll;
+                # if the book never comes back, settlement books the true
+                # payout, which is the honest answer since we could not have
+                # sold either.
+                log.info("paper: no bid for %s; skipping copy sell", signal.token_id[:10])
+                return None
+            else:
+                base = signal.target_price
             price = base * (1 - slip) if base else None
 
         if not price or price <= 0:

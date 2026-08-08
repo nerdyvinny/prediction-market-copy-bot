@@ -256,3 +256,51 @@ def test_rescore_passes_dropped_leaders_with_open_positions_as_exit_only(monkeyp
     assert strat.leaders == ["0xnew"]
     assert strat.exit_only == ["0xheld"]
     eng.close()
+
+
+# --- settle scheduling ----------------------------------------------------
+class _CountingSettler:
+    def __init__(self):
+        self.calls = 0
+
+    def settle_open_positions(self):
+        self.calls += 1
+        return 0
+
+
+def test_first_settle_sweep_runs_immediately_after_boot(monkeypatch):
+    """Regression: the first sweep must not wait out a whole settle interval.
+
+    `_last_settle` was 0.0 and compared against `time.monotonic()`, which is
+    seconds since BOOT on Linux. On a freshly rebooted VM `now - 0.0` was less
+    than the interval, so every already-resolved position stayed unsettled —
+    and its bankroll pinned — for up to half an hour, the exact thing a
+    30-minute settle interval exists to prevent.
+    """
+    s = Settings(db_path=":memory:", copy_vet_leaders=False, arb_enabled=False,
+                 settle_interval_hours=0.5, poll_interval_seconds=0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xgood"]), strategy=FakeStrategy())
+    settler = _CountingSettler()
+    eng.settler = settler
+    # Simulate a machine that booted 60s ago: monotonic() is small.
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: 60.0)
+    monkeypatch.setattr(engine_mod.time, "sleep", lambda _s: None)
+
+    eng.run(max_cycles=1)
+    assert settler.calls == 1
+    eng.close()
+
+
+def test_settle_sweep_does_not_rerun_inside_the_interval(monkeypatch):
+    """...and having run, it waits the full interval before the next one."""
+    s = Settings(db_path=":memory:", copy_vet_leaders=False, arb_enabled=False,
+                 settle_interval_hours=0.5, poll_interval_seconds=0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xgood"]), strategy=FakeStrategy())
+    settler = _CountingSettler()
+    eng.settler = settler
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: 60.0)
+    monkeypatch.setattr(engine_mod.time, "sleep", lambda _s: None)
+
+    eng.run(max_cycles=3)
+    assert settler.calls == 1        # once, not once per cycle
+    eng.close()

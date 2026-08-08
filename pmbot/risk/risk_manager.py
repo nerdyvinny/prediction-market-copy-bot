@@ -1,11 +1,15 @@
 """Risk manager: turn an unsized Signal into a sized one (or reject it).
 
-Sizing pipeline (each step can only shrink the order):
+Sizing pipeline for an ENTRY (each step can only shrink the order):
   1. start from the leader's notional * copy_fraction
   2. clamp to remaining per-leader allowance
   3. clamp to remaining per-market allowance
   4. clamp to remaining bankroll (total deployed across all positions)
   5. reject dust (< min_ticket_usd)
+
+EXITS take none of those steps: closing risk is not sized off copy_fraction,
+does not consume bankroll, and is never blocked by a cap. It is capped only at
+what we actually hold, and refused only below `exit_dust_usd`.
 """
 
 from __future__ import annotations
@@ -26,7 +30,8 @@ _WEIGHT_MAX = 2.0
 
 
 class RiskManager:
-    def __init__(self, ledger: Ledger, settings: Settings | None = None, min_ticket_usd: float = 1.0):
+    def __init__(self, ledger: Ledger, settings: Settings | None = None,
+                 min_ticket_usd: float | None = None):
         s = settings or get_settings()
         self.ledger = ledger
         self.bankroll = s.bankroll_usd
@@ -34,7 +39,12 @@ class RiskManager:
         self.max_per_market = s.max_per_market_usd
         self.max_per_leader = s.max_per_leader_usd
         self.compound = s.compound_profits
-        self.min_ticket_usd = min_ticket_usd
+        self.min_ticket_usd = s.min_ticket_usd if min_ticket_usd is None else min_ticket_usd
+        # Floor for EXITS. The entry floor exists to stop dust copies dying to
+        # slippage; applying it to exits made small slices permanently
+        # un-closeable — rejected at DEBUG, then re-offered every 10s until the
+        # trade scrolled out of the window. Only a true crumb is refused now.
+        self.min_exit_usd = s.exit_dust_usd
         # Per-leader conviction multipliers on copy_fraction (1.0 = neutral).
         # Set from vet-backtest ROI at rescore; clamped so no single leader's
         # hot streak can blow past the diversification the caps encode.
@@ -75,7 +85,9 @@ class RiskManager:
             if held_shares <= 0:
                 return None
             desired = min(signal.size_usd, held_value)
-            if desired < self.min_ticket_usd:
+            if desired < self.min_exit_usd:
+                log.info("risk: exit of %s too small to place ($%.4f < $%.4f)",
+                         signal.token_id[:10], desired, self.min_exit_usd)
                 return None
             if signal.size_shares is None:
                 # No explicit share count: derive it from the dollar intent so a

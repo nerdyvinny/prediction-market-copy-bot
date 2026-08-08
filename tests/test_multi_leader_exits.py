@@ -204,7 +204,10 @@ def test_copied_shares_for_leader_is_zero_for_unknowns():
 
 def test_settlement_fills_are_not_attributed_to_any_leader():
     """Settlement writes a SELL with no source_leader, so it can't reduce a
-    leader's balance — the strategy clamps against the (now zero) position."""
+    leader's balance directly — attribution is instead scoped to fills after
+    the token's last settlement, which closes the round for every leader at
+    once. (This used to read 30.0, "stale by design"; a re-entry then made the
+    balance the sum of both rounds. See the re-entry test below.)"""
     led = Ledger(":memory:")
     try:
         _copy_buy(led, A, 30.0)
@@ -212,7 +215,7 @@ def test_settlement_fills_are_not_attributed_to_any_leader():
         led.record_fill(Fill(signal=settle, fill_price=1.0, size_usd=30.0,
                              shares=30.0, timestamp=NOW, mode="paper"))
         assert led.get_position(TOK).shares == 0.0
-        assert led.copied_shares_for_leader(A, TOK) == 30.0     # stale by design
+        assert led.copied_shares_for_leader(A, TOK) == 0.0      # round closed
 
         tapes = {A: [_trade(A, Side.BUY, 200, "a1"), _trade(A, Side.SELL, 200, "a2")]}
         assert _sells(_strategy(led, tapes, [A])) == []         # nothing left to exit
@@ -301,3 +304,79 @@ def test_sweep_does_not_touch_a_genuine_partial_exit():
         assert sells[0].size_shares == 15.0
     finally:
         led.close()
+
+
+# -- settlement + re-entry ------------------------------------------------
+def _settle(led: Ledger, shares: float, price: float = 1.0):
+    """Close the whole position the way Settler does: no source_leader."""
+    sig = Signal(MKT, TOK, "Yes", Side.SELL, price, shares * price, "settlement")
+    led.record_fill(Fill(signal=sig, fill_price=price, size_usd=shares * price,
+                         shares=shares, timestamp=NOW, mode="paper"))
+
+
+def test_settled_round_does_not_inflate_a_leaders_slice():
+    """A settled round must not follow a leader into their next one.
+
+    Settlement zeroes the position but its fill carries no source_leader, so
+    the old net-all-fills sum kept counting round 1 forever: leader A read as
+    500 shares when they owned 100 of the 150 we held. The only clamp
+    available was the COMBINED position, so A's exit sold all 150 — taking
+    leader B's 50 with it, the precise failure this module exists to prevent.
+    """
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 400.0, uid="a-round1")
+        _settle(led, 400.0)                       # market resolves; position zeroed
+        _copy_buy(led, A, 100.0, uid="a-round2")  # A re-enters the same token
+        _copy_buy(led, B, 50.0, uid="b-round2")   # B joins them
+
+        assert led.get_position(TOK).shares == 150.0
+        assert led.copied_shares_for_leader(A, TOK) == 100.0   # not 500
+        assert led.copied_shares_for_leader(B, TOK) == 50.0
+
+        # A fully exits: only their own 100 goes, B's 50 stays.
+        tapes = {A: [_trade(A, Side.BUY, 200, "a1"), _trade(A, Side.SELL, 200, "a2")]}
+        sells = _sells(_strategy(led, tapes, [A]))
+        assert len(sells) == 1
+        assert sells[0].size_shares == 100.0
+    finally:
+        led.close()
+
+
+def test_settled_round_does_not_inflate_leader_exposure():
+    """The same scoping applies to the cap: a settled round must release the
+    leader's budget instead of counting against `max_per_leader_usd` forever."""
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 400.0, uid="a-round1")   # $200 at 0.50
+        _settle(led, 400.0)
+        assert led.exposure_for_leader(A) == 0.0   # round closed, budget freed
+
+        _copy_buy(led, A, 100.0, uid="a-round2")   # $50 at 0.50
+        assert led.exposure_for_leader(A) == 50.0  # only the new round
+        assert led.leader_exposures()[A] == 50.0
+    finally:
+        led.close()
+
+
+def test_exposure_is_cost_basis_not_cost_minus_proceeds():
+    """Exposure must be what we still hold at what we paid.
+
+    Netting BUY cost against SELL proceeds mixes units, and backwards: an exit
+    into a collapsed price subtracts little and leaves the leader looking MORE
+    exposed than they are, throttling new copies from them; a winning exit
+    subtracts more than the cost removed and hands them extra headroom.
+    """
+    for exit_price, label in ((0.90, "winner"), (0.10, "loser")):
+        led = Ledger(":memory:")
+        try:
+            _copy_buy(led, A, 200.0, uid=f"a-{label}")          # $100 at 0.50
+            sig = Signal(MKT, TOK, "Yes", Side.SELL, exit_price, 100 * exit_price,
+                         "exit", source_leader=A, source_uid=f"x-{label}")
+            led.record_fill(Fill(signal=sig, fill_price=exit_price,
+                                 size_usd=100 * exit_price, shares=100.0,
+                                 timestamp=NOW, mode="paper"))
+            # 100 shares left, bought at 0.50 -> $50, whichever way it exited.
+            assert led.exposure_for_leader(A) == 50.0, label
+        finally:
+            led.close()

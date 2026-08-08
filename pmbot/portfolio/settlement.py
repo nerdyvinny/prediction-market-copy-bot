@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from pmbot.data import GammaClient, KalshiClient
 from pmbot.models import Fill, Position, Side, Signal, Venue
-from pmbot.portfolio.ledger import Ledger
+from pmbot.portfolio.ledger import SETTLEMENT_REASON, Ledger
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +102,10 @@ class Settler:
             side=side,
             target_price=price,
             size_usd=round(shares * price, 6),
-            reason="settlement",
+            # Leader attribution keys off this exact string: it marks where a
+            # token's previous round ended, so earlier fills stop counting
+            # toward any leader's slice. See `_SINCE_SETTLEMENT`.
+            reason=SETTLEMENT_REASON,
             venue=pos.venue,
         )
         fill = Fill(

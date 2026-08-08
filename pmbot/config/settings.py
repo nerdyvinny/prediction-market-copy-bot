@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     compound_profits: bool = False
     min_market_liquidity_usd: float = 5000.0  # skip thin markets
 
+    # Smallest ENTRY worth placing: below this a copy is dust that dies to
+    # slippage. Exits are deliberately exempt — a leader trimming a small slice
+    # produced a sub-$1 exit that was silently rejected and then re-offered
+    # every poll, so the position could never be closed at all. Closing risk is
+    # never blocked; `exit_dust_usd` handles the genuinely negligible crumb.
+    min_ticket_usd: float = 1.0
+
     # Paper fill model.
     slippage_bps: float = 60.0             # assumed adverse slippage (0.60%)
 

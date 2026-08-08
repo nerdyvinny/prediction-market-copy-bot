@@ -60,6 +60,26 @@ CREATE TABLE IF NOT EXISTS seen_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_fills_source_uid ON fills(source_uid);
 CREATE INDEX IF NOT EXISTS idx_fills_leader ON fills(source_leader);
+CREATE INDEX IF NOT EXISTS idx_fills_token ON fills(token_id);
+"""
+
+# `reason` on the closing fill Settler writes. Leader attribution keys off it
+# (see `_SINCE_SETTLEMENT`), so it is a shared constant rather than a literal
+# repeated in two modules.
+SETTLEMENT_REASON = "settlement"
+
+# Attribution scope: only fills after the token's most recent settlement.
+#
+# Settlement zeroes a position but writes its closing fill with NO
+# source_leader, so nothing ever nets a leader's earlier round out of the
+# per-leader sums. After a settle + re-entry a leader's balance reads as the
+# sum of BOTH rounds, and a full exit by them then sells shares a DIFFERENT
+# leader paid for — the exact failure `copied_shares_for_leader` exists to
+# prevent. A settlement closes everything before it by definition, so
+# restricting to fills after it is both correct and cheap.
+_SINCE_SETTLEMENT = """
+    f.id > COALESCE((SELECT MAX(s.id) FROM fills s
+                     WHERE s.token_id = f.token_id AND s.reason = 'settlement'), 0)
 """
 
 # Columns added after the v1 schema; applied to pre-existing DBs on open.
@@ -73,6 +93,12 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # NULL on rows written before this column existed.
     ("fills", "target_price", "ALTER TABLE fills ADD COLUMN target_price REAL"),
     ("positions", "venue", "ALTER TABLE positions ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'"),
+    # The leader's share count in this token BEFORE the trade. Recorded on
+    # SELLs only (nothing consumes a BUY's prior), so a re-decided exit sizes
+    # off the count we actually observed instead of reconstructing it — the
+    # old `stored + t.shares` arithmetic is only right for the LAST sell on a
+    # token, and turned every earlier partial trim into a 100% exit on replay.
+    ("seen_trades", "prior_shares", "ALTER TABLE seen_trades ADD COLUMN prior_shares REAL"),
 ]
 
 
@@ -126,6 +152,16 @@ class Ledger:
             cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in cols:
                 self.conn.execute(ddl)
+        # Heal leader tracking that went "short". The strategy used to observe
+        # leader trades through `apply_fill`, which models a book that CAN go
+        # short and so opened a negative position on a sell it couldn't account
+        # for — routine, since a leader's first observed exit is usually of a
+        # position that predates us. Polymarket has no naked shorts, so those
+        # rows are noise, and a negative prior made `sell_fraction` fall to its
+        # "unknown position -> full exit" branch on every later trim. The
+        # tracker now clamps at zero; this clears the state already persisted
+        # (65 of 466 rows when the bug was found). Idempotent and cheap.
+        self.conn.execute("UPDATE leader_positions SET shares = 0 WHERE shares < 0")
 
     def close(self) -> None:
         self.conn.close()
@@ -196,25 +232,59 @@ class Ledger:
         ).fetchone()
         return row is not None
 
-    def exposure_for_leader(self, leader: str) -> float:
-        """USD still deployed by following this leader, over OPEN positions only.
+    # Per-(leader, token) slice of every OPEN position: the leader's net shares
+    # since the last settlement, the shares actually held, and our cost basis.
+    # One query behind `exposure_for_leader` and `leader_exposures` so both
+    # mean the same thing.
+    _SLICE_SQL = f"""
+        SELECT f.source_leader AS leader,
+               f.token_id      AS token,
+               COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.shares ELSE -f.shares END), 0) AS net_shares,
+               p.shares        AS held,
+               p.avg_price     AS avg_price
+        FROM fills f JOIN positions p ON p.token_id = f.token_id
+        WHERE f.source_leader IS NOT NULL
+          AND ABS(p.shares) > 1e-9
+          AND {_SINCE_SETTLEMENT}
+          {{extra}}
+        GROUP BY f.source_leader, f.token_id
+    """
 
-        Joining fills to nonzero positions is what frees a leader's budget
-        when a market settles: settlement zeroes the position, its token
-        drops out of the join, and the leader's cap headroom returns. (The
-        old all-fills sum counted settled positions forever, so every leader
-        eventually looked "full" and new copies were silently skipped.)
-        Per-token nets are clamped at zero so an over-sold token can't grant
-        negative exposure that hides real deployment elsewhere.
+    @staticmethod
+    def _slice_usd(row: sqlite3.Row) -> float:
+        """Cost basis this leader still has deployed in one token.
+
+        Clamped into [0, what we actually hold]: a leader's net can exceed the
+        position (legacy over-exits attributed shares to the wrong wallet) or
+        go negative (they sold more than they bought here), and neither may
+        leak into another leader's budget.
         """
+        held = abs(float(row["held"] or 0.0))
+        net = min(max(0.0, float(row["net_shares"] or 0.0)), held)
+        return net * float(row["avg_price"] or 0.0)
+
+    def exposure_for_leader(self, leader: str) -> float:
+        """Cost basis still deployed by following this leader, open positions only.
+
+        Measured in the same unit as `deployed_usd` and `exposure_for_market`
+        — shares still held times what we paid — which is what
+        `max_per_leader_usd` is meant to cap.
+
+        This used to net BUY `size_usd` against SELL `size_usd`, i.e. cost
+        minus PROCEEDS. Those are different units and the error ran backwards:
+        a leader whose copies lost money reported MORE exposure than they held
+        (tightening their cap), while a winning leader got extra headroom.
+
+        Joining to nonzero positions is what frees a leader's budget when a
+        market settles: settlement zeroes the position, its token drops out of
+        the join, and the cap headroom returns.
+        """
+        if not leader:
+            return 0.0
         rows = self.conn.execute(
-            """SELECT COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.size_usd ELSE -f.size_usd END), 0) AS net
-               FROM fills f JOIN positions p ON p.token_id = f.token_id
-               WHERE f.source_leader=? AND ABS(p.shares) > 1e-9
-               GROUP BY f.token_id""",
-            (leader,),
+            self._SLICE_SQL.format(extra="AND f.source_leader = ?"), (leader,)
         ).fetchall()
-        return sum(max(0.0, float(r["net"] or 0.0)) for r in rows)
+        return sum(self._slice_usd(r) for r in rows)
 
     def copied_shares_for_leader(self, leader: str, token_id: str) -> float:
         """Shares of `token_id` we hold *because of* `leader`.
@@ -226,16 +296,22 @@ class Ledger:
 
         This is what keeps one leader's exit from liquidating another's copy:
         several followed leaders can hold the same outcome token, but
-        `positions` only knows the combined total. Settlement fills carry no
-        `source_leader`, so a settled market leaves a stale non-zero balance
-        here; callers clamp against the real position (which settlement zeroes)
-        instead of trusting this alone.
+        `positions` only knows the combined total.
+
+        Scoped to fills after the token's last settlement (`_SINCE_SETTLEMENT`).
+        Settlement fills carry no `source_leader`, so without that scope a
+        settled round stayed on the books forever: after a re-entry a leader's
+        balance read as the sum of both rounds, and clamping to the COMBINED
+        position — the only clamp available — let their exit sell shares
+        another leader had paid for. Callers still clamp, for legacy rows and
+        over-exits written before this fix.
         """
         if not leader:
             return 0.0
         row = self.conn.execute(
-            """SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN shares ELSE -shares END), 0) AS net
-               FROM fills WHERE source_leader=? AND token_id=?""",
+            f"""SELECT COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.shares ELSE -f.shares END), 0) AS net
+                FROM fills f
+                WHERE f.source_leader=? AND f.token_id=? AND {_SINCE_SETTLEMENT}""",
             (leader, token_id),
         ).fetchone()
         return float(row["net"] or 0.0)
@@ -262,18 +338,16 @@ class Ledger:
         return sum(abs(p.shares * p.avg_price) for p in self.get_positions())
 
     def leader_exposures(self) -> dict[str, float]:
-        """USD still deployed per leader, over open positions only (same
-        open-position join and per-token clamp as `exposure_for_leader`)."""
-        rows = self.conn.execute(
-            """SELECT f.source_leader AS leader, f.token_id AS token,
-                      COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.size_usd ELSE -f.size_usd END), 0) AS net
-               FROM fills f JOIN positions p ON p.token_id = f.token_id
-               WHERE f.source_leader IS NOT NULL AND ABS(p.shares) > 1e-9
-               GROUP BY f.source_leader, f.token_id"""
-        ).fetchall()
+        """Cost basis still deployed per leader, over open positions only —
+        the same definition as `exposure_for_leader`, for every leader at once.
+
+        The engine uses only the KEYS (which wallets we still hold something
+        from); the dashboard shows the values.
+        """
+        rows = self.conn.execute(self._SLICE_SQL.format(extra="")).fetchall()
         out: dict[str, float] = {}
         for r in rows:
-            out[r["leader"]] = out.get(r["leader"], 0.0) + max(0.0, float(r["net"] or 0.0))
+            out[r["leader"]] = out.get(r["leader"], 0.0) + self._slice_usd(r)
         return out
 
     def set_followed_leaders(self, wallets: dict[str, float]) -> None:
@@ -309,13 +383,19 @@ class Ledger:
 
     # -- leader-observation tracking (ExactCopyStrategy persistence) -------
     def record_leader_observation(
-        self, leader: str, token_id: str, shares: float, uid: str, ts: datetime
+        self, leader: str, token_id: str, shares: float, uid: str, ts: datetime,
+        prior_shares: float | None = None,
     ) -> None:
         """Persist one observed leader trade: their running share count for the
         token plus the trade uid, in a single transaction. Restarts then keep
         proportional exits proportional (an unknown prior position degrades a
         leader's 10% trim into a full exit of ours) without ever re-applying a
-        trade the strategy already counted."""
+        trade the strategy already counted.
+
+        `prior_shares` is their count BEFORE this trade, stored for SELLs so a
+        re-decided exit (a restart, or one the RiskManager rejected) sizes off
+        the number we actually observed rather than inferring it backwards.
+        """
         with self.conn:
             self.conn.execute(
                 """INSERT INTO leader_positions (leader, token_id, shares)
@@ -324,8 +404,8 @@ class Ledger:
                 (leader, token_id, shares),
             )
             self.conn.execute(
-                "INSERT OR IGNORE INTO seen_trades (uid, ts) VALUES (?,?)",
-                (uid, ts.isoformat()),
+                "INSERT OR IGNORE INTO seen_trades (uid, ts, prior_shares) VALUES (?,?,?)",
+                (uid, ts.isoformat(), prior_shares),
             )
 
     def load_leader_positions(self) -> dict[tuple[str, str], float]:
@@ -336,6 +416,20 @@ class Ledger:
 
     def load_seen_uids(self) -> set[str]:
         return {r["uid"] for r in self.conn.execute("SELECT uid FROM seen_trades")}
+
+    def load_seen_priors(self) -> dict[str, float]:
+        """{trade uid: leader's share count before that trade}, SELLs only.
+
+        Rows written before this column existed come back NULL and are skipped
+        — those uids fall back to the live tracked count, which is the old
+        behaviour, so an upgrade degrades rather than breaks.
+        """
+        return {
+            r["uid"]: float(r["prior_shares"])
+            for r in self.conn.execute(
+                "SELECT uid, prior_shares FROM seen_trades WHERE prior_shares IS NOT NULL"
+            )
+        }
 
     def prune_seen_trades(self, older_than_days: float = 30.0) -> None:
         """Drop seen-trade uids old enough to have left every fetch window."""

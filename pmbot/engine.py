@@ -62,11 +62,23 @@ class Engine:
         self.risk = risk or RiskManager(self.ledger, self.settings)
         self._resolution_store: ResolutionStore | None = None
         self._record_store: RecordStore | None = None
+        # Dedicated HTTP clients for the rescore path. Scoring fans out to 6
+        # threads and vetting pages whole tapes, all of it on the background
+        # worker — sharing the copy loop's clients put thousands of scoring
+        # requests through the same connection pool as the latency-critical
+        # poll, for ~15 minutes a day. Every second of 429 backoff there comes
+        # straight out of the 0.03 drift budget that decides whether a trade is
+        # still copyable. Only built when we own the selector (an injected one
+        # brings its own clients, as tests do).
+        self._rescore_data: PolymarketDataClient | None = None
+        self._rescore_gamma: GammaClient | None = None
         if selector is None:
             self._resolution_store = ResolutionStore(self.settings.db_path)
             self._record_store = RecordStore(self.settings.db_path)
+            self._rescore_data = PolymarketDataClient()
+            self._rescore_gamma = GammaClient()
             selector = LeaderSelector(
-                self.data, self.gamma,
+                self._rescore_data, self._rescore_gamma,
                 resolution_store=self._resolution_store,
                 record_store=self._record_store,
             )
@@ -95,7 +107,15 @@ class Engine:
         self._rescore_result: list[LeaderScore] | None = None
         self._rescore_error: Exception | None = None
         self._settle_interval = self.settings.settle_interval_hours * 3600
-        self._last_settle = 0.0
+        # None = never settled, so the first sweep is due immediately. This was
+        # 0.0, compared against `time.monotonic()` — seconds since BOOT on
+        # Linux — so on a freshly rebooted VM the first sweep was skipped until
+        # the box had been up a full `settle_interval`, pinning the bankroll of
+        # every already-resolved position for up to half an hour.
+        self._last_settle: float | None = None
+        # Per-leader sizing weights computed during a background rescore and
+        # applied on the main thread (see `_apply_rescore`).
+        self._pending_weights: dict[str, float] | None = None
 
     # -- steps -----------------------------------------------------------
     def rescore(self) -> list[LeaderScore]:
@@ -139,6 +159,12 @@ class Engine:
                 self._restore_watchlist()
             return False
         self.leaders = ranked
+        # Install vet weights only once the result is actually adopted.
+        if self._pending_weights is not None:
+            self.risk.set_leader_weights(self._pending_weights)
+            for w, mult in sorted(self._pending_weights.items(), key=lambda x: -x[1]):
+                log.info("vet: weight %.2fx for %s", mult, w[:10])
+            self._pending_weights = None
         try:
             self.ledger.set_followed_leaders({r.wallet: r.score for r in ranked})
         except Exception as e:
@@ -214,7 +240,13 @@ class Engine:
         # were effectively unvetted. The consistency window needs more history
         # still, so the tape has to cover oos_lookback_days, not just lookback.
         s = self.settings
-        vetter = ExactCopyBacktester(self.data, self.gamma, s, trades_limit=4000)
+        # Runs on the rescore worker, so it uses the rescore clients too (see
+        # __init__); falls back to the shared ones when a selector was injected.
+        vetter = ExactCopyBacktester(
+            self._rescore_data or self.data,
+            self._rescore_gamma or self.gamma,
+            s, trades_limit=4000,
+        )
         kept: list[LeaderScore] = []
         rois: dict[str, float] = {}
         now = datetime.now(timezone.utc)
@@ -284,11 +316,12 @@ class Engine:
 
         log.info("vet: %d of %d candidates proven copyable", len(kept), len(ranked))
 
+        # Stage the weights; `_apply_rescore` installs them on the MAIN thread.
+        # Writing straight to `self.risk` here breaks the promise in
+        # `_compute_rescore`'s docstring — this runs on the background rescore
+        # worker — and applied weights even when the result was then discarded.
         if self.settings.copy_weight_by_vet:
-            weights = vet_weights(rois)
-            self.risk.set_leader_weights(weights)
-            for w, mult in sorted(weights.items(), key=lambda x: -x[1]):
-                log.info("vet: weight %.2fx for %s", mult, w[:10])
+            self._pending_weights = vet_weights(rois)
         return kept
 
     def poll_once(self) -> tuple[int, int]:
@@ -355,6 +388,7 @@ class Engine:
         incumbents = self._incumbents()          # ledger reads on main thread
         self._rescore_result = None
         self._rescore_error = None
+        self._pending_weights = None             # drop any from a rejected run
 
         def worker() -> None:
             try:
@@ -424,7 +458,8 @@ class Engine:
                     now = time.monotonic()
                     self._rescore_tick()
 
-                    if (now - self._last_settle) >= self._settle_interval:
+                    if (self._last_settle is None
+                            or (now - self._last_settle) >= self._settle_interval):
                         # Arm the next deadline BEFORE sweeping: a throw here
                         # would otherwise leave it un-advanced and retry the
                         # whole sweep every cycle instead of every interval.
@@ -489,7 +524,8 @@ class Engine:
                   f"copyable={st.n_copyable_trades}")
 
     def close(self) -> None:
-        for c in (self.data, self.gamma, self.price_cache, self.kalshi):
+        for c in (self.data, self.gamma, self.price_cache, self.kalshi,
+                  self._rescore_data, self._rescore_gamma):
             if c is None:
                 continue
             try:

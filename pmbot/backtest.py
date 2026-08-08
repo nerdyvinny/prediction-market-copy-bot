@@ -24,7 +24,7 @@ from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.models import Fill, LeaderTrade, Market, Side, Signal
 from pmbot.portfolio.ledger import Ledger
 from pmbot.risk import RiskManager
-from pmbot.strategy.exact_copy import EXIT_CRUMB_SHARES
+from pmbot.strategy.exact_copy import EXIT_CRUMB_SHARES, observe_leader_fill
 
 log = logging.getLogger(__name__)
 
@@ -658,8 +658,11 @@ class ExactCopyBacktester:
             settle_until(t.timestamp)
             lkey = (t.leader.lower(), t.token_id)
             prior = leader_pos.get(lkey, 0.0)
-            delta = t.shares if t.side is Side.BUY else -t.shares
-            leader_pos[lkey] = max(0.0, prior + delta)
+            # Shared with ExactCopyStrategy so the two cannot drift: live used
+            # to track this through `apply_fill` (which goes short) while the
+            # sim clamped at zero, so identical tapes produced different exit
+            # fractions and vetting judged a bot that did not exist.
+            leader_pos[lkey] = observe_leader_fill(prior, t.side, t.shares)
 
             if t.side is Side.BUY:
                 if t.uid in round_tripped:
