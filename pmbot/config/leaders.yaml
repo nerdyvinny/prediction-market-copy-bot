@@ -45,6 +45,15 @@ weights:
   consistency: 0.00
   recency: 0.30
 
-# Manual overrides (optional).
-allowlist: []   # wallet addresses to always include (bypass filters)
+# Manual overrides (optional). Allowlisted wallets bypass BOTH the selection
+# filters above and the copy-vetting backtest — they are followed on your say-so
+# until you remove them, so review them when you review the lineup.
+allowlist:
+  # Dropped 2026-08-12 by the out-of-sample vetting rule on a -$17.13 older
+  # window, on the same day its recent window hit its best-ever +$127.75. It
+  # was the source of 13 of the bot's fills over Aug 8-10 and its trades clear
+  # the entry filters better than anything except 0xc23dc0ec. The rule that
+  # dropped it has since been given slack (copy_vet_oos_min_pnl_usd), but this
+  # pin keeps it in regardless of what the sliding window does next.
+  - "0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33"
 blocklist: []   # wallet addresses to never follow

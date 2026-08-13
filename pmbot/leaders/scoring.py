@@ -341,6 +341,20 @@ class LeaderSelector:
             return (wallet, None, _REJECT_ERROR)
         if not trades:
             return (wallet, None, _REJECT_TRADES)
+        # An allowlisted wallet is a manual override, so the early rejects below
+        # have to be skipped too — they run BEFORE the filter stage that the
+        # allowlist was documented to bypass, so a pinned wallet that was quiet
+        # for a day (recency) or trades in a style the copy path dislikes
+        # (copyable) was thrown out before the bypass could ever apply. Only an
+        # empty tape still stops us: there is nothing to score.
+        if wallet in self.config.allowlist:
+            return (wallet, compute_wallet_stats(
+                wallet, [t for t in trades if t.timestamp >= cutoff] or trades,
+                self._resolver, now=now,
+                copyable_notional_min=self.copy_notional_min,
+                copyable_price_min=self.copy_price_min,
+                copyable_price_max=self.copy_price_max,
+            ), None)
         newest = max(t.timestamp for t in trades)
         if (now - newest).total_seconds() / 3600.0 > f.max_hours_since_last_trade:
             return (wallet, None, _REJECT_RECENCY)
@@ -465,6 +479,12 @@ class LeaderSelector:
 
         ranked = rank_wallets(eligible, cfg.weights)
         top = ranked[: cfg.selection.top_n]
+        # top_n is the last place an allowlisted wallet could still be dropped:
+        # it bypasses the filters only to be cut here if it ranks below the
+        # line. A manual pin has to survive its own ranking.
+        if allow:
+            picked = {r.wallet for r in top}
+            top = top + [r for r in ranked if r.wallet in allow and r.wallet not in picked]
         rejects = Counter(early)
         rejects.update(filter_fails)
         self.last_report = {

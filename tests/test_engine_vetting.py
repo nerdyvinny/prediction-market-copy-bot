@@ -5,6 +5,7 @@ from __future__ import annotations
 import pmbot.engine as engine_mod
 from pmbot.config import Settings
 from pmbot.engine import Engine
+from pmbot.leaders.config import load_leader_config as _load_leader_config
 from pmbot.leaders.scoring import LeaderScore, WalletStats
 from pmbot.models import Signal  # noqa: F401  (imported for type parity with engine)
 
@@ -107,14 +108,93 @@ def test_vetting_drops_too_few_trades_to_judge(monkeypatch):
 
 def test_vetting_drops_hot_streak_that_fails_out_of_sample(monkeypatch):
     """Profitable in the scoring window, a loser before it — that's the luck
-    case the single-window test could never separate from skill."""
+    case the single-window test could never separate from skill.
+
+    The floor is pinned rather than left to default: unset, it scales off
+    `max_per_market_usd`, which a developer's .env can move underneath the
+    test.
+    """
     monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
     FakeVetter.outcomes = {"0xhot": (25, 120.0), "0xreal": (25, 60.0)}
     FakeVetter.prior = {"0xhot": (20, -80.0), "0xreal": (20, 45.0)}
-    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
     eng = Engine(settings=s, selector=FakeSelector(["0xhot", "0xreal"]),
                  strategy=FakeStrategy())
     assert [r.wallet for r in eng.rescore()] == ["0xreal"]
+    eng.close()
+
+
+def test_small_prior_loss_is_within_slack(monkeypatch):
+    """The 0x5cd5c8d7 case: dropped 2026-08-12 for a -$17.13 older window on
+    the same day its recent window hit its best-ever +$127.75.
+
+    The older window slides daily, so its P&L drifts on its own; a loss
+    smaller than one maximum position is that drift, not evidence.
+    """
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0x5cd5": (19, 127.75)}
+    FakeVetter.prior = {"0x5cd5": (23, -17.13)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0x5cd5"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0x5cd5"]
+    eng.close()
+
+
+def test_combined_windows_must_still_be_profitable(monkeypatch):
+    """Slack on the older window must not become a hole. A prior loss inside
+    the slack still drops the leader if the recent window can't pay for it."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (25, 10.0)}     # clears the recent floor
+    FakeVetter.prior = {"0xthin": (20, -40.0)}       # inside the -50 slack
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin"]), strategy=FakeStrategy())
+    assert eng.rescore() == []                        # 10 - 40 = -30 overall
+    eng.close()
+
+
+def test_combined_check_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (25, 10.0)}
+    FakeVetter.prior = {"0xthin": (20, -40.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0, copy_vet_require_combined=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xthin"]
+    eng.close()
+
+
+def test_oos_floor_defaults_to_one_max_position(monkeypatch):
+    """Unset, the slack tracks the size of a single bet."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xa": (25, 200.0), "0xb": (25, 200.0)}
+    FakeVetter.prior = {"0xa": (20, -60.0), "0xb": (20, -140.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 max_per_market_usd=100.0, copy_vet_oos_min_pnl_usd=None)
+    eng = Engine(settings=s, selector=FakeSelector(["0xa", "0xb"]),
+                 strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xa"]   # -60 inside, -140 past
+    eng.close()
+
+
+def test_allowlisted_leader_bypasses_vetting(monkeypatch, tmp_path):
+    """A manual pin is the override for when the automation gets it wrong, so
+    vetting must not be able to undo it — otherwise the allowlist bypasses the
+    selection filters only to lose the wallet one stage later."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    cfg = tmp_path / "leaders.yaml"
+    cfg.write_text('allowlist: ["0xpinned"]\nblocklist: []\n', encoding="utf-8")
+    monkeypatch.setattr(engine_mod, "load_leader_config",
+                        lambda *a, **kw: _load_leader_config(cfg))
+    # Numbers that would be dropped on every count: loses when copied, no
+    # track record to judge it on, and a losing older window.
+    FakeVetter.outcomes = {"0xpinned": (2, -500.0)}
+    FakeVetter.prior = {"0xpinned": (0, -900.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xpinned"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xpinned"]
     eng.close()
 
 

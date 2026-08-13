@@ -224,12 +224,28 @@ class Engine:
            a wallet that makes zero trades we would mirror sit in the lineup
            indefinitely, and let brand-new wallets in with no record at all.
         2. Recent copy P&L at or above the floor.
-        3. An OLDER, non-overlapping window that is also profitable. One
-           window cannot separate skill from a hot streak: the same 30-45 days
-           that surface a wallet are then used to score it, so the test is
-           in-sample by construction and a lucky month passes it. Requiring the
-           preceding window to hold up is the cheapest available out-of-sample
-           check.
+        3. An OLDER, non-overlapping window that does not lose more than
+           `oos_floor` (one maximum position by default). One window cannot
+           separate skill from a hot streak: the same 30-45 days that surface a
+           wallet are then used to score it, so the test is in-sample by
+           construction and a lucky month passes it. Requiring the preceding
+           window to hold up is the cheapest available out-of-sample check.
+
+           That window is judged with SLACK, not against zero. It slides
+           forward daily — dropping trades off the back, picking up newer ones
+           at the front — so its P&L wanders even when the leader has not
+           changed. Against a $0 floor that wander became a firing pin: it
+           dropped 0x5cd5c8d7 at -$17.13 on the same day its recent window hit
+           a best-ever +$127.75, and 0x06a22231 at -$4.51. Every leader the
+           rule kept sat between +$14 and +$1,570, so zero was only ever
+           clipping noise.
+        4. Both windows TOGETHER at or above the recent floor, so the slack in
+           (3) cannot let a hot streak paper over a genuinely bad history —
+           which is the entire reason for looking back.
+
+        Allowlisted wallets skip all of it: the pin exists precisely for the
+        case where this judgement was wrong, so letting vetting overturn it
+        would make the override useless.
 
         The lineup is whatever survives — `selection.top_n` is a ceiling, not a
         quota, so a day with three proven wallets follows three.
@@ -251,7 +267,23 @@ class Engine:
         rois: dict[str, float] = {}
         now = datetime.now(timezone.utc)
         recent_days = s.copy_vet_lookback_days
+        # Slack on the sliding older window, in dollars. Defaults to one
+        # maximum position: a prior window that lost less than a single bet
+        # cannot distinguish a bad leader from window drift.
+        oos_floor = (
+            -abs(s.max_per_market_usd) if s.copy_vet_oos_min_pnl_usd is None
+            else s.copy_vet_oos_min_pnl_usd
+        )
+        # Allowlisted wallets are a deliberate manual override — they already
+        # bypass the selection filters, and bypassing scoring only to be
+        # dropped by vetting made the override useless in the one case it
+        # exists for (re-adding a leader the automation got wrong).
+        allow = {w.lower() for w in load_leader_config().allowlist}
         for r in ranked:
+            if r.wallet.lower() in allow:
+                log.info("vet: %s KEPT (allowlisted — vetting bypassed)", r.wallet[:10])
+                kept.append(r)
+                continue
             try:
                 tapes = vetter.fetch_tapes([r.wallet])
 
@@ -297,10 +329,17 @@ class Engine:
                              "window — %d trades in the prior %dd)",
                              r.wallet[:10], prior["n_trades"], span)
                     continue
-                if prior["net_pnl"] < s.copy_vet_min_pnl_usd:
-                    log.info("vet: %s DROPPED (profitable recently, $%.2f, but lost "
-                             "$%.2f over the prior %dd — not out-of-sample proven)",
-                             r.wallet[:10], m["net_pnl"], prior["net_pnl"], span)
+                if prior["net_pnl"] < oos_floor:
+                    log.info("vet: %s DROPPED (recent $%.2f, but lost $%.2f over "
+                             "the prior %dd — past the $%.2f slack)",
+                             r.wallet[:10], m["net_pnl"], prior["net_pnl"],
+                             span, oos_floor)
+                    continue
+                combined = m["net_pnl"] + prior["net_pnl"]
+                if s.copy_vet_require_combined and combined < s.copy_vet_min_pnl_usd:
+                    log.info("vet: %s DROPPED (recent $%.2f + prior $%.2f = $%.2f "
+                             "across both windows — not profitable overall)",
+                             r.wallet[:10], m["net_pnl"], prior["net_pnl"], combined)
                     continue
                 log.info("vet: %s KEPT (recent $%.2f/%dt, prior $%.2f/%dt)",
                          r.wallet[:10], m["net_pnl"], m["n_trades"],

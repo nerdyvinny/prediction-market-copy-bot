@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     gamma_api_base: str = "https://gamma-api.polymarket.com"
     clob_api_base: str = "https://clob.polymarket.com"
     kalshi_api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
+    # Polymarket US (QCX LLC) public gateway — a separate CFTC-designated
+    # venue, NOT the global CLOB above. Read-only; trading there needs the
+    # authenticated api.polymarket.us host and is not wired up.
+    polymarket_us_api_base: str = "https://gateway.polymarket.us"
 
     # Poll loop. Every second of lag is edge lost to the drift guard, so poll
     # as fast as is polite to the public Data API (8 leader queries/cycle).
@@ -142,6 +146,26 @@ class Settings(BaseSettings):
     copy_vet_require_consistency: bool = True
     copy_vet_oos_lookback_days: int = 90
     copy_vet_oos_min_trades: int = 5   # lower bar: older tape is thinner
+    # The older window is a SLIDING one: every day it drops trades off the back
+    # and picks up newer ones at the front, so its P&L wanders on its own even
+    # when the leader's behaviour is unchanged. Judging it against the same $0
+    # floor as the recent window made that wander a firing pin. Two leaders were
+    # dropped on it while strongly profitable recently — 0x06a22231 (recent
+    # +$72.04, prior -$4.51) and 0x5cd5c8d7 (recent +$127.75, prior -$17.13,
+    # its best recent reading ever, after four days parked at +$14.01). Every
+    # leader the rule KEPT sat between +$14 and +$1,570, so the boundary was
+    # doing nothing but clipping noise near zero.
+    #
+    # The floor is now separate and slack by one maximum position: a prior
+    # window that lost less than a single bet is not evidence of anything.
+    # `_vet_leaders` scales it to `max_per_market_usd` when this is None.
+    copy_vet_oos_min_pnl_usd: float | None = None
+    # ...but slack on one window must not let a hot streak paper over a bad
+    # history, which is the whole point of looking back. The two windows
+    # TOGETHER still have to clear `copy_vet_min_pnl_usd`, so a leader can be
+    # mildly negative in the older window only if the recent one more than
+    # pays for it.
+    copy_vet_require_combined: bool = True
     # Vetting can no longer be bricked open, but a transient backtest error is
     # not proof of anything either — such a wallet is skipped for this rescore.
     # `_apply_rescore` already keeps the last good set if everything drops out.
