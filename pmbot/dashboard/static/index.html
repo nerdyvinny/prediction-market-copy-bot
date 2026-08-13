@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pmbot</title>
-<link rel="stylesheet" href="/static/style.css?v=6">
+<link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
 
@@ -80,12 +80,22 @@
   <section class="card">
     <div class="card-head">
       <h2>Open positions</h2>
+      <div class="sorts" id="pos-sorts">
+        <span class="sorts-label">Sort</span>
+        <button type="button" class="sort-btn" data-sort="copied">
+          Copied <span class="sort-arrow"></span>
+        </button>
+        <button type="button" class="sort-btn" data-sort="resolves">
+          Resolves <span class="sort-arrow"></span>
+        </button>
+      </div>
       <span class="sub" id="pos-sub"></span>
     </div>
     <div class="table-wrap">
       <table id="positions">
         <thead><tr>
           <th class="left">Market</th><th class="left">Side</th>
+          <th class="left">Copied</th><th class="left">Resolves</th>
           <th>Put in</th><th>Worth now</th><th>P&amp;L</th>
         </tr></thead>
         <tbody></tbody>
@@ -136,6 +146,6 @@
 
 <footer>Read-only paper ledger · no orders are placed from this page</footer>
 
-<script src="/static/app.js?v=6"></script>
+<script src="/static/app.js?v=7"></script>
 </body>
 </html>

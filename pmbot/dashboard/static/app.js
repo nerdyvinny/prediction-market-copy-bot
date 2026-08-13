@@ -532,14 +532,94 @@ function switchLeaderTab(wallet, tab) {
 
 /* ---- open positions -------------------------------------------------- */
 
+/* Two orderings over the same rows: when the bot copied the trade, and when
+   the market is due to resolve. Both open newest-first (the page's default is
+   the latest copy at the top); clicking the active one flips the direction. */
+const posSort = { key: "copied", dir: "desc" };
+
+const POS_SORT_KEYS = { copied: "opened_ts", resolves: "resolves_at" };
+
+const msOf = (iso) => {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  return Number.isNaN(t) ? null : t;
+};
+
+function sortPositions(positions) {
+  const field = POS_SORT_KEYS[posSort.key];
+  const dir = posSort.dir === "desc" ? -1 : 1;
+  return positions.slice().sort((a, b) => {
+    const x = msOf(a[field]);
+    const y = msOf(b[field]);
+    // A row with no timestamp sinks to the bottom whichever way the sort
+    // points — it isn't the oldest thing on the page, it's unknown.
+    if (x === null && y === null) return 0;
+    if (x === null) return 1;
+    if (y === null) return -1;
+    return (x - y) * dir;
+  });
+}
+
+function paintSortButtons() {
+  for (const btn of document.querySelectorAll("#pos-sorts .sort-btn")) {
+    const on = btn.dataset.sort === posSort.key;
+    btn.classList.toggle("on", on);
+    btn.querySelector(".sort-arrow").textContent = on
+      ? (posSort.dir === "desc" ? "↓" : "↑") : "";
+    btn.setAttribute("aria-pressed", String(on));
+  }
+}
+
+const POS_SORT_LABEL = {
+  "copied:desc": "newest copy first",
+  "copied:asc": "oldest copy first",
+  "resolves:desc": "latest to resolve first",
+  "resolves:asc": "soonest to resolve first",
+};
+
+/* Compact distance in time: 45m, 3h 10m, 2d 4h. */
+function fmtSpan(ms) {
+  const a = Math.abs(ms);
+  const m = Math.floor(a / 60000) % 60;
+  const h = Math.floor(a / 3600000) % 24;
+  const d = Math.floor(a / 86400000);
+  if (d) return h ? `${d}d ${h}h` : `${d}d`;
+  if (h) return m ? `${h}h ${m}m` : `${h}h`;
+  return `${Math.max(m, 1)}m`;
+}
+
+function copiedCell(iso) {
+  if (!iso) return `<span class="dim">—</span>`;
+  const ago = Date.now() - new Date(iso).getTime();
+  return `${ago < 60000 ? "just now" : `${fmtSpan(ago)} ago`}` +
+    `<span class="rowsub">${fmtTime(iso)}</span>`;
+}
+
+/* A market that is past its end date but still on our books hasn't paid out
+   yet. That is normal — Polymarket can take days to publish the outcome — so
+   the row says what's actually happening instead of counting down past zero. */
+function resolvesCell(iso) {
+  if (!iso) return `<span class="dim">unknown</span>` +
+    `<span class="rowsub">no date published</span>`;
+  const left = new Date(iso).getTime() - Date.now();
+  if (left <= 0) {
+    return `<span class="due">awaiting settlement</span>` +
+      `<span class="rowsub">ended ${fmtTime(iso)}</span>`;
+  }
+  return `in ${fmtSpan(left)}<span class="rowsub">${fmtTime(iso)}</span>`;
+}
+
 function renderPositions(positions) {
   const tb = $("#positions tbody");
-  $("#pos-sub").textContent = positions.length ? `${positions.length} open` : "";
+  paintSortButtons();
+  $("#pos-sub").textContent = positions.length
+    ? `${positions.length} open · ${POS_SORT_LABEL[`${posSort.key}:${posSort.dir}`]}`
+    : "";
   if (!positions.length) {
-    tb.innerHTML = `<tr><td colspan="5" class="left empty">No open positions.</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="7" class="left empty">No open positions.</td></tr>`;
     return;
   }
-  tb.innerHTML = positions.map((p) => {
+  tb.innerHTML = sortPositions(positions).map((p) => {
     const name = p.question ||
       `<span class="mono-id">${p.market_id.slice(0, 18)}…</span>`;
     const flag = p.anomaly ? `<span class="flag">SHORT / CHECK</span>` : "";
@@ -549,6 +629,8 @@ function renderPositions(positions) {
       <td class="left market" title="${p.question || p.market_id}">${marketLink(name, p.url)}${flag}
         <span class="rowsub">${sub}</span></td>
       <td class="left">${p.outcome}</td>
+      <td class="left when">${copiedCell(p.opened_ts)}</td>
+      <td class="left when">${resolvesCell(p.resolves_at)}</td>
       <td>${fmtUsd(p.cost_usd)}</td>
       <td>${fmtUsd(p.value_usd)}</td>
       <td class="${pnlClass(p.unrealized_usd)}">${fmtUsd(p.unrealized_usd, true)}</td>
@@ -728,6 +810,21 @@ $("#leaders tbody").addEventListener("keydown", (e) => {
   if (!row) return;
   e.preventDefault();
   toggleLeader(row.dataset.wallet);
+});
+
+/* Re-sorts from the state already in hand, so the order changes on the click
+   rather than on the next poll. */
+$("#pos-sorts").addEventListener("click", (e) => {
+  const btn = e.target.closest(".sort-btn");
+  if (!btn) return;
+  const key = btn.dataset.sort;
+  if (posSort.key === key) {
+    posSort.dir = posSort.dir === "desc" ? "asc" : "desc";
+  } else {
+    posSort.key = key;
+    posSort.dir = "desc";
+  }
+  renderPositions(lastState ? lastState.positions : []);
 });
 
 $("#cal-prev").addEventListener("click", () => shiftMonth(-1));

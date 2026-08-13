@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pmbot.config.settings import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.data.price_cache import PriceCache
-from pmbot.models import Side
+from pmbot.models import Market, Side
 from pmbot.portfolio.ledger import Ledger, apply_fill
 
 app = FastAPI(title="pmbot dashboard")
@@ -46,8 +46,13 @@ _STATIC = Path(__file__).parent / "static"
 _gamma: GammaClient | None = None
 _prices: PriceCache | None = None
 _data: PolymarketDataClient | None = None
-# condition id -> (question, polymarket URL). Both come from one Gamma lookup.
-_market_cache: dict[str, tuple[str, str | None]] = {}
+# condition id -> (question, polymarket URL, resolution time ISO or None).
+# All three come from one Gamma lookup.
+_market_cache: dict[str, tuple[str, str | None, str | None]] = {}
+# condition id -> last time we re-asked Gamma for an end date that had already
+# passed. See _resolution_iso.
+_end_recheck: dict[str, float] = {}
+END_RECHECK_TTL = 600.0
 _engine_check: tuple[float, bool] = (0.0, False)
 # wallet -> (fetched_at, raw positions). Leader books move on trades, not ticks,
 # so a short TTL keeps a click-happy user off the public API's rate limit.
@@ -106,19 +111,70 @@ def _market_url(slug: object, event_slug: object) -> str | None:
     return None
 
 
-def _market_meta(market_id: str) -> tuple[str, str | None]:
-    """(question, polymarket URL) for a condition id, cached for the process."""
+def _market_row(market_id: str) -> tuple[str, str | None, str | None]:
+    """(question, URL, resolution ISO) for a condition id, cached for the process."""
     if market_id not in _market_cache:
         try:
             m = _get_gamma().get_market(market_id)
         except Exception:
-            return ("", None)  # transient API failure: retry next poll, don't cache
+            return ("", None, None)  # transient API failure: retry next poll, don't cache
         if m is None:
             # Not found *right now* is not an answer either — caching the blank
             # would leave the row unlabelled for the life of the process.
-            return ("", None)
-        _market_cache[market_id] = (m.question, _market_url(m.slug, m.event_slug))
+            return ("", None, None)
+        _market_cache[market_id] = _row_of(m)
     return _market_cache[market_id]
+
+
+def _row_of(m: Market) -> tuple[str, str | None, str | None]:
+    return (
+        m.question,
+        _market_url(m.slug, m.event_slug),
+        m.end_date.isoformat() if m.end_date else None,
+    )
+
+
+def _market_meta(market_id: str) -> tuple[str, str | None]:
+    """(question, polymarket URL) for a condition id."""
+    return _market_row(market_id)[:2]
+
+
+def _resolution_iso(market_id: str) -> str | None:
+    """When this market is scheduled to resolve, or None if Gamma has no date.
+
+    The date is cached with the rest of the market like everything else here,
+    with one exception: once it is in the *past* it gets re-asked on a slow
+    timer. A postponed game moves its endDate, and a dashboard that runs for
+    days would otherwise print the original kickoff forever. A market that has
+    simply not settled yet re-reads the same past date, which is what the row
+    should say: Polymarket can report a market closed for days before it
+    publishes the outcome, and that wait is normal, not a stuck position.
+    """
+    end = _market_row(market_id)[2]
+    when = _parse_iso(end) if end else None
+    if when is None or when > datetime.now(timezone.utc):
+        return end
+    if time.time() - _end_recheck.get(market_id, 0.0) < END_RECHECK_TTL:
+        return end
+    _end_recheck[market_id] = time.time()
+    try:
+        m = _get_gamma().get_market(market_id)
+    except Exception:
+        return end  # keep the stale date rather than blanking the column
+    if m is not None:
+        # Replace wholesale: a failed refresh must never cost the row its
+        # question or its link.
+        _market_cache[market_id] = _row_of(m)
+        return _market_cache[market_id][2]
+    return end
+
+
+def _parse_iso(s: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _engine_running() -> bool:
@@ -379,6 +435,14 @@ def state() -> dict:
     trades_out = _group_trades(all_fills, open_pos, mids)
     leaders_out = _leaders(leaders_raw, leader_exposure, trades_out)
 
+    # When we took each position: the first BUY on that token, not the last
+    # fill — an add-on later doesn't make it a newer trade. all_fills is
+    # oldest-first, so the first BUY seen wins.
+    opened: dict[str, str] = {}
+    for f in all_fills:
+        if f["side"] == "BUY":
+            opened.setdefault(f["token_id"], f["ts"])
+
     pos_out = []
     for p in positions:
         mid = mids.get(p.token_id)
@@ -387,6 +451,7 @@ def state() -> dict:
         question, url = _market_meta(p.market_id)
         pos_out.append({
             "market_id": p.market_id,
+            "token_id": p.token_id,
             "question": question,
             "url": url,
             "outcome": p.outcome,
@@ -398,8 +463,12 @@ def state() -> dict:
             "value_usd": round(value, 2) if value is not None else None,
             "unrealized_usd": round(value - cost, 2) if value is not None else None,
             "anomaly": p.shares < 0,
+            "opened_ts": opened.get(p.token_id),
+            "resolves_at": _resolution_iso(p.market_id),
         })
-    pos_out.sort(key=lambda p: abs(p["cost_usd"]), reverse=True)
+    # Newest copy first. The page can re-sort by resolution time, but this is
+    # the order it opens in, so it has to be right server-side too.
+    pos_out.sort(key=lambda p: p["opened_ts"] or "", reverse=True)
 
     fills_out = []
     for f in reversed(all_fills):

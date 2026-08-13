@@ -361,6 +361,31 @@ main {
 
 .card-head .sub { font-size: 13px; color: var(--ink-3); }
 
+/* Sort toggles (open positions): same pill as the leader tabs, so a control
+   that reorders a table looks like the other control that swaps one. */
+.sorts { display: flex; align-items: center; gap: 6px; margin-right: auto; }
+
+.sorts-label { font-size: 12px; color: var(--ink-3); }
+
+.sort-btn {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: none;
+  border: 1px solid var(--hairline);
+  border-radius: 980px;
+  padding: 3px 12px;
+  cursor: pointer;
+}
+.sort-btn:hover { color: var(--ink); }
+.sort-btn.on {
+  color: var(--chip-open-ink);
+  background: var(--chip-open-bg);
+  border-color: transparent;
+  font-weight: 500;
+}
+.sort-arrow { font-size: 11px; }
+
 /* ---- tables ---------------------------------------------------------- */
 
 .table-wrap { overflow-x: auto; }
@@ -409,6 +434,15 @@ td.market {
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
 .dim { color: var(--ink-3); }
+
+/* Seven columns is wider than the five this table used to hold, so the market
+   name gives up the room the two time columns need. */
+#positions td.market { max-width: 230px; }
+
+.when { font-size: 13px; color: var(--ink-2); }
+
+/* Past its end date, still on our books: waiting on Polymarket, not stuck. */
+.due { color: var(--ink); font-weight: 500; }
 
 td.nowrap { white-space: nowrap; }
 

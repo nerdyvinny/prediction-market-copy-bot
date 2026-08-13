@@ -20,9 +20,10 @@ LEADER = "0xlead"
 MKT = "mktA"
 
 
-def _fill(led, *, token, side, price, shares, uid, ts, leader=LEADER, fee=0.01):
+def _fill(led, *, token, side, price, shares, uid, ts, leader=LEADER, fee=0.01,
+          market=MKT):
     sig = Signal(
-        market_id=MKT, token_id=token, outcome="Yes", side=side,
+        market_id=market, token_id=token, outcome="Yes", side=side,
         target_price=price, size_usd=shares * price, reason="test",
         source_leader=leader, source_uid=uid,
     )
@@ -165,6 +166,155 @@ def test_market_lookup_failure_is_not_cached(monkeypatch):
     dash._market_cache.clear()
     assert dash._market_meta("0xdead") == ("", None)
     assert "0xdead" not in dash._market_cache
+
+
+# --- open positions: when it was copied, when it resolves -------------------
+
+def _state(tmp_path, monkeypatch, fills, *, markets=None, mid=0.5):
+    """/api/state over a throwaway ledger, with Gamma and quotes faked out.
+
+    `markets` maps condition id -> Market; anything missing gets a bare one so
+    a row still renders.
+    """
+    from fastapi.testclient import TestClient
+
+    from pmbot.models import Market
+
+    db = str(tmp_path / "t.db")
+    led = Ledger(db)
+    for f in fills:
+        _fill(led, **f)
+    led.close()
+    monkeypatch.setattr(dash.get_settings(), "db_path", db)
+
+    class FakeGamma:
+        def get_market(self, condition_id):
+            return (markets or {}).get(
+                condition_id, Market(market_id=condition_id, question=condition_id))
+
+    monkeypatch.setattr(dash, "_get_gamma", lambda: FakeGamma())
+    monkeypatch.setattr(dash, "_mid_for", lambda token_id, venue: mid)
+    dash._market_cache.clear()
+    dash._end_recheck.clear()
+    return TestClient(dash.app).get("/api/state").json()
+
+
+def test_positions_are_ordered_newest_copy_first(tmp_path, monkeypatch):
+    """The card opens on the order the user asked for: latest trade on top."""
+    t0 = datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+    body = _state(tmp_path, monkeypatch, [
+        dict(token="old", side=Side.BUY, price=0.40, shares=100, uid="1", ts=t0,
+             market="mkt-old"),
+        dict(token="new", side=Side.BUY, price=0.40, shares=10, uid="2",
+             ts=t0 + timedelta(hours=5), market="mkt-new"),
+        dict(token="mid", side=Side.BUY, price=0.40, shares=50, uid="3",
+             ts=t0 + timedelta(hours=2), market="mkt-mid"),
+    ])
+    assert [p["token_id"] for p in body["positions"]] == ["new", "mid", "old"]
+    # Biggest position last: the old order (by size) would have put it first.
+    assert body["positions"][-1]["cost_usd"] == 40.0
+
+
+def test_open_time_is_the_first_buy_not_a_later_add(tmp_path, monkeypatch):
+    """Adding to a position doesn't make it a newer trade."""
+    t0 = datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+    body = _state(tmp_path, monkeypatch, [
+        dict(token="a", side=Side.BUY, price=0.40, shares=50, uid="1", ts=t0),
+        dict(token="a", side=Side.BUY, price=0.50, shares=50, uid="2",
+             ts=t0 + timedelta(hours=3)),
+    ])
+    assert body["positions"][0]["opened_ts"] == t0.isoformat()
+
+
+def test_positions_carry_the_resolution_time(tmp_path, monkeypatch):
+    from pmbot.models import Market
+
+    t0 = datetime.now(timezone.utc) - timedelta(hours=1)
+    ends = datetime.now(timezone.utc) + timedelta(hours=6)
+    body = _state(
+        tmp_path, monkeypatch,
+        [dict(token="a", side=Side.BUY, price=0.40, shares=50, uid="1", ts=t0)],
+        markets={MKT: Market(market_id=MKT, question="Will it?", end_date=ends)},
+    )
+    assert body["positions"][0]["resolves_at"] == ends.isoformat()
+
+
+def test_a_market_with_no_end_date_says_so(tmp_path, monkeypatch):
+    """No date is null, not a guess — the column prints 'unknown'."""
+    t0 = datetime.now(timezone.utc) - timedelta(hours=1)
+    body = _state(
+        tmp_path, monkeypatch,
+        [dict(token="a", side=Side.BUY, price=0.40, shares=50, uid="1", ts=t0)],
+    )
+    assert body["positions"][0]["resolves_at"] is None
+
+
+def test_a_past_resolution_time_is_rechecked_once(monkeypatch):
+    """A postponed game moves its endDate; a long-lived cache would miss it."""
+    from pmbot.models import Market
+
+    past = datetime.now(timezone.utc) - timedelta(hours=2)
+    moved = datetime.now(timezone.utc) + timedelta(hours=3)
+    calls = {"n": 0}
+
+    class FakeGamma:
+        def get_market(self, condition_id):
+            calls["n"] += 1
+            return Market(market_id=condition_id, question="Q",
+                          end_date=past if calls["n"] == 1 else moved)
+
+    monkeypatch.setattr(dash, "_get_gamma", lambda: FakeGamma())
+    dash._market_cache.clear()
+    dash._end_recheck.clear()
+
+    assert dash._resolution_iso(MKT) == moved.isoformat()
+    assert calls["n"] == 2  # first load, then the past-due re-ask
+    # Now that it's in the future again there's nothing to re-check.
+    assert dash._resolution_iso(MKT) == moved.isoformat()
+    assert calls["n"] == 2
+
+
+def test_a_market_still_awaiting_settlement_is_not_re_asked_every_poll(monkeypatch):
+    """Settlement lag is normal; it must not turn into a Gamma call per poll."""
+    from pmbot.models import Market
+
+    past = datetime.now(timezone.utc) - timedelta(days=2)
+    calls = {"n": 0}
+
+    class FakeGamma:
+        def get_market(self, condition_id):
+            calls["n"] += 1
+            return Market(market_id=condition_id, question="Q", end_date=past)
+
+    monkeypatch.setattr(dash, "_get_gamma", lambda: FakeGamma())
+    dash._market_cache.clear()
+    dash._end_recheck.clear()
+
+    assert dash._resolution_iso(MKT) == past.isoformat()
+    assert calls["n"] == 2
+    for _ in range(5):
+        assert dash._resolution_iso(MKT) == past.isoformat()
+    assert calls["n"] == 2  # throttled by END_RECHECK_TTL
+
+
+def test_a_failed_recheck_keeps_the_row_intact(monkeypatch):
+    """A dead re-ask must not cost the row its question, its link, or its date."""
+    calls = {"n": 0}
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+
+    class DeadGamma:
+        def get_market(self, condition_id):
+            calls["n"] += 1
+            raise RuntimeError("gamma down")
+
+    monkeypatch.setattr(dash, "_get_gamma", lambda: DeadGamma())
+    dash._market_cache.clear()
+    dash._end_recheck.clear()
+    dash._market_cache[MKT] = ("Will it?", "https://polymarket.com/market/x", past)
+
+    assert dash._resolution_iso(MKT) == past
+    assert calls["n"] == 1
+    assert dash._market_meta(MKT) == ("Will it?", "https://polymarket.com/market/x")
 
 
 # --- per-trade prices ------------------------------------------------------
