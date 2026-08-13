@@ -271,7 +271,7 @@ class Engine:
         # maximum position: a prior window that lost less than a single bet
         # cannot distinguish a bad leader from window drift.
         oos_floor = (
-            -abs(s.max_per_market_usd) if s.copy_vet_oos_min_pnl_usd is None
+            -abs(s.per_market_cap_usd) if s.copy_vet_oos_min_pnl_usd is None
             else s.copy_vet_oos_min_pnl_usd
         )
         # Allowlisted wallets are a deliberate manual override — they already

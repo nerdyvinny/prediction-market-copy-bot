@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     bankroll_usd: float = 500.0
     copy_fraction: float = 0.10            # replicate this fraction of leader size
     max_per_market_usd: float = 100.0      # hard cap per market
+    # Per-market cap as a FRACTION of bankroll. When set it replaces
+    # `max_per_market_usd` outright (see `per_market_cap_usd`), so the cap
+    # scales with the account instead of drifting out of proportion whenever
+    # the bankroll changes. Live since 2026-08-13 at 0.03 -> $15 on $500,
+    # down from the flat $50: with $439 of $500 deployed across 11 positions,
+    # a single copy was risking 10% of the book. Default None so every sweep
+    # script that passes an explicit dollar cap is unaffected.
+    max_per_market_pct: float | None = None
     max_per_leader_usd: float = 400.0      # hard cap of exposure per leader
     # Redeploy realized profits: free bankroll is bankroll + realized P&L -
     # deployed, instead of a fixed starting amount. Off by default: in
@@ -211,6 +219,19 @@ class Settings(BaseSettings):
     clob_api_key: str | None = None
     clob_api_secret: str | None = None
     clob_api_passphrase: str | None = None
+
+    @property
+    def per_market_cap_usd(self) -> float:
+        """The per-market cap actually in force, in dollars.
+
+        `max_per_market_pct` wins when set; otherwise the fixed dollar cap.
+        Anything that ENFORCES or REPORTS the per-market cap must read this
+        rather than `max_per_market_usd` — reading the raw field silently
+        ignores a percentage cap and sizes off a number nothing applies.
+        """
+        if self.max_per_market_pct is not None:
+            return self.bankroll_usd * self.max_per_market_pct
+        return self.max_per_market_usd
 
 
 @lru_cache

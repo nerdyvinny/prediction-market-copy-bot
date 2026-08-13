@@ -177,6 +177,42 @@ def test_risk_size_respects_market_cap():
     led.close()
 
 
+def test_pct_cap_replaces_dollar_cap():
+    # 3% of a $500 bankroll = $15, and it wins over the $50 dollar cap.
+    s = _settings(max_per_market_pct=0.03)
+    assert s.per_market_cap_usd == pytest.approx(15.0)
+    led = Ledger(":memory:")
+    rm = RiskManager(led, s, min_ticket_usd=1.0)
+    # 1000 * 0.05 = 50 desired, but the pct cap clamps it to 15.
+    sized = rm.size(_sig(1000))
+    assert sized is not None and sized.size_usd == pytest.approx(15.0)
+    led.close()
+
+
+def test_pct_cap_absent_leaves_dollar_cap_in_force():
+    # Every sweep script passes an explicit dollar cap and must be unaffected.
+    s = _settings()
+    assert s.max_per_market_pct is None
+    assert s.per_market_cap_usd == pytest.approx(50.0)
+
+
+def test_pct_cap_scales_with_bankroll():
+    assert _settings(bankroll_usd=1000.0,
+                     max_per_market_pct=0.03).per_market_cap_usd == pytest.approx(30.0)
+
+
+def test_pct_cap_accumulates_across_copies_in_one_market():
+    # Two copies in the same market share the 3% budget, not one each.
+    led = Ledger(":memory:")
+    s = _sig(50)
+    led.record_fill(Fill(signal=s, fill_price=0.50, size_usd=10, shares=20,
+                         timestamp=NOW, mode="paper"))
+    rm = RiskManager(led, _settings(max_per_market_pct=0.03), min_ticket_usd=1.0)
+    sized = rm.size(_sig(1000))            # $15 cap, $10 already used -> $5 left
+    assert sized is not None and sized.size_usd == pytest.approx(5.0)
+    led.close()
+
+
 def test_risk_size_rejects_dust():
     led = Ledger(":memory:")
     rm = RiskManager(led, _settings(), min_ticket_usd=1.0)

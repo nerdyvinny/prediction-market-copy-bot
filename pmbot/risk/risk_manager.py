@@ -36,7 +36,9 @@ class RiskManager:
         self.ledger = ledger
         self.bankroll = s.bankroll_usd
         self.copy_fraction = s.copy_fraction
-        self.max_per_market = s.max_per_market_usd
+        # Resolved cap, not the raw dollar field: a percentage cap
+        # (max_per_market_pct) replaces it and is what actually binds.
+        self.max_per_market = s.per_market_cap_usd
         self.max_per_leader = s.max_per_leader_usd
         self.compound = s.compound_profits
         self.min_ticket_usd = s.min_ticket_usd if min_ticket_usd is None else min_ticket_usd
