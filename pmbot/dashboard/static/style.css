@@ -217,7 +217,64 @@ main {
 
 .cal-cell .narrow { display: none; }
 
+.cal-cell.has { cursor: pointer; }
+.cal-cell.has:hover { border-color: var(--ink-3); }
+.cal-cell.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
 .cal-foot { font-size: 12px; color: var(--ink-3); margin-top: 10px; }
+
+/* ---- one day's trades --------------------------------------------------- */
+
+.day-panel {
+  margin-top: 14px;
+  padding: 12px 14px 4px;
+  background: var(--bg);
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+}
+
+.day-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.day-title { font-size: 15px; font-weight: 600; margin-right: 8px; }
+
+.day-sub { font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+.day-close {
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--ink-3);
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 4px 7px;
+  cursor: pointer;
+  flex: none;
+}
+.day-close:hover { background: var(--chip-closed-bg); color: var(--ink); }
+
+.day-sec {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 14px 0 2px;
+}
+
+.day-secsub {
+  margin-left: 8px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
 
 @media (max-width: 560px) {
   .cal-dow, .cal-grid { gap: 3px; }
@@ -246,6 +303,31 @@ main {
 .lp-note { font-size: 13px; color: var(--ink-2); padding: 6px 2px; }
 
 .lp-table td { padding: 8px 10px; }
+
+/* Their tape vs. what they're holding — two views of the same leader. */
+.lp-tabs { display: flex; gap: 6px; padding: 6px 0 2px; }
+
+.lp-tab {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: none;
+  border: 1px solid var(--hairline);
+  border-radius: 980px;
+  padding: 3px 12px;
+  cursor: pointer;
+}
+.lp-tab:hover { color: var(--ink); }
+.lp-tab.on {
+  color: var(--chip-open-ink);
+  background: var(--chip-open-bg);
+  border-color: transparent;
+  font-weight: 500;
+}
+
+/* A leader's tape is long by design: scroll it instead of pushing the rest of
+   the page down a screen and a half. */
+.lp-scroll { max-height: 420px; overflow-y: auto; }
 
 /* The whole point of this panel is spotting what the bot took vs. skipped, so
    copied rows get a tint + rail, and the skipped ones recede. */
@@ -326,6 +408,9 @@ td.market {
 
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
+.dim { color: var(--ink-3); }
+
+td.nowrap { white-space: nowrap; }
 
 .side-buy  { color: var(--pos); font-weight: 600; }
 .side-sell { color: var(--neg); font-weight: 600; }

@@ -167,6 +167,108 @@ def test_market_lookup_failure_is_not_cached(monkeypatch):
     assert "0xdead" not in dash._market_cache
 
 
+# --- per-trade prices ------------------------------------------------------
+
+def _grouped(led, mids=None):
+    """The trade rows /api/state builds, without the Gamma round trip."""
+    fills = _read_fills(led)
+    positions = {p.token_id: p for p in led.get_positions()}
+    return {t["token_id"]: t
+            for t in dash._group_trades(fills, positions, mids or {})}
+
+
+def test_trade_rows_carry_entry_exit_and_live_price(ledger, monkeypatch):
+    """A day cell shows what a trade went in at and where it stands now."""
+    monkeypatch.setattr(dash, "_market_meta", lambda mid: ("Q", None))
+    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    # Held: two buys at different prices, still open, quoted at 0.70.
+    _fill(ledger, token="held", side=Side.BUY, price=0.40, shares=50, uid="1", ts=t0,
+          fee=0.0)
+    _fill(ledger, token="held", side=Side.BUY, price=0.60, shares=50, uid="2",
+          ts=t0 + timedelta(hours=1), fee=0.0)
+    # Sold out at 0.90.
+    _fill(ledger, token="gone", side=Side.BUY, price=0.50, shares=20, uid="3", ts=t0,
+          fee=0.0)
+    _fill(ledger, token="gone", side=Side.SELL, price=0.90, shares=20, uid="4",
+          ts=t0 + timedelta(hours=2), fee=0.0)
+
+    rows = _grouped(ledger, mids={"held": 0.70})
+    held, gone = rows["held"], rows["gone"]
+    assert held["entry_price"] == pytest.approx(0.50)   # 50@0.40 + 50@0.60
+    assert held["cur_price"] == pytest.approx(0.70)
+    assert held["exit_price"] is None
+    assert gone["status"] == "closed"
+    assert gone["exit_price"] == pytest.approx(0.90)
+    assert gone["cur_price"] is None                    # closed: no live mark
+
+
+# --- per-leader scorecard --------------------------------------------------
+
+def test_leader_stats_split_wins_losses_and_pnl(ledger, monkeypatch):
+    """The leader row grades each leader on the copies we took off them."""
+    monkeypatch.setattr(dash, "_market_meta", lambda mid: ("Q", None))
+    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    # LEADER: one winner (+$10), one loser (−$5), one open (+$5 at the mid).
+    _fill(ledger, token="w", side=Side.BUY, price=0.40, shares=50, uid="1", ts=t0,
+          fee=0.0)
+    _fill(ledger, token="w", side=Side.SELL, price=0.60, shares=50, uid="2",
+          ts=t0 + timedelta(hours=1), fee=0.0)
+    _fill(ledger, token="l", side=Side.BUY, price=0.50, shares=50, uid="3", ts=t0,
+          fee=0.0)
+    _fill(ledger, token="l", side=Side.SELL, price=0.40, shares=50, uid="4",
+          ts=t0 + timedelta(hours=1), fee=0.0)
+    _fill(ledger, token="o", side=Side.BUY, price=0.50, shares=50, uid="5", ts=t0,
+          fee=0.0)
+    # A different leader's copy must not land in LEADER's column.
+    _fill(ledger, token="x", side=Side.BUY, price=0.50, shares=10, uid="6", ts=t0,
+          leader="0xOTHER", fee=0.0)
+
+    trades = list(_grouped(ledger, mids={"o": 0.60, "x": 0.50}).values())
+    stats = dash._leader_stats(trades)
+
+    s = stats[LEADER]
+    assert (s["copied_trades"], s["closed_trades"], s["open_trades"]) == (3, 2, 1)
+    assert (s["wins"], s["losses"]) == (1, 1)
+    assert s["win_rate"] == pytest.approx(0.5)
+    assert s["closed_pnl_usd"] == pytest.approx(5.0)   # +10 − 5
+    assert s["open_pnl_usd"] == pytest.approx(5.0)     # 50 shares, 0.50 → 0.60
+    assert s["net_usd"] == pytest.approx(10.0)
+    assert "0xother" in stats                          # matched case-insensitively
+    assert stats["0xother"]["win_rate"] is None        # nothing closed yet
+
+
+def test_leader_row_reports_its_own_copies(tmp_path, monkeypatch):
+    """End-to-end: the row's numbers come from the same trades the tables show."""
+    from fastapi.testclient import TestClient
+
+    from pmbot.models import Market
+
+    db = str(tmp_path / "t.db")
+    led = Ledger(db)
+    led.set_followed_leaders({LEADER: 0.9})
+    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    _fill(led, token="w", side=Side.BUY, price=0.40, shares=50, uid="1", ts=t0, fee=0.0)
+    _fill(led, token="w", side=Side.SELL, price=0.60, shares=50, uid="2",
+          ts=t0 + timedelta(hours=1), fee=0.0)
+    led.close()
+    monkeypatch.setattr(dash.get_settings(), "db_path", db)
+
+    class FakeGamma:
+        def get_market(self, condition_id):
+            return Market(market_id=condition_id, question="Will it?",
+                          slug="will-it", event_slug="the-event")
+
+    monkeypatch.setattr(dash, "_get_gamma", lambda: FakeGamma())
+    monkeypatch.setattr(dash, "_mid_for", lambda token_id, venue: 0.5)
+    dash._market_cache.clear()
+
+    row = TestClient(dash.app).get("/api/state").json()["leaders"][0]
+    assert row["copied_trades"] == 1
+    assert row["closed_trades"] == 1 and row["wins"] == 1
+    assert row["win_rate"] == 1.0
+    assert row["net_usd"] == pytest.approx(10.0)
+
+
 # --- leader drill-down -----------------------------------------------------
 
 def test_our_book_tags_the_leader_we_copied_from(ledger):
@@ -243,6 +345,58 @@ def test_leader_positions_marks_copies_and_rejects_strangers(tmp_path, monkeypat
     assert body["total_value_usd"] == pytest.approx(92.0)
     # Biggest position first, so the panel leads with what matters.
     assert [p["token_id"] for p in body["positions"]] == ["held", "exited", "skipped"]
+
+
+def test_leader_trades_come_back_newest_first_and_tagged(tmp_path, monkeypatch):
+    """The tape is the point of this panel: it must be in time order."""
+    from fastapi.testclient import TestClient
+
+    db = str(tmp_path / "t.db")
+    led = Ledger(db)
+    led.set_followed_leaders({LEADER: 0.9})
+    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    _fill(led, token="held", side=Side.BUY, price=0.40, shares=100, uid="1", ts=t0)
+    _fill(led, token="theirs", side=Side.BUY, price=0.50, shares=10, uid="2", ts=t0,
+          leader="0xother")
+    led.close()
+    monkeypatch.setattr(dash.get_settings(), "db_path", db)
+
+    class FakeData:
+        def get_raw_trades(self, *, user=None, market=None, limit=100, offset=0):
+            # Deliberately shuffled — the API's order is not the panel's order.
+            return [
+                {"asset": "theirs", "conditionId": MKT, "title": "Middle one",
+                 "outcome": "Yes", "side": "BUY", "size": 10, "price": 0.5,
+                 "timestamp": 1_780_000_500},
+                {"asset": "never", "conditionId": MKT, "title": "Newest one",
+                 "slug": "newest", "eventSlug": "evt",
+                 "outcome": "No", "side": "SELL", "size": 4, "price": 0.25,
+                 "timestamp": 1_780_000_900},
+                {"asset": "held", "conditionId": MKT, "title": "Oldest one",
+                 "outcome": "Yes", "side": "BUY", "size": 100, "price": 0.4,
+                 "timestamp": 1_780_000_100},
+            ]
+
+    monkeypatch.setattr(dash, "_get_data", lambda: FakeData())
+    dash._leader_trade_cache.clear()
+
+    client = TestClient(dash.app)
+    assert client.get("/api/leader/0xstranger/trades").status_code == 404
+
+    body = client.get(f"/api/leader/{LEADER}/trades").json()
+    assert [t["title"] for t in body["trades"]] == [
+        "Newest one", "Middle one", "Oldest one"]
+    by_token = {t["token_id"]: t for t in body["trades"]}
+    assert by_token["held"]["copied_from_this_leader"] is True
+    assert by_token["held"]["our_status"] == "open"
+    # Same market via another leader: copied, but not credited to this one.
+    assert by_token["theirs"]["copied"] is True
+    assert by_token["theirs"]["copied_from_this_leader"] is False
+    assert by_token["never"]["copied"] is False
+    assert by_token["never"]["our_status"] is None
+    assert by_token["never"]["url"] == "https://polymarket.com/event/evt/newest"
+    assert by_token["never"]["usd_size"] == pytest.approx(1.0)
+    assert body["copied_count"] == 2
 
 
 def test_leader_positions_serves_stale_book_when_api_falls_over(tmp_path, monkeypatch):

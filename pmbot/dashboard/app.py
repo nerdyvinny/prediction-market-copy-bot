@@ -53,6 +53,10 @@ _engine_check: tuple[float, bool] = (0.0, False)
 # so a short TTL keeps a click-happy user off the public API's rate limit.
 _leader_pos_cache: dict[str, tuple[float, list[dict]]] = {}
 LEADER_POS_TTL = 30.0
+# wallet -> (fetched_at, raw trades), same bargain as the book above.
+_leader_trade_cache: dict[str, tuple[float, list[dict]]] = {}
+LEADER_TRADE_TTL = 30.0
+LEADER_TRADE_LIMIT = 100
 
 
 def _get_gamma() -> GammaClient:
@@ -170,13 +174,17 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
             "invested_usd": 0.0,
             "returned_usd": 0.0,
             "fees_usd": 0.0,
+            "bought_shares": 0.0,
+            "sold_shares": 0.0,
             "first_ts": f["ts"],
             "last_ts": f["ts"],
         })
         if f["side"] == "BUY":
             t["invested_usd"] += f["size_usd"]
+            t["bought_shares"] += abs(f["shares"])
         else:
             t["returned_usd"] += f["size_usd"]
+            t["sold_shares"] += abs(f["shares"])
         t["fees_usd"] += f["fee_usd"] or 0.0
         if t["leader"] is None and f["source_leader"]:
             t["leader"] = f["source_leader"]
@@ -195,6 +203,11 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
         else:
             net = t["returned_usd"] - t["invested_usd"] - t["fees_usd"]
         question, url = _market_meta(t["market_id"])
+        # Average prices, so a day cell can show what a trade went in at against
+        # where it stands now. A closed trade's "now" is the price it left at —
+        # a settlement pays 1.00 or 0.00, which is the honest last mark.
+        entry = (t["invested_usd"] / t["bought_shares"]) if t["bought_shares"] else None
+        exit_ = (t["returned_usd"] / t["sold_shares"]) if t["sold_shares"] else None
         out.append({
             **t,
             "question": question,
@@ -202,6 +215,9 @@ def _group_trades(fills: list[dict], open_pos: dict, mids: dict) -> list[dict]:
             "status": "open" if is_open else "closed",
             "open_value_usd": round(open_value, 2) if open_value is not None else None,
             "net_usd": round(net, 2) if net is not None else None,
+            "entry_price": round(entry, 4) if entry is not None else None,
+            "exit_price": round(exit_, 4) if exit_ is not None else None,
+            "cur_price": round(mid, 4) if mid is not None else None,
         })
     out.sort(key=lambda t: t["last_ts"], reverse=True)
     return out
@@ -252,27 +268,86 @@ def _win_stats(trades: list[dict]) -> dict:
 POLYMARKET_PROFILE = "https://polymarket.com/profile/{}"
 
 
-def _leaders(followed: list[dict], exposure: dict, fills: list[dict]) -> list[dict]:
+def _leader_stats(trades: list[dict]) -> dict[str, dict]:
+    """How the trades we copied from each leader have actually done.
+
+    Keyed by lowercased wallet — `source_leader` carries whatever case the Data
+    API handed us, and the follow list is written by a different path. Win rate
+    is closed trades only, on the same 0.5c dead band as the hero tile, so a
+    leader's rate can't wobble with every quote. `open_pnl_usd` is mark-to-
+    market on what's still open, so the two columns add to the total.
+
+    A trade the engine attributes to no leader (a manual or settled-only token)
+    belongs to nobody and is left out rather than smeared across the lineup.
+    """
+    stats: dict[str, dict] = {}
+    for t in trades:
+        w = (t.get("leader") or "").lower()
+        if not w:
+            continue
+        s = stats.setdefault(w, {
+            "copied_trades": 0, "open_trades": 0, "closed_trades": 0,
+            "wins": 0, "losses": 0, "flat": 0, "win_rate": None,
+            "invested_usd": 0.0, "closed_pnl_usd": 0.0, "open_pnl_usd": 0.0,
+            "net_usd": 0.0, "unpriced": 0,
+        })
+        s["copied_trades"] += 1
+        s["invested_usd"] += t["invested_usd"]
+        net = t["net_usd"]
+        if t["status"] == "closed":
+            s["closed_trades"] += 1
+            s["closed_pnl_usd"] += net or 0.0
+            if (net or 0.0) > 0.005:
+                s["wins"] += 1
+            elif (net or 0.0) < -0.005:
+                s["losses"] += 1
+            else:
+                s["flat"] += 1
+        else:
+            s["open_trades"] += 1
+            if net is None:
+                s["unpriced"] += 1  # no quote: counted, but not in the P&L
+            else:
+                s["open_pnl_usd"] += net
+
+    for s in stats.values():
+        s["net_usd"] = round(s["closed_pnl_usd"] + s["open_pnl_usd"], 2)
+        s["closed_pnl_usd"] = round(s["closed_pnl_usd"], 2)
+        s["open_pnl_usd"] = round(s["open_pnl_usd"], 2)
+        s["invested_usd"] = round(s["invested_usd"], 2)
+        s["win_rate"] = (round(s["wins"] / s["closed_trades"], 4)
+                         if s["closed_trades"] else None)
+    return stats
+
+
+def _leaders(followed: list[dict], exposure: dict, trades: list[dict]) -> list[dict]:
     """Who we're following, enriched for the dashboard.
 
     `followed` is the persisted follow list (wallet + score + when). We fold in
-    live open exposure per leader and how many trades we've copied from each,
+    live open exposure per leader plus how the copies off each one have done,
     and hand back a Polymarket profile URL so the row can be clicked through.
     """
-    copied: dict[str, int] = {}
-    for f in fills:
-        w = f["source_leader"]
-        if w and f["side"] == "BUY":
-            copied[w] = copied.get(w, 0) + 1
+    stats = _leader_stats(trades)
     out = []
     for row in followed:
         w = row["wallet"]
+        s = stats.get(w.lower(), {})
         out.append({
             "wallet": w,
             "score": round(float(row["score"]), 3),
             "followed_at": row["followed_at"],
             "exposure_usd": round(exposure.get(w, 0.0), 2),
-            "copied_trades": copied.get(w, 0),
+            "copied_trades": s.get("copied_trades", 0),
+            "open_trades": s.get("open_trades", 0),
+            "closed_trades": s.get("closed_trades", 0),
+            "wins": s.get("wins", 0),
+            "losses": s.get("losses", 0),
+            "flat": s.get("flat", 0),
+            "win_rate": s.get("win_rate"),
+            "invested_usd": s.get("invested_usd", 0.0),
+            "closed_pnl_usd": s.get("closed_pnl_usd", 0.0),
+            "open_pnl_usd": s.get("open_pnl_usd", 0.0),
+            "net_usd": s.get("net_usd", 0.0),
             "profile_url": POLYMARKET_PROFILE.format(w),
         })
     return out
@@ -299,7 +374,10 @@ def state() -> dict:
     _annotate_realized(all_fills)  # oldest-first order matters: this replays the tape
     open_pos = {p.token_id: p for p in positions}
     mids = {p.token_id: _mid_for(p.token_id, p.venue) for p in positions}
-    leaders_out = _leaders(leaders_raw, leader_exposure, all_fills)
+    # Leader stats are a roll-up of the same trade rows the tables show, so the
+    # per-leader P&L can't disagree with the "Copied trades" card.
+    trades_out = _group_trades(all_fills, open_pos, mids)
+    leaders_out = _leaders(leaders_raw, leader_exposure, trades_out)
 
     pos_out = []
     for p in positions:
@@ -331,7 +409,6 @@ def state() -> dict:
     unrealized = sum(
         p["unrealized_usd"] for p in pos_out if p["unrealized_usd"] is not None
     )
-    trades_out = _group_trades(all_fills, open_pos, mids)
     return {
         "now": datetime.now(timezone.utc).isoformat(),
         "engine_running": _engine_running(),
@@ -372,15 +449,13 @@ def _our_book_by_token(fills: list[dict], leader: str) -> dict[str, dict]:
     return book
 
 
-@app.get("/api/leader/{wallet}/positions")
-def leader_positions(wallet: str) -> dict:
-    """A followed leader's live Polymarket book, flagged with what we copied.
+def _our_side_of(key: str) -> tuple[dict[str, dict], dict[str, float]]:
+    """(our book by token, open cost by token) for a followed leader.
 
     Restricted to wallets on the follow list on purpose: the dashboard binds
     0.0.0.0, and an unfiltered wallet parameter would turn it into an open
     proxy for the public Data API.
     """
-    key = wallet.lower()
     settings = get_settings()
     led = Ledger(settings.db_path)
     try:
@@ -395,8 +470,81 @@ def leader_positions(wallet: str) -> dict:
         }
     finally:
         led.close()
+    return _our_book_by_token([dict(r) for r in rows], key), open_cost
 
-    book = _our_book_by_token([dict(r) for r in rows], key)
+
+def _our_status(ours: dict | None, open_cost: dict[str, float], token: str) -> str | None:
+    """'open' / 'closed' for a token we copied, None for one we never touched."""
+    if ours is None:
+        return None
+    return "open" if open_cost.get(token, 0.0) >= DUST_USD else "closed"
+
+
+@app.get("/api/leader/{wallet}/trades")
+def leader_trades(wallet: str) -> dict:
+    """A followed leader's own recent fills, newest first.
+
+    Their book (the other endpoint) says what they hold; this says what they
+    did and when — which is the order the user reads a tape in. Sorted here
+    rather than trusting the API's order, and ties broken by the transaction
+    hash so a re-poll can't shuffle two fills that share a second.
+    """
+    key = wallet.lower()
+    book, open_cost = _our_side_of(key)
+
+    now = time.time()
+    cached = _leader_trade_cache.get(key)
+    if cached and now - cached[0] < LEADER_TRADE_TTL:
+        raw, stale = cached[1], False
+    else:
+        try:
+            raw = _get_data().get_raw_trades(user=wallet, limit=LEADER_TRADE_LIMIT)
+            _leader_trade_cache[key] = (now, raw)
+            stale = False
+        except Exception as exc:
+            if cached is None:
+                raise HTTPException(status_code=502, detail=f"Data API: {exc}") from exc
+            raw, stale = cached[1], True
+
+    out = []
+    for t in raw:
+        token = str(t.get("asset", ""))
+        ours = book.get(token)
+        ts = int(_f(t.get("timestamp")))
+        shares = _f(t.get("size"))
+        price = _f(t.get("price"))
+        out.append({
+            "ts": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+            "unix": ts,
+            "token_id": token,
+            "market_id": str(t.get("conditionId", "")),
+            "title": t.get("title") or "",
+            "url": _market_url(t.get("slug"), t.get("eventSlug")),
+            "outcome": t.get("outcome") or "",
+            "side": str(t.get("side", "")).upper(),
+            "price": price,
+            "shares": shares,
+            "usd_size": round(shares * price, 2),
+            "copied": ours is not None,
+            "copied_from_this_leader": bool(ours and ours["from_this_leader"]),
+            "our_status": _our_status(ours, open_cost, token),
+        })
+    out.sort(key=lambda t: (t["unix"], t["token_id"]), reverse=True)
+    return {
+        "wallet": wallet,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "stale": stale,
+        "trades": out,
+        "copied_count": sum(1 for t in out if t["copied"]),
+        "buy_count": sum(1 for t in out if t["side"] == "BUY"),
+    }
+
+
+@app.get("/api/leader/{wallet}/positions")
+def leader_positions(wallet: str) -> dict:
+    """A followed leader's live Polymarket book, flagged with what we copied."""
+    key = wallet.lower()
+    book, open_cost = _our_side_of(key)
 
     now = time.time()
     cached = _leader_pos_cache.get(key)
@@ -416,7 +564,6 @@ def leader_positions(wallet: str) -> dict:
     for p in raw:
         token = str(p.get("asset", ""))
         ours = book.get(token)
-        held = open_cost.get(token, 0.0) >= DUST_USD
         out.append({
             "token_id": token,
             "market_id": str(p.get("conditionId", "")),
@@ -434,7 +581,7 @@ def leader_positions(wallet: str) -> dict:
             "redeemable": bool(p.get("redeemable")),
             "copied": ours is not None,
             "copied_from_this_leader": bool(ours and ours["from_this_leader"]),
-            "our_status": "open" if (ours and held) else "closed" if ours else None,
+            "our_status": _our_status(ours, open_cost, token),
             "our_invested_usd": round(ours["invested_usd"], 2) if ours else None,
             "our_first_ts": ours["first_ts"] if ours else None,
         })

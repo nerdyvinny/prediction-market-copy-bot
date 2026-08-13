@@ -22,8 +22,11 @@ const fmtUsdWhole = (v) => {
   return `${r < 0 ? "−" : "+"}$${Math.abs(r).toLocaleString("en-US")}`;
 };
 
+/* Sub-cent prices are real on Polymarket, so they get four decimals — but a
+   settlement at exactly 0 is a price, not a rounding artefact: "0.0000" reads
+   like a glitch where "0.00" reads like a market that paid nothing. */
 const fmtPrice = (v) =>
-  v === null || v === undefined ? "—" : v.toFixed(v < 0.01 ? 4 : 2);
+  v === null || v === undefined ? "—" : v.toFixed(v > 0 && v < 0.01 ? 4 : 2);
 
 const fmtShares = (v) =>
   v.toLocaleString("en-US", { maximumFractionDigits: 1 });
@@ -105,9 +108,10 @@ function bucketDays(fills) {
     const d = new Date(f.ts);
     const k = dayKey(d);
     let b = days.get(k);
-    if (!b) days.set(k, (b = { pnl: 0, buys: 0, sells: 0, fills: 0 }));
+    if (!b) days.set(k, (b = { pnl: 0, buys: 0, sells: 0, fills: 0, list: [] }));
     b.pnl += f.net_realized_usd || 0;
     b.fills += 1;
+    b.list.push(f);  // kept so clicking the cell can show that day's trades
     if (f.side === "BUY") b.buys += 1; else b.sells += 1;
   }
   return days;
@@ -116,6 +120,9 @@ function bucketDays(fills) {
 // null = "follow the data": pinned to the newest month with activity until the
 // user clicks an arrow, after which their choice sticks across polls.
 let calMonth = null;
+// Day the user clicked open, as a `dayKey`. Survives the poll so the panel
+// refreshes in place instead of shutting itself while they read it.
+let calDay = null;
 
 function monthLabel(y, m) {
   return new Date(y, m, 1).toLocaleString(undefined, {
@@ -180,7 +187,8 @@ function renderCalendar(fills) {
       ` — ${fmtUsd(b.pnl, true)} · ${b.buys} entries, ${b.sells} exits`;
     // Two renderings of the same numbers; CSS picks one by viewport. A phone
     // cell is ~35px wide, which ellipsises "+$18.19" down to a useless "+$…".
-    cells.push(`<div class="cal-cell has ${sign}${today}"${style} title="${title}">
+    cells.push(`<div class="cal-cell has ${sign}${today}${k === calDay ? " sel" : ""}"${style}
+      title="${title}" data-day="${k}" role="button" tabindex="0">
       <span class="cal-d">${d}</span>
       <span class="cal-pnl wide ${pnlClass(b.pnl)}">${fmtUsd(b.pnl, true)}</span>
       <span class="cal-pnl narrow ${pnlClass(b.pnl)}">${fmtUsdWhole(b.pnl)}</span>
@@ -188,6 +196,7 @@ function renderCalendar(fills) {
     </div>`);
   }
   $("#cal-grid").innerHTML = cells.join("");
+  renderDayDetail(days);
 
   // Don't let the user page into an empty future.
   const now = new Date();
@@ -199,16 +208,204 @@ function shiftMonth(delta) {
   if (calMonth === null) return;
   const d = new Date(calMonth.y, calMonth.m + delta, 1);
   calMonth = { y: d.getFullYear(), m: d.getMonth() };
+  calDay = null;  // the open day isn't on screen any more
+  renderCalendar(lastState ? lastState.fills : []);
+}
+
+/* ---- one day's trades -------------------------------------------------- */
+
+/* Fills are the tape; a *trade* is all the fills on one outcome token. A day
+   cell's P&L comes from that day's exits, so the panel splits the two: what
+   the bot bought into that day (and where those positions stand now), and what
+   closed that day (which is what actually moved the number). */
+
+function groupDayFills(list, side) {
+  const groups = new Map();
+  for (const f of list) {
+    if (f.side !== side) continue;
+    let g = groups.get(f.token_id);
+    if (!g) {
+      groups.set(f.token_id, (g = {
+        token_id: f.token_id, market_id: f.market_id, question: f.question,
+        url: f.url, outcome: f.outcome, leader: f.source_leader,
+        reason: f.reason, ts: f.ts, usd: 0, shares: 0, realized: 0, n: 0,
+      }));
+    }
+    g.usd += f.size_usd;
+    g.shares += Math.abs(f.shares);
+    g.realized += f.net_realized_usd || 0;
+    g.n += 1;
+    if (f.ts > g.ts) g.ts = f.ts;
+  }
+  return [...groups.values()].sort((a, b) => (a.ts < b.ts ? 1 : -1));
+}
+
+const dayName = (g) =>
+  g.question || `<span class="mono-id">${g.market_id.slice(0, 18)}…</span>`;
+
+/* Where a position taken that day stands now: the live mid while it's open,
+   and the price it left at once it's closed (a settlement pays 1.00 or 0.00). */
+function nowCell(t) {
+  if (!t) return `<span class="dim">—</span>`;
+  if (t.status === "open") {
+    return t.cur_price === null
+      ? `<span class="dim">no quote</span>`
+      : `${fmtPrice(t.cur_price)}<span class="rowsub">live</span>`;
+  }
+  return t.exit_price === null
+    ? `<span class="dim">—</span>`
+    : `${fmtPrice(t.exit_price)}<span class="rowsub">closed at</span>`;
+}
+
+function entriesTable(groups, trades) {
+  const rows = groups.map((g) => {
+    const t = trades.get(g.token_id);
+    const price = g.shares ? g.usd / g.shares : null;
+    const from = g.leader
+      ? `copied from <span class="mono-id" title="${g.leader}">${shortAddr(g.leader)}</span>`
+      : "";
+    const sub = [g.outcome, from, fmtTime(g.ts)].filter(Boolean).join(" · ");
+    const status = t
+      ? `<span class="chip ${t.status}">${t.status === "open" ? "Open" : "Closed"}</span>`
+      : "";
+    return `<tr>
+      <td class="left market" title="${g.question || g.market_id}">${marketLink(dayName(g), g.url)}
+        <span class="rowsub">${sub}</span></td>
+      <td>${fmtUsd(g.usd)}<span class="rowsub">${fmtPrice(price)} in</span></td>
+      <td>${nowCell(t)}</td>
+      <td class="${pnlClass(t ? t.net_usd : null)}">${fmtUsd(t ? t.net_usd : null, true)}</td>
+      <td class="left">${status}</td>
+    </tr>`;
+  }).join("");
+  return `<table class="lp-table">
+    <thead><tr><th class="left">Market</th><th>Put in</th>
+      <th>Price now</th><th>Net</th><th class="left">Status</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function exitsTable(groups, trades) {
+  const rows = groups.map((g) => {
+    const t = trades.get(g.token_id);
+    const price = g.shares ? g.usd / g.shares : null;
+    const how = g.reason === "settlement" ? "settled" : "sold";
+    const sub = [g.outcome, `${how} at ${fmtPrice(price)}`, fmtTime(g.ts)]
+      .filter(Boolean).join(" · ");
+    const still = t && t.status === "open"
+      ? `<span class="chip open">Part left open</span>`
+      : `<span class="chip closed">Closed</span>`;
+    return `<tr>
+      <td class="left market" title="${g.question || g.market_id}">${marketLink(dayName(g), g.url)}
+        <span class="rowsub">${sub}</span></td>
+      <td>${fmtUsd(g.usd)}</td>
+      <td class="${pnlClass(g.realized)}">${fmtUsd(g.realized, true)}</td>
+      <td class="left">${still}</td>
+    </tr>`;
+  }).join("");
+  return `<table class="lp-table">
+    <thead><tr><th class="left">Market</th><th>Came back</th>
+      <th>Booked that day</th><th class="left">Status</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function renderDayDetail(days) {
+  const el = $("#cal-day");
+  const b = calDay ? days.get(calDay) : null;
+  if (!b) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  const trades = new Map(
+    (lastState ? lastState.trades : []).map((t) => [t.token_id, t]));
+  const [y, m, d] = calDay.split("-").map(Number);
+  const label = new Date(y, m - 1, d).toLocaleDateString(undefined, {
+    weekday: "long", month: "long", day: "numeric", year: "numeric",
+  });
+  const entries = groupDayFills(b.list, "BUY");
+  const exits = groupDayFills(b.list, "SELL");
+
+  const put = entries.reduce((s, g) => s + g.usd, 0);
+  const sections = [];
+  if (entries.length) {
+    sections.push(`<h3 class="day-sec">Copied that day` +
+      `<span class="day-secsub">${entries.length} trade${entries.length === 1 ? "" : "s"} · ${fmtUsd(put)} put in</span></h3>` +
+      `<div class="table-wrap">${entriesTable(entries, trades)}</div>`);
+  }
+  if (exits.length) {
+    sections.push(`<h3 class="day-sec">Closed that day` +
+      `<span class="day-secsub">what booked the day's P&amp;L</span></h3>` +
+      `<div class="table-wrap">${exitsTable(exits, trades)}</div>`);
+  }
+
+  el.hidden = false;
+  el.innerHTML = `<div class="day-head">
+      <div><span class="day-title">${label}</span>
+        <span class="day-sub"><span class="${pnlClass(b.pnl)}">${fmtUsd(b.pnl, true)}</span>` +
+        ` booked · ${b.fills} fill${b.fills === 1 ? "" : "s"}` +
+        ` (${b.buys} in, ${b.sells} out)</span></div>
+      <button type="button" class="day-close" id="cal-day-close" aria-label="Close">✕</button>
+    </div>` + sections.join("");
+}
+
+function toggleDay(key) {
+  calDay = calDay === key ? null : key;
   renderCalendar(lastState ? lastState.fills : []);
 }
 
 /* ---- leaders we follow ----------------------------------------------- */
 
-/* Clicking a leader opens their live Polymarket book underneath the row.
-   `leaderBooks` survives the 20s poll re-render so an open panel doesn't
-   flicker or collapse while the user is reading it. */
+/* Clicking a leader opens a panel under the row: their recent trades (a tape,
+   newest first) or the book they're holding right now. The maps survive the
+   20s poll re-render so an open panel doesn't flicker or collapse while the
+   user is reading it. */
 const expandedLeaders = new Set();
 const leaderBooks = new Map();  // wallet -> {loading, error, data}
+const leaderTapes = new Map();  // wallet -> {loading, error, data}
+const leaderTab = new Map();    // wallet -> "trades" | "book"
+
+const tabOf = (wallet) => leaderTab.get(wallet) || "trades";
+
+/* What the bot did with a trade the leader made, as a chip. `copied` without
+   `copied_from_this_leader` means we're in that market off someone else's
+   signal — worth distinguishing, or the panel takes credit it hasn't earned. */
+function copyChip(t) {
+  if (!t.copied) return `<span class="lp-skip">not copied</span>`;
+  const via = t.copied_from_this_leader ? "Copied" : "Copied (other leader)";
+  return `<span class="chip ${t.our_status}">${via}${
+    t.our_status === "open" ? "" : " · closed"}</span>`;
+}
+
+function leaderTapeHtml(wallet) {
+  const st = leaderTapes.get(wallet);
+  if (!st || st.loading) return `<div class="lp-note">Loading their recent trades…</div>`;
+  if (st.error) return `<div class="lp-note neg">Couldn't load: ${st.error}</div>`;
+  const d = st.data;
+  if (!d.trades.length) {
+    return `<div class="lp-note">No trades on record for this wallet.</div>`;
+  }
+  const rows = d.trades.map((t) => {
+    const name = t.title || `<span class="mono-id">${t.market_id.slice(0, 18)}…</span>`;
+    const act = t.side === "BUY"
+      ? `<span class="side-buy">BUY</span> ${t.outcome}`
+      : `<span class="side-sell">SELL</span> ${t.outcome}`;
+    const sub = `${fmtShares(t.shares)} @ ${fmtPrice(t.price)}`;
+    return `<tr class="${t.copied ? "lp-copied" : ""}">
+      <td class="left nowrap">${fmtTime(t.ts)}</td>
+      <td class="left market" title="${t.title}">${marketLink(name, t.url)}
+        <span class="rowsub">${sub}</span></td>
+      <td class="left">${act}</td>
+      <td>${fmtUsd(t.usd_size)}</td>
+      <td class="left">${copyChip(t)}</td>
+    </tr>`;
+  }).join("");
+  const head = `<div class="lp-note">${d.trades.length} most recent fills · ` +
+    `${d.copied_count} the bot copied` +
+    (d.stale ? ` · <span class="neg">last known tape</span>` : "") + `</div>`;
+  return head + `<div class="table-wrap lp-scroll"><table class="lp-table">
+    <thead><tr><th class="left">Time</th><th class="left">Market</th>
+      <th class="left">Action</th><th>Size</th><th class="left">Us</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
 
 function leaderBookHtml(wallet) {
   const st = leaderBooks.get(wallet);
@@ -219,11 +416,7 @@ function leaderBookHtml(wallet) {
     return `<div class="lp-note">No open positions on Polymarket right now.</div>`;
   }
   const rows = d.positions.map((p) => {
-    const mine = p.copied
-      ? `<span class="chip ${p.our_status}">${
-          p.copied_from_this_leader ? "Copied" : "Copied (other leader)"}${
-          p.our_status === "open" ? "" : " · closed"}</span>`
-      : `<span class="lp-skip">not copied</span>`;
+    const mine = copyChip(p);
     const sub = `${fmtShares(p.shares)} @ ${fmtPrice(p.avg_price)} → ${fmtPrice(p.cur_price)}` +
       (p.end_date ? ` · ends ${p.end_date}` : "") +
       (p.our_invested_usd ? ` · we put in ${fmtUsd(p.our_invested_usd)}` : "");
@@ -246,20 +439,47 @@ function leaderBookHtml(wallet) {
     <tbody>${rows}</tbody></table></div>`;
 }
 
+function leaderPanelHtml(wallet) {
+  const tab = tabOf(wallet);
+  const btn = (id, label) =>
+    `<button type="button" class="lp-tab${tab === id ? " on" : ""}"
+      data-wallet="${wallet}" data-tab="${id}">${label}</button>`;
+  return `<div class="lp-tabs">${btn("trades", "Recent trades")}${
+    btn("book", "Open book")}</div>` +
+    (tab === "trades" ? leaderTapeHtml(wallet) : leaderBookHtml(wallet));
+}
+
+const LEADER_COLS = 7;
+
 function renderLeaders(leaders) {
   const tb = $("#leaders tbody");
   $("#leaders-sub").textContent = leaders && leaders.length
-    ? `${leaders.length} followed · click one to see their open trades` : "";
+    ? `${leaders.length} followed · click one to see their recent trades` : "";
   if (!leaders || !leaders.length) {
-    tb.innerHTML = `<tr><td colspan="5" class="left empty">No leaders followed yet — the bot picks them on its next rescore.</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="${LEADER_COLS}" class="left empty">No leaders followed yet — the bot picks them on its next rescore.</td></tr>`;
     return;
   }
   tb.innerHTML = leaders.map((l) => {
+    // Every number in these three columns is about *our* copies of this
+    // leader, not their own book — the panel below covers that.
     const copied = l.copied_trades
-      ? `${l.copied_trades} trade${l.copied_trades === 1 ? "" : "s"}` : "—";
+      ? `${l.copied_trades}<span class="rowsub">${
+          l.open_trades ? `${l.open_trades} still open` : "all closed"}</span>`
+      : "—";
+    const rate = l.win_rate === null || l.win_rate === undefined
+      ? `<span class="dim">—</span><span class="rowsub">nothing closed yet</span>`
+      : `<span class="${l.win_rate >= 0.5 ? "pos" : "neg"}">${
+          (l.win_rate * 100).toFixed(0)}%</span>` +
+        `<span class="rowsub">${l.wins}W / ${l.losses}L${
+          l.flat ? ` / ${l.flat}F` : ""}</span>`;
+    const pnl = l.copied_trades
+      ? `<span class="${pnlClass(l.net_usd)}">${fmtUsd(l.net_usd, true)}</span>` +
+        `<span class="rowsub">${fmtUsd(l.closed_pnl_usd, true)} closed · ${
+          fmtUsd(l.open_pnl_usd, true)} open</span>`
+      : "—";
     const open = expandedLeaders.has(l.wallet);
     const detail = open
-      ? `<tr class="lp-row"><td colspan="5" class="left">${leaderBookHtml(l.wallet)}</td></tr>`
+      ? `<tr class="lp-row"><td colspan="${LEADER_COLS}" class="left">${leaderPanelHtml(l.wallet)}</td></tr>`
       : "";
     return `<tr class="leader-row${open ? " open" : ""}" data-wallet="${l.wallet}"
         role="button" tabindex="0" aria-expanded="${open}">
@@ -268,33 +488,46 @@ function renderLeaders(leaders) {
       <td>${l.score.toFixed(3)}</td>
       <td>${fmtUsd(l.exposure_usd)}</td>
       <td>${copied}</td>
+      <td>${rate}</td>
+      <td>${pnl}</td>
       <td class="left"><a class="leader-link" href="${l.profile_url}" target="_blank"
         rel="noopener noreferrer" title="Open ${l.wallet} on Polymarket">Polymarket ↗</a></td>
     </tr>${detail}`;
   }).join("");
 }
 
-async function loadLeaderBook(wallet) {
-  leaderBooks.set(wallet, { loading: true });
-  renderLeaders(lastState ? lastState.leaders : []);
+const relayout = () => renderLeaders(lastState ? lastState.leaders : []);
+
+async function loadLeaderPart(wallet, tab) {
+  const store = tab === "book" ? leaderBooks : leaderTapes;
+  const path = tab === "book" ? "positions" : "trades";
+  store.set(wallet, { loading: true });
+  relayout();
   try {
-    const res = await fetch(`/api/leader/${wallet}/positions`);
+    const res = await fetch(`/api/leader/${wallet}/${path}`);
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    leaderBooks.set(wallet, { data: await res.json() });
+    store.set(wallet, { data: await res.json() });
   } catch (err) {
-    leaderBooks.set(wallet, { error: err.message });
+    store.set(wallet, { error: err.message });
   }
-  renderLeaders(lastState ? lastState.leaders : []);
+  relayout();
 }
 
 function toggleLeader(wallet) {
   if (expandedLeaders.has(wallet)) {
     expandedLeaders.delete(wallet);
-    renderLeaders(lastState ? lastState.leaders : []);
+    relayout();
     return;
   }
   expandedLeaders.add(wallet);
-  loadLeaderBook(wallet);  // always refetch: their book moves faster than our poll
+  // Always refetch: a leader trades faster than our 20s poll.
+  loadLeaderPart(wallet, tabOf(wallet));
+}
+
+function switchLeaderTab(wallet, tab) {
+  if (tabOf(wallet) === tab) return;
+  leaderTab.set(wallet, tab);
+  loadLeaderPart(wallet, tab);
 }
 
 /* ---- open positions -------------------------------------------------- */
@@ -480,6 +713,11 @@ async function refresh() {
 /* Delegated so handlers survive the poll re-rendering the tables. */
 $("#leaders tbody").addEventListener("click", (e) => {
   if (e.target.closest("a")) return;  // let the Polymarket link through
+  const tab = e.target.closest(".lp-tab");
+  if (tab) {
+    switchLeaderTab(tab.dataset.wallet, tab.dataset.tab);
+    return;  // a tab click is not a click on the row: don't collapse the panel
+  }
   const row = e.target.closest(".leader-row");
   if (row) toggleLeader(row.dataset.wallet);
 });
@@ -494,6 +732,24 @@ $("#leaders tbody").addEventListener("keydown", (e) => {
 
 $("#cal-prev").addEventListener("click", () => shiftMonth(-1));
 $("#cal-next").addEventListener("click", () => shiftMonth(1));
+
+/* Delegated: the grid is rebuilt every poll. */
+$("#cal-grid").addEventListener("click", (e) => {
+  const cell = e.target.closest(".cal-cell.has");
+  if (cell) toggleDay(cell.dataset.day);
+});
+
+$("#cal-grid").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const cell = e.target.closest(".cal-cell.has");
+  if (!cell) return;
+  e.preventDefault();
+  toggleDay(cell.dataset.day);
+});
+
+$("#cal-day").addEventListener("click", (e) => {
+  if (e.target.closest("#cal-day-close")) toggleDay(calDay);
+});
 
 renderUpdates(loadUpdates());
 refresh();
