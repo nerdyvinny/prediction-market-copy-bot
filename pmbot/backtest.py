@@ -481,6 +481,7 @@ class ExactCopyBacktester:
         price_series: dict[str, list[tuple[int, float]]] | None = None,
         resolve_at: dict[str, datetime] | None = None,
         skip_round_tripped_entries: bool = False,
+        skip_price_band: tuple[float, float] | None = None,
     ) -> BacktestReport:
         """Simulate the tapes over the window [now - lookback_days, now].
 
@@ -502,6 +503,13 @@ class ExactCopyBacktester:
         `end_date` quirk described below — that quirk makes `hours_left`
         negative, which sits under any positive ceiling, so in-game sports
         entries pass the max filter exactly as they do live.
+
+        `skip_price_band` punches a hole in the middle of the copy window:
+        entries priced inside [lo, hi) are refused while everything cheaper and
+        everything dearer is still copied. `price_min`/`price_max` can only
+        move the window's edges, so a "the middle is where we bleed" claim is
+        not expressible with them — hence the separate knob. Half-open on the
+        top so adjacent bands tile without double-counting a boundary price.
 
         `stop_loss_frac` arms a protective exit: if the token's observed price
         falls to `avg_entry * (1 - frac)` before the leader exits or the market
@@ -669,6 +677,10 @@ class ExactCopyBacktester:
                     continue                       # leader already flat before our next poll
                 if not (p_min <= t.price <= p_max):
                     continue
+                if skip_price_band is not None and (
+                    skip_price_band[0] <= t.price < skip_price_band[1]
+                ):
+                    continue                       # punched-out middle band
                 if t.usd_size < min_leader_notional:
                     continue
                 market, winner = self._market(t.market_id)

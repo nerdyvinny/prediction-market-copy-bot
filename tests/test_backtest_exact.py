@@ -60,6 +60,42 @@ def test_in_game_entry_copied_when_hours_filter_off():
     assert len(rep2.results) == 0                # knob ON excludes it
 
 
+def test_skip_price_band_punches_out_the_middle_only():
+    """The band knob must remove the middle and leave both tails copied.
+
+    A plain `price_min`/`price_max` narrowing cannot express this, which is the
+    whole reason the knob exists — if it ever collapsed to an edge move, a
+    "the middle is where we bleed" test would silently become "we stopped
+    buying anything dear", a different rule with a different P&L.
+    """
+    res = {c: (_mkt(c), f"tok{c}") for c in ("m1", "m2", "m3")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokm1", Side.BUY, 0.30, 1000, 10, "u1"),   # below the hole
+        _trade("m2", "tokm2", Side.BUY, 0.70, 1000, 10, "u2"),   # inside it
+        _trade("m3", "tokm3", Side.BUY, 0.82, 1000, 10, "u3"),   # above it
+    ]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert {r.token_id for r in rep.results} == {"tokm1", "tokm2", "tokm3"}
+
+    held = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                             skip_price_band=(0.60, 0.80))
+    assert {r.token_id for r in held.results} == {"tokm1", "tokm3"}
+
+
+def test_skip_price_band_is_half_open_at_the_top():
+    """Adjacent bands must tile: 0.80 belongs to the next band up, not this one.
+    A closed upper bound would double-count a boundary price whenever two bands
+    are compared side by side."""
+    res = {c: (_mkt(c), f"tok{c}") for c in ("m1", "m2")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokm1", Side.BUY, 0.60, 1000, 10, "u1"),   # lower edge: excluded
+        _trade("m2", "tokm2", Side.BUY, 0.80, 1000, 10, "u2"),   # upper edge: kept
+    ]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                            skip_price_band=(0.60, 0.80))
+    assert {r.token_id for r in rep.results} == {"tokm2"}
+
+
 def test_market_lookup_error_not_cached():
     """A transient Gamma failure (rate limit) must not poison the memo: the
     next call for the same market retries and succeeds. A poisoned entry
