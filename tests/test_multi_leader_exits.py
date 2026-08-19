@@ -145,29 +145,36 @@ def test_stale_attribution_is_clamped_to_what_we_actually_hold():
     """Ledgers written before this fix contain over-exits: one leader's SELL
     booked against shares another leader paid for. That leaves a negative
     balance for the seller and an inflated one for the payer, and the strategy
-    must heal rather than emit a negative or oversized exit."""
+    must heal rather than emit a negative or oversized exit.
+
+    The over-exit here stops SHORT of flat on purpose. `_SINCE_FLAT` resets
+    both balances the moment a position closes, so an over-exit that empties
+    the position is now self-healing — the clamp is what still has to cover
+    the case where it doesn't.
+    """
     led = Ledger(":memory:")
     try:
         _copy_buy(led, A, 50.0, uid="a-buy-1")
         _copy_buy(led, B, 50.0, uid="b-buy-1")
-        # Legacy over-exit: B's mirror-sell took the whole 100-share position.
-        over = Signal(MKT, TOK, "Yes", Side.SELL, 0.60, 60.0, "legacy",
+        # Legacy over-exit: B's mirror-sell reached into A's shares but left
+        # the position open, so no flat boundary heals the attribution.
+        over = Signal(MKT, TOK, "Yes", Side.SELL, 0.60, 48.0, "legacy",
                       source_leader=B, source_uid="b-oversell")
-        led.record_fill(Fill(signal=over, fill_price=0.60, size_usd=60.0,
-                             shares=100.0, timestamp=NOW, mode="paper"))
-        _copy_buy(led, A, 40.0, uid="a-buy-2")
+        led.record_fill(Fill(signal=over, fill_price=0.60, size_usd=48.0,
+                             shares=80.0, timestamp=NOW, mode="paper"))
+        _copy_buy(led, A, 10.0, uid="a-buy-2")
 
-        assert led.get_position(TOK).shares == 40.0
-        assert led.copied_shares_for_leader(A, TOK) == 90.0    # inflated
-        assert led.copied_shares_for_leader(B, TOK) == -50.0   # negative
+        assert led.get_position(TOK).shares == 30.0
+        assert led.copied_shares_for_leader(A, TOK) == 60.0    # inflated
+        assert led.copied_shares_for_leader(B, TOK) == -30.0   # negative
 
         # B's negative balance must not produce a signal at all.
         b_tape = [_trade(B, Side.BUY, 200, "b1"), _trade(B, Side.SELL, 200, "b2")]
         assert _sells(_strategy(led, {B: b_tape}, [B])) == []
-        # A's inflated balance is capped at the 40 shares that actually exist.
+        # A's inflated balance is capped at the 30 shares that actually exist.
         a_tape = [_trade(A, Side.BUY, 200, "a1"), _trade(A, Side.SELL, 200, "a2")]
         sells = _sells(_strategy(led, {A: a_tape}, [A]))
-        assert len(sells) == 1 and sells[0].size_shares == 40.0
+        assert len(sells) == 1 and sells[0].size_shares == 30.0
     finally:
         led.close()
 
@@ -380,3 +387,82 @@ def test_exposure_is_cost_basis_not_cost_minus_proceeds():
             assert led.exposure_for_leader(A) == 50.0, label
         finally:
             led.close()
+
+
+# -- any flat position, not just a settled one ----------------------------
+def _manual_close(led: Ledger, shares: float, price: float = 0.50):
+    """Close the position from OUTSIDE the bot: no source_leader, and a reason
+    that is not 'settlement'. This is what an ad-hoc de-risk script writes."""
+    sig = Signal(MKT, TOK, "Yes", Side.SELL, price, shares * price,
+                 "manual-close: user request")
+    led.record_fill(Fill(signal=sig, fill_price=price, size_usd=shares * price,
+                         shares=shares, timestamp=NOW, mode="paper"))
+
+
+def test_manual_close_does_not_leave_a_leader_balance_behind():
+    """A close the bot didn't attribute must still end the leader's round.
+
+    Scoping attribution on `reason = 'settlement'` covered the Settler and
+    nothing else. Live (Aug 2026) a manual de-risk closed 10 positions with a
+    NULL leader and a different reason, so none of them decremented anyone:
+    leader A stayed credited with the shares of a position that had been sold
+    days earlier, and when B later re-entered the token, A's balance clamped to
+    B's holding — one full exit by A would have liquidated all of B's copy.
+    """
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 65.0, uid="a-round1")
+        _manual_close(led, 65.0)                 # closed outside the bot
+        assert led.copied_shares_for_leader(A, TOK) == 0.0
+        assert led.exposure_for_leader(A) == 0.0
+        assert A not in led.leader_exposures()
+
+        _copy_buy(led, B, 19.0, uid="b-round2")  # someone else re-enters
+        assert led.get_position(TOK).shares == 19.0
+        assert led.copied_shares_for_leader(A, TOK) == 0.0   # not 65.0
+        assert led.copied_shares_for_leader(B, TOK) == 19.0
+        assert led.leader_exposures() == {B: 19.0 * 0.50}
+
+        # A is stale here: they must yield no exit at all, and B's copy stays.
+        tapes = {A: [_trade(A, Side.BUY, 30, "a1"), _trade(A, Side.SELL, 30, "a2")]}
+        assert _sells(_strategy(led, tapes, [A])) == []
+    finally:
+        led.close()
+
+
+def test_mirrored_full_exit_also_ends_the_round():
+    """The boundary is the position going flat, however it got there — a
+    leader's own mirrored exit closes their round too, so a re-entry starts
+    from zero instead of double-counting the shares they already sold."""
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 100.0, uid="a-round1")
+        tapes = {A: [_trade(A, Side.BUY, 100, "a1"), _trade(A, Side.SELL, 100, "a2")]}
+        sells = _sells(_strategy(led, tapes, [A]))
+        assert len(sells) == 1 and sells[0].size_shares == 100.0
+        # Book that exit, taking us flat.
+        sig = Signal(MKT, TOK, "Yes", Side.SELL, 0.50, 50.0, "copy exit",
+                     source_leader=A, source_uid="a2")
+        led.record_fill(Fill(signal=sig, fill_price=0.50, size_usd=50.0,
+                             shares=100.0, timestamp=NOW, mode="paper"))
+        assert led.copied_shares_for_leader(A, TOK) == 0.0
+
+        _copy_buy(led, A, 40.0, uid="a-round2")
+        assert led.copied_shares_for_leader(A, TOK) == 40.0   # round 2 only
+    finally:
+        led.close()
+
+
+def test_a_crumb_left_by_a_full_exit_still_counts_as_flat():
+    """Polymarket truncates share counts to 2dp, so a "full" exit can leave a
+    sub-0.01 crumb. Testing the running total against an exact zero would miss
+    the close and carry the whole round forward — the dust-epsilon trap."""
+    led = Ledger(":memory:")
+    try:
+        _copy_buy(led, A, 100.0, uid="a-round1")
+        _manual_close(led, 99.995)               # 0.005 sh crumb left behind
+        _copy_buy(led, B, 19.0, uid="b-round2")
+        assert led.copied_shares_for_leader(A, TOK) == 0.0
+        assert led.copied_shares_for_leader(B, TOK) == 19.0
+    finally:
+        led.close()

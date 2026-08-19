@@ -63,23 +63,53 @@ CREATE INDEX IF NOT EXISTS idx_fills_leader ON fills(source_leader);
 CREATE INDEX IF NOT EXISTS idx_fills_token ON fills(token_id);
 """
 
-# `reason` on the closing fill Settler writes. Leader attribution keys off it
-# (see `_SINCE_SETTLEMENT`), so it is a shared constant rather than a literal
-# repeated in two modules.
+# `reason` on the closing fill Settler writes. Kept as a shared constant so the
+# two modules that read and write it cannot drift.
 SETTLEMENT_REASON = "settlement"
 
-# Attribution scope: only fills after the token's most recent settlement.
+# A position at or below this many shares is flat, not held. Polymarket reports
+# share counts truncated to 2 decimals, so a mirrored "full" exit routinely
+# leaves a sub-0.01 crumb behind; testing the running total against an exact
+# zero would never see the position close. Same constant, same reasoning as
+# `ExactCopyStrategy.EXIT_CRUMB_SHARES` (imported there rather than here to
+# keep the ledger free of strategy imports).
+_FLAT_SHARES = 0.01
+
+# Attribution scope: only fills after the token's position last went FLAT.
 #
-# Settlement zeroes a position but writes its closing fill with NO
-# source_leader, so nothing ever nets a leader's earlier round out of the
-# per-leader sums. After a settle + re-entry a leader's balance reads as the
-# sum of BOTH rounds, and a full exit by them then sells shares a DIFFERENT
+# Per-leader share balances are derived by summing that leader's own fills
+# (BUY adds, SELL subtracts). A closing fill that carries no `source_leader`
+# therefore nets nobody out, and the balance survives the position it
+# described. After a re-entry the stale balance reads as shares we still hold
+# from that leader, and a full exit by them then sells shares a DIFFERENT
 # leader paid for — the exact failure `copied_shares_for_leader` exists to
-# prevent. A settlement closes everything before it by definition, so
-# restricting to fills after it is both correct and cheap.
-_SINCE_SETTLEMENT = """
-    f.id > COALESCE((SELECT MAX(s.id) FROM fills s
-                     WHERE s.token_id = f.token_id AND s.reason = 'settlement'), 0)
+# prevent.
+#
+# This used to scope on `reason = 'settlement'`, which covers the Settler but
+# nothing else. Every other way a position can go flat without a leader SELL —
+# a manual close run outside the bot, a repair script, any future exit path
+# that doesn't attribute — left the balance dangling. Ten of them did, live:
+# an Aug 2026 manual de-risk closed 10 positions with a NULL leader, and one of
+# those tokens was later re-entered from a different leader, leaving the first
+# leader credited with 65.40 shares of a position that held 18.87 bought for
+# someone else. Keying on the POSITION going flat instead of on one fill's
+# reason makes the rule about the thing it actually cares about, and subsumes
+# the settlement case (settlement sells the whole position by construction).
+#
+# Cost: one windowed pass over `fills` per outer row. The table grows by a
+# handful of rows a day, so this is cheap for years; revisit if it ever gets
+# large enough to matter.
+_SINCE_FLAT = f"""
+    f.id > COALESCE((
+        SELECT MAX(z.id) FROM (
+            SELECT x.id AS id, x.token_id AS token_id,
+                   SUM(CASE WHEN x.side='BUY' THEN x.shares ELSE -x.shares END)
+                       OVER (PARTITION BY x.token_id ORDER BY x.id
+                             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
+            FROM fills x
+        ) z
+        WHERE z.token_id = f.token_id AND ABS(z.running) <= {_FLAT_SHARES}
+    ), 0)
 """
 
 # Columns added after the v1 schema; applied to pre-existing DBs on open.
@@ -233,9 +263,9 @@ class Ledger:
         return row is not None
 
     # Per-(leader, token) slice of every OPEN position: the leader's net shares
-    # since the last settlement, the shares actually held, and our cost basis.
-    # One query behind `exposure_for_leader` and `leader_exposures` so both
-    # mean the same thing.
+    # since the position was last flat, the shares actually held, and our cost
+    # basis. One query behind `exposure_for_leader` and `leader_exposures` so
+    # both mean the same thing.
     _SLICE_SQL = f"""
         SELECT f.source_leader AS leader,
                f.token_id      AS token,
@@ -245,7 +275,7 @@ class Ledger:
         FROM fills f JOIN positions p ON p.token_id = f.token_id
         WHERE f.source_leader IS NOT NULL
           AND ABS(p.shares) > 1e-9
-          AND {_SINCE_SETTLEMENT}
+          AND {_SINCE_FLAT}
           {{extra}}
         GROUP BY f.source_leader, f.token_id
     """
@@ -277,7 +307,8 @@ class Ledger:
 
         Joining to nonzero positions is what frees a leader's budget when a
         market settles: settlement zeroes the position, its token drops out of
-        the join, and the cap headroom returns.
+        the join, and the cap headroom returns. `_SINCE_FLAT` then keeps the
+        headroom freed if that token is later re-entered from someone else.
         """
         if not leader:
             return 0.0
@@ -298,9 +329,10 @@ class Ledger:
         several followed leaders can hold the same outcome token, but
         `positions` only knows the combined total.
 
-        Scoped to fills after the token's last settlement (`_SINCE_SETTLEMENT`).
-        Settlement fills carry no `source_leader`, so without that scope a
-        settled round stayed on the books forever: after a re-entry a leader's
+        Scoped to fills after the position last went flat (`_SINCE_FLAT`).
+        Closing fills that carry no `source_leader` — settlements, and any
+        close run outside the bot — net nobody out, so without that scope a
+        finished round stayed on the books forever: after a re-entry a leader's
         balance read as the sum of both rounds, and clamping to the COMBINED
         position — the only clamp available — let their exit sell shares
         another leader had paid for. Callers still clamp, for legacy rows and
@@ -311,7 +343,7 @@ class Ledger:
         row = self.conn.execute(
             f"""SELECT COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.shares ELSE -f.shares END), 0) AS net
                 FROM fills f
-                WHERE f.source_leader=? AND f.token_id=? AND {_SINCE_SETTLEMENT}""",
+                WHERE f.source_leader=? AND f.token_id=? AND {_SINCE_FLAT}""",
             (leader, token_id),
         ).fetchone()
         return float(row["net"] or 0.0)
