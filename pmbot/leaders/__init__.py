@@ -7,9 +7,11 @@ from pmbot.leaders.scoring import (
     LeaderSelector,
     WalletStats,
     compute_wallet_stats,
+    copyability,
     failing_filters,
     passes_filters,
     rank_wallets,
+    seat_roster,
 )
 
 __all__ = [
@@ -24,7 +26,9 @@ __all__ = [
     "LeaderSelector",
     "WalletStats",
     "compute_wallet_stats",
+    "copyability",
     "failing_filters",
     "passes_filters",
     "rank_wallets",
+    "seat_roster",
 ]

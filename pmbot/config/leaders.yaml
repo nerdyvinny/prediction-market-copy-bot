@@ -11,6 +11,26 @@ selection:
   top_n: 8                     # diversify across up to this many leaders
   rescore_interval_hours: 24   # re-rank the pool on this cadence
 
+  # top_n is a RELATIVE cut, and it binds on every rescore (the eligible pool
+  # ran 9-27, median 15, over the first month). That evicted leaders which had
+  # got no worse: 0xc23dc0ec passed vetting on 2026-08-20 with the most
+  # copyable tape of any wallet, then vanished the next day when the pool grew
+  # 19 -> 27. Nothing rejected it; it was simply out-ranked.
+  #
+  # With keep_incumbents on, a leader we already follow keeps its seat. It
+  # still has to clear every filter below AND the copy vetting, so a seat is
+  # only ever lost by failing a test -- never by someone else's good day.
+  keep_incumbents: true
+  explore_slots: 2             # seats kept contestable so the funnel still
+                               # discovers; incumbency can claim at most
+                               # top_n - explore_slots.
+
+  # Copyable BUYs that count as "enough of this tape is mirrorable". The
+  # copyability weight saturates here instead of rewarding raw volume: the
+  # highest-copyable wallet of the first month (235) was also the worst
+  # leader we followed, so more is not better past a point.
+  copyable_target: 40
+
 # A wallet must pass ALL of these to be eligible. One 30-day window covers
 # everything — recent form only, no credit for ancient history.
 filters:
@@ -39,11 +59,20 @@ filters:
 # Ranking weights for eligible wallets (should sum to ~1.0). Consistency
 # (category spread) is zeroed: with specialists allowed it mostly punishes
 # exactly the profile we now want.
+#
+# 2026-08-23, from 37 rescores of live data: the old weights ranked wallets on
+# how rich they are, which barely predicts whether we get to copy them. The
+# score's correlation with trades we actually filled was +0.13; the count of
+# copyable trades scored +0.35. The top-ranked wallet held its seat for 76% of
+# the month and produced TWO fills, while the wallets behind 46% of all buys
+# ranked 7th and 17th. `copyability` exists to close that gap -- it is the one
+# term measured on an absolute scale, so it does not drift with the pool.
 weights:
-  realized_pnl: 0.40
-  win_rate: 0.30
+  realized_pnl: 0.25
+  win_rate: 0.25
   consistency: 0.00
-  recency: 0.30
+  recency: 0.20
+  copyability: 0.30
 
 # Manual overrides (optional). Allowlisted wallets bypass BOTH the selection
 # filters above and the copy-vetting backtest — they are followed on your say-so

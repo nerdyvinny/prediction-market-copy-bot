@@ -204,7 +204,31 @@ def passes_filters(st: WalletStats, f: FilterConfig) -> bool:
     return not failing_filters(st, f)
 
 
-def rank_wallets(stats: list[WalletStats], weights: dict[str, float]) -> list[LeaderScore]:
+def copyability(n_copyable: int, target: int) -> float:
+    """How much of a wallet's tape we could actually mirror, on a 0..1 scale.
+
+    Saturating on purpose. A wallet with 200 copyable BUYs in the window is a
+    scalper, not five times more followable than one with 40 -- and the live
+    tape bears that out: the highest-copyable wallet of the month was also the
+    worst leader. Rewarding "enough to be worth following" beats rewarding raw
+    volume.
+
+    Deliberately NOT min-max normalised like the other ranking components.
+    Those are relative to whoever else happens to be in the pool that day, so a
+    wallet's score drifts when nothing about the wallet changed; an absolute
+    scale keeps this term stable across rescores.
+    """
+    if target <= 0:
+        return 0.0
+    return min(float(n_copyable), float(target)) / float(target)
+
+
+def rank_wallets(
+    stats: list[WalletStats],
+    weights: dict[str, float],
+    *,
+    copyable_target: int = 40,
+) -> list[LeaderScore]:
     if not stats:
         return []
 
@@ -218,6 +242,7 @@ def rank_wallets(stats: list[WalletStats], weights: dict[str, float]) -> list[Le
     wr = norm([s.win_rate for s in stats])
     cons = norm([float(s.n_categories) for s in stats])
     rec = norm([-s.recency_days for s in stats])   # more recent -> higher
+    cop = [copyability(s.n_copyable_trades, copyable_target) for s in stats]
 
     out: list[LeaderScore] = []
     for i, s in enumerate(stats):
@@ -226,10 +251,47 @@ def rank_wallets(stats: list[WalletStats], weights: dict[str, float]) -> list[Le
             + weights.get("win_rate", 0) * wr[i]
             + weights.get("consistency", 0) * cons[i]
             + weights.get("recency", 0) * rec[i]
+            + weights.get("copyability", 0) * cop[i]
         )
         out.append(LeaderScore(wallet=s.wallet, score=score, stats=s))
     out.sort(key=lambda x: x.score, reverse=True)
     return out
+
+
+def seat_roster(
+    ranked: list[LeaderScore],
+    incumbents: list[str],
+    top_n: int,
+    *,
+    keep_incumbents: bool = True,
+    explore_slots: int = 0,
+) -> list[LeaderScore]:
+    """Pick the lineup from ranked candidates, seating incumbents first.
+
+    Plain top-N is a relative cut: when the eligible pool grows, leaders that
+    got no worse are evicted by strangers who merely scored higher that day.
+    Seating incumbents first removes that churn without weakening any bar --
+    everyone here has already passed the filters, and copy vetting still runs
+    downstream. `explore_slots` seats stay contestable so the lineup can still
+    turn over on merit.
+    """
+    if top_n <= 0:
+        return []
+    if not keep_incumbents:
+        return ranked[:top_n]
+
+    held = {w.lower() for w in incumbents}
+    protected = max(top_n - max(explore_slots, 0), 0)
+    seated = [r for r in ranked if r.wallet.lower() in held][:protected]
+    seen = {r.wallet for r in seated}
+    for r in ranked:                      # remaining seats go by rank, to
+        if len(seated) >= top_n:          # newcomers and unseated incumbents
+            break                         # alike
+        if r.wallet not in seen:
+            seated.append(r)
+            seen.add(r.wallet)
+    seated.sort(key=lambda r: r.score, reverse=True)
+    return seated
 
 
 class LeaderSelector:
@@ -477,8 +539,16 @@ class LeaderSelector:
             if st.wallet in allow and st not in eligible:
                 eligible.append(st)
 
-        ranked = rank_wallets(eligible, cfg.weights)
-        top = ranked[: cfg.selection.top_n]
+        ranked = rank_wallets(
+            eligible, cfg.weights, copyable_target=cfg.selection.copyable_target
+        )
+        top = seat_roster(
+            ranked,
+            list(incumbents or []),
+            cfg.selection.top_n,
+            keep_incumbents=cfg.selection.keep_incumbents,
+            explore_slots=cfg.selection.explore_slots,
+        )
         # top_n is the last place an allowlisted wallet could still be dropped:
         # it bypasses the filters only to be cut here if it ranks below the
         # line. A manual pin has to survive its own ranking.
@@ -487,6 +557,8 @@ class LeaderSelector:
             top = top + [r for r in ranked if r.wallet in allow and r.wallet not in picked]
         rejects = Counter(early)
         rejects.update(filter_fails)
+        held = {w.lower() for w in (incumbents or [])}
+        retained = sum(1 for r in top if r.wallet.lower() in held)
         self.last_report = {
             "pool": len(pool),
             "record_wallets": len(record_quality),
@@ -496,9 +568,15 @@ class LeaderSelector:
             "rejects": dict(rejects),
             "eligible": len(eligible),
             "followed": len(top),
+            # Churn, logged every run. The first month averaged 5.5 leaders a
+            # rescore and still burned through 33 wallets, which is why no
+            # leader ever accumulated a record worth reading.
+            "retained": retained,
         }
         log.info(
-            "scoring: %d pool -> %d deep-scored -> %d eligible -> top %d",
+            "scoring: %d pool -> %d deep-scored -> %d eligible -> "
+            "%d followed (%d retained, %d new)",
             len(pool), len(targets), len(eligible), len(top),
+            retained, len(top) - retained,
         )
         return top

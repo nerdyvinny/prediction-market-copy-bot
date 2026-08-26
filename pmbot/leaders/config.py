@@ -14,6 +14,19 @@ _DEFAULT_PATH = Path(__file__).resolve().parent.parent / "config" / "leaders.yam
 class SelectionConfig:
     top_n: int = 8
     rescore_interval_hours: float = 24.0
+    # top_n is a RELATIVE cut, so a leader that got no worse is evicted the
+    # moment the eligible pool grows. With this on, a leader we already follow
+    # keeps its seat instead of being out-ranked by a newcomer; it still has to
+    # pass every filter and the copy vetting, so only failing a test loses a
+    # seat.
+    keep_incumbents: bool = True
+    # ...but incumbency must never fill the whole lineup, or the funnel stops
+    # discovering. This many seats stay contestable on every rescore.
+    explore_slots: int = 2
+    # Copyable BUYs that count as "enough of this tape is mirrorable". The
+    # copyability score saturates here rather than rewarding raw volume --
+    # see rank_wallets.
+    copyable_target: int = 40
 
 
 @dataclass
@@ -49,7 +62,8 @@ class LeaderConfig:
     filters: FilterConfig = field(default_factory=FilterConfig)
     weights: dict[str, float] = field(
         default_factory=lambda: {
-            "realized_pnl": 0.40, "win_rate": 0.30, "consistency": 0.0, "recency": 0.30
+            "realized_pnl": 0.25, "win_rate": 0.25, "consistency": 0.0,
+            "recency": 0.20, "copyability": 0.30,
         }
     )
     allowlist: list[str] = field(default_factory=list)
@@ -69,6 +83,9 @@ def load_leader_config(path: str | Path | None = None) -> LeaderConfig:
         selection=SelectionConfig(
             top_n=int(sel.get("top_n", 8)),
             rescore_interval_hours=float(sel.get("rescore_interval_hours", 24)),
+            keep_incumbents=bool(sel.get("keep_incumbents", True)),
+            explore_slots=int(sel.get("explore_slots", 2)),
+            copyable_target=int(sel.get("copyable_target", 40)),
         ),
         filters=FilterConfig(
             lookback_days=int(flt.get("lookback_days", d.lookback_days)),

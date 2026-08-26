@@ -539,8 +539,15 @@ class Engine:
         if not rep:
             return
         # rep["followed"] is pre-vetting; self.leaders is what survived it.
+        # `carried` is the churn number: how much of the lineup we already had.
+        # Reviewing a month of results is only possible if leaders persist long
+        # enough to build a record, so it belongs on the headline line.
+        carried = rep.get("retained")
+        churn = "" if carried is None else (
+            f" ({carried} carried over, {rep['followed'] - carried} new)")
         print(f"  funnel: {rep['pool']} in pool -> {rep['deep_scored']} deep-scored "
-              f"-> {rep['eligible']} eligible -> following {len(self.leaders)} after vet")
+              f"-> {rep['eligible']} eligible -> following {len(self.leaders)} after vet"
+              f"{churn}")
         if rep.get("record_wallets"):
             print(f"  records: {rep['record_wallets']} wallet(s) shortlistable from "
                   f"accumulated resolved-market history")

@@ -9,11 +9,14 @@ import pytest
 from pmbot.config import Settings
 from pmbot.leaders.config import FilterConfig
 from pmbot.leaders.scoring import (
+    LeaderScore,
     WalletStats,
     compute_wallet_stats,
+    copyability,
     failing_filters,
     passes_filters,
     rank_wallets,
+    seat_roster,
 )
 from pmbot.models import Fill, LeaderTrade, Side, Signal
 from pmbot.portfolio.ledger import Ledger
@@ -141,6 +144,134 @@ def test_rank_wallets_orders_by_weighted_score():
                                          "consistency": .00, "recency": .30})
     assert [r.wallet for r in ranked] == ["good", "weak"]
     assert 0.0 <= ranked[-1].score <= 1.0
+
+
+# --- copyability + incumbency seating ------------------------------------
+def _ws(wallet, *, pnl=1000.0, win=0.90, recency=1.0, copyable=0):
+    return WalletStats(wallet, 200, 30, 28, pnl, win, 5, recency, 0.2, copyable)
+
+
+def _score(wallet, score):
+    return LeaderScore(wallet=wallet, score=score, stats=_ws(wallet))
+
+
+def test_copyability_saturates_at_target():
+    # Absolute scale, so it does not drift with the rest of the pool.
+    assert copyability(0, 40) == 0.0
+    assert copyability(20, 40) == pytest.approx(0.5)
+    assert copyability(40, 40) == pytest.approx(1.0)
+    # 235 copyable trades is a scalper, not 6x better than 40.
+    assert copyability(235, 40) == pytest.approx(1.0)
+    assert copyability(10, 0) == 0.0          # target off -> term contributes nothing
+
+
+WEIGHTS = {"realized_pnl": .25, "win_rate": .25, "consistency": .0,
+           "recency": .20, "copyability": .30}
+
+
+def test_copyability_breaks_the_tie_between_equal_wallets():
+    ranked = rank_wallets([_ws("thin", copyable=2), _ws("deep", copyable=60)],
+                          WEIGHTS, copyable_target=40)
+    assert [r.wallet for r in ranked] == ["deep", "thin"]
+
+
+OLD_WEIGHTS = {"realized_pnl": .40, "win_rate": .30, "consistency": .0, "recency": .30}
+
+
+def test_copyability_promotes_the_wallet_we_could_actually_copy():
+    """Regression on real numbers: the 2026-08-23 lineup as logged.
+
+    0x5cd5c8d7 supplied 25 of the month's 91 buys -- more than any other
+    wallet -- yet ranked 3rd of 5 under the old weights, behind 0xfc25f141
+    which supplied one. Weighting copyability lifts it above that wallet.
+
+    Note this does NOT dethrone 0xd487f513 (2 buys all month): it tops both
+    money terms, and min-max normalisation hands a pool-leader the full weight
+    of each. Copyability narrows that gap rather than closing it.
+    """
+    lineup = [                                    # pnl, win rate, copyable
+        _ws("0xd487f513", pnl=56358, win=0.98, copyable=22),
+        _ws("0xfc25f141", pnl=12089, win=0.98, copyable=24),
+        _ws("0x5cd5c8d7", pnl=1515, win=0.95, copyable=77),
+        _ws("0xf0ea0711", pnl=12149, win=0.87, copyable=77),
+        _ws("0xbb3eaeb8", pnl=6229, win=0.89, copyable=75),
+    ]
+    before = [r.wallet for r in rank_wallets(lineup, OLD_WEIGHTS)]
+    after = [r.wallet for r in rank_wallets(lineup, WEIGHTS, copyable_target=40)]
+
+    assert before.index("0xfc25f141") < before.index("0x5cd5c8d7")
+    assert after.index("0x5cd5c8d7") < after.index("0xfc25f141")
+    assert after.index("0x5cd5c8d7") == 1
+
+
+def test_copyability_cannot_outweigh_topping_both_money_terms():
+    """The known limit of this change, pinned so it is not mistaken for a bug.
+
+    A wallet that leads the pool on BOTH realized_pnl and win_rate collects the
+    full weight of each (min-max gives the leader 1.0), which outweighs the
+    copyability term on its own. Fixing that means changing how those two are
+    normalised, not the copyability weight.
+    """
+    rich = _ws("rich", pnl=9000.0, win=0.93, copyable=3)
+    usable = _ws("usable", pnl=4000.0, win=0.91, copyable=55)
+    ranked = rank_wallets([rich, usable], WEIGHTS, copyable_target=40)
+    assert [r.wallet for r in ranked] == ["rich", "usable"]
+
+
+def test_copyability_is_ignored_when_unweighted():
+    old = {"realized_pnl": .40, "win_rate": .30, "consistency": .0, "recency": .30}
+    ranked = rank_wallets([_ws("a", copyable=0), _ws("b", copyable=90)], old)
+    assert ranked[0].score == pytest.approx(ranked[1].score)
+
+
+def test_seat_roster_keeps_an_incumbent_that_was_merely_outranked():
+    # 0xc23dc0ec's exact failure: it got no worse, the pool just grew.
+    ranked = [_score("new1", .9), _score("new2", .8), _score("inc", .3)]
+    seated = seat_roster(ranked, ["inc"], top_n=2, explore_slots=1)
+    assert set(r.wallet for r in seated) == {"inc", "new1"}
+    assert [r.wallet for r in seated] == ["new1", "inc"]     # returned by score
+
+
+def test_seat_roster_leaves_slots_contestable():
+    # Incumbency may claim only top_n - explore_slots seats; the rest go on
+    # rank, so a newcomer can still displace a weak incumbent.
+    ranked = [_score("inc1", .9), _score("new", .7), _score("inc2", .5)]
+    seated = seat_roster(ranked, ["inc1", "inc2"], top_n=2, explore_slots=1)
+    assert [r.wallet for r in seated] == ["inc1", "new"]
+
+
+def test_seat_roster_does_not_resurrect_an_ineligible_incumbent():
+    # A leader that failed the filters never reaches `ranked`, so incumbency
+    # cannot save it. Only failing a test loses a seat -- but it does lose it.
+    ranked = [_score("new1", .9), _score("new2", .8)]
+    seated = seat_roster(ranked, ["dropped"], top_n=2, explore_slots=1)
+    assert [r.wallet for r in seated] == ["new1", "new2"]
+
+
+def test_seat_roster_matches_the_wallet_case_insensitively():
+    ranked = [_score("0xAbC", .2), _score("new", .9)]
+    seated = seat_roster(ranked, ["0xabc"], top_n=1, explore_slots=0)
+    assert [r.wallet for r in seated] == ["0xAbC"]
+
+
+def test_seat_roster_disabled_is_plain_top_n():
+    ranked = [_score("new1", .9), _score("new2", .8), _score("inc", .3)]
+    seated = seat_roster(ranked, ["inc"], top_n=2, keep_incumbents=False)
+    assert [r.wallet for r in seated] == ["new1", "new2"]
+
+
+def test_seat_roster_never_exceeds_top_n_or_duplicates():
+    ranked = [_score(f"w{i}", 1.0 - i / 10) for i in range(6)]
+    seated = seat_roster(ranked, ["w4", "w5"], top_n=3, explore_slots=1)
+    assert len(seated) == 3
+    assert len({r.wallet for r in seated}) == 3
+    assert {"w4", "w5"} <= {r.wallet for r in seated}     # both protected seats
+
+
+def test_seat_roster_handles_no_incumbents_and_zero_seats():
+    ranked = [_score("a", .9), _score("b", .5)]
+    assert [r.wallet for r in seat_roster(ranked, [], top_n=2, explore_slots=2)] == ["a", "b"]
+    assert seat_roster(ranked, ["a"], top_n=0) == []
 
 
 # --- risk sizing ---------------------------------------------------------
