@@ -71,13 +71,15 @@ class HarvestData:
 
 def test_harvest_records_wallet_pnl_once(tmp_path):
     store = RecordStore(str(tmp_path / "rec.db"))
-    n = harvest_resolved_records(HarvestData(), HarvestGamma(), store)
+    # Pinned clock: the fixture markets are dated relative to NOW, and the
+    # harvest window is measured back from it.
+    n = harvest_resolved_records(HarvestData(), HarvestGamma(), store, now=NOW)
     assert n == 1
     summ = store.wallet_summaries((NOW - timedelta(days=30)).isoformat())
     assert summ["0xrec"] == (1, 0, pytest.approx(50.0))     # wallets lowercased
     assert summ["0xdud"] == (0, 1, pytest.approx(-50.0))
     # Second harvest: the market is already recorded — nothing new.
-    assert harvest_resolved_records(HarvestData(), HarvestGamma(), store) == 0
+    assert harvest_resolved_records(HarvestData(), HarvestGamma(), store, now=NOW) == 0
     store.close()
 
 

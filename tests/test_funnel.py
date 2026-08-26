@@ -69,8 +69,11 @@ class FeedData:
 
 
 def test_profile_candidates_estimates_win_quality():
+    # `now` is pinned: the fixtures carry dated markets, and the resolved-feed
+    # window is measured back from this instant, not from the wall clock.
     profiles = profile_candidates(FeedData(), FeedGamma(), top_open_markets=5,
-                                  top_closed_markets=5, per_market_trades=100)
+                                  top_closed_markets=5, per_market_trades=100,
+                                  now=NOW)
     assert set(profiles) == {"0xwin", "0xlose", "0xpaper"}
     win, lose, paper = profiles["0xwin"], profiles["0xlose"], profiles["0xpaper"]
     assert win.resolved_wins == 1 and win.resolved_pnl == pytest.approx(50.0)

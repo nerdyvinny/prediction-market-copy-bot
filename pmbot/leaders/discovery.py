@@ -103,12 +103,19 @@ def _winner_token(m: Market) -> str | None:
 
 
 def _recent_resolved_markets(
-    gamma: GammaClient, *, limit: int, lookback_days: int
+    gamma: GammaClient, *, limit: int, lookback_days: int,
+    now: datetime | None = None,
 ) -> list[Market]:
-    """Recently, decisively resolved markets — the exact-outcome sample."""
+    """Recently, decisively resolved markets — the exact-outcome sample.
+
+    `now` is injectable so callers (and tests) can pin the window; the rest of
+    the funnel already threads a clock this way. Reading the wall clock here
+    unconditionally made any test with dated fixtures pass only until real time
+    drifted `lookback_days` past them.
+    """
     if limit <= 0:
         return []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=lookback_days)
     try:
         # endDate ordering surfaces the freshest resolutions; fall back to
         # volume ordering if Gamma rejects the order key.
@@ -143,6 +150,7 @@ def profile_candidates(
     top_closed_markets: int = 30,
     per_market_trades: int = 1000,
     lookback_days: int = 30,
+    now: datetime | None = None,
 ) -> dict[str, FeedProfile]:
     """Build a FeedProfile for every wallet seen in the sampled feeds."""
     profiles: dict[str, FeedProfile] = {}
@@ -155,7 +163,7 @@ def profile_candidates(
         log.warning("discovery: failed to list open markets: %s", e)
         open_markets = []
     closed_markets = _recent_resolved_markets(
-        gamma, limit=top_closed_markets, lookback_days=lookback_days
+        gamma, limit=top_closed_markets, lookback_days=lookback_days, now=now
     )
 
     def profile(wallet: str) -> FeedProfile:

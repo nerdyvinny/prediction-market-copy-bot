@@ -473,6 +473,7 @@ class LeaderSelector:
             top_closed_markets=self.top_closed_markets,
             per_market_trades=self.per_market_trades,
             lookback_days=cfg.filters.lookback_days,
+            now=now,
         )
         record_quality: dict[str, float] = {}
         if self.record_store is not None:
@@ -482,6 +483,7 @@ class LeaderSelector:
                     market_limit=self.records_harvest_limit,
                     lookback_days=cfg.filters.lookback_days,
                     per_market_trades=self.per_market_trades,
+                    now=now,
                 )
                 since = (now - timedelta(days=cfg.filters.lookback_days)).isoformat()
                 for w, (wins, losses, pnl) in self.record_store.wallet_summaries(since).items():

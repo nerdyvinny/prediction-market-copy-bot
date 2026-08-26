@@ -132,12 +132,15 @@ def harvest_resolved_records(
     market_limit: int = 150,
     lookback_days: int = 30,
     per_market_trades: int = 1000,
+    now: datetime | None = None,
 ) -> int:
     """Ingest up to `market_limit` recently resolved markets the store hasn't
     seen yet; returns how many were recorded. Feed-fetch failures are skipped
     WITHOUT marking the market harvested, so they retry next rescore."""
     store.prune()
-    markets = _recent_resolved_markets(gamma, limit=market_limit, lookback_days=lookback_days)
+    markets = _recent_resolved_markets(
+        gamma, limit=market_limit, lookback_days=lookback_days, now=now
+    )
     done = store.harvested_ids()
     n_new = 0
     for m in markets:
