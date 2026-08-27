@@ -17,6 +17,7 @@ from pmbot.leaders.scoring import (
     passes_filters,
     rank_wallets,
     seat_roster,
+    win_rate_score,
 )
 from pmbot.models import Fill, LeaderTrade, Side, Signal
 from pmbot.portfolio.ledger import Ledger
@@ -167,6 +168,7 @@ def test_copyability_saturates_at_target():
 
 WEIGHTS = {"realized_pnl": .25, "win_rate": .25, "consistency": .0,
            "recency": .20, "copyability": .30}
+FLOOR = 0.80        # leaders.yaml min_win_rate; select() passes it to rank_wallets
 
 
 def test_copyability_breaks_the_tie_between_equal_wallets():
@@ -182,12 +184,9 @@ def test_copyability_promotes_the_wallet_we_could_actually_copy():
     """Regression on real numbers: the 2026-08-23 lineup as logged.
 
     0x5cd5c8d7 supplied 25 of the month's 91 buys -- more than any other
-    wallet -- yet ranked 3rd of 5 under the old weights, behind 0xfc25f141
-    which supplied one. Weighting copyability lifts it above that wallet.
-
-    Note this does NOT dethrone 0xd487f513 (2 buys all month): it tops both
-    money terms, and min-max normalisation hands a pool-leader the full weight
-    of each. Copyability narrows that gap rather than closing it.
+    wallet -- yet ranked LAST of 5 under the old weights, behind 0xfc25f141
+    which supplied one. Weighting copyability and anchoring win rate to the
+    eligibility floor lifts it to 2nd.
     """
     lineup = [                                    # pnl, win rate, copyable
         _ws("0xd487f513", pnl=56358, win=0.98, copyable=22),
@@ -197,25 +196,49 @@ def test_copyability_promotes_the_wallet_we_could_actually_copy():
         _ws("0xbb3eaeb8", pnl=6229, win=0.89, copyable=75),
     ]
     before = [r.wallet for r in rank_wallets(lineup, OLD_WEIGHTS)]
-    after = [r.wallet for r in rank_wallets(lineup, WEIGHTS, copyable_target=40)]
+    after = [r.wallet for r in rank_wallets(lineup, WEIGHTS, copyable_target=40,
+                                            win_rate_floor=FLOOR)]
 
     assert before.index("0xfc25f141") < before.index("0x5cd5c8d7")
     assert after.index("0x5cd5c8d7") < after.index("0xfc25f141")
     assert after.index("0x5cd5c8d7") == 1
 
 
-def test_copyability_cannot_outweigh_topping_both_money_terms():
-    """The known limit of this change, pinned so it is not mistaken for a bug.
+def test_win_rate_score_measures_up_from_the_eligibility_floor():
+    assert win_rate_score(0.80, 0.80) == 0.0        # exactly at the bar
+    assert win_rate_score(1.00, 0.80) == pytest.approx(1.0)
+    assert win_rate_score(0.90, 0.80) == pytest.approx(0.5)
+    assert win_rate_score(0.70, 0.80) == 0.0        # below the bar, clamped
+    assert win_rate_score(0.90, 0.0) == pytest.approx(0.9)   # floor off -> raw
+    assert win_rate_score(0.90, 1.0) == 0.0         # degenerate floor
 
-    A wallet that leads the pool on BOTH realized_pnl and win_rate collects the
-    full weight of each (min-max gives the leader 1.0), which outweighs the
-    copyability term on its own. Fixing that means changing how those two are
-    normalised, not the copyability weight.
-    """
-    rich = _ws("rich", pnl=9000.0, win=0.93, copyable=3)
-    usable = _ws("usable", pnl=4000.0, win=0.91, copyable=55)
-    ranked = rank_wallets([rich, usable], WEIGHTS, copyable_target=40)
-    assert [r.wallet for r in ranked] == ["rich", "usable"]
+
+def test_win_rate_no_longer_flattens_a_wallet_that_just_cleared_the_bar():
+    """The old bug: min-max across the SURVIVORS of a >=0.80 filter gave the
+    weakest of them a flat 0.0, so a 1-point win-rate gap was worth as much as
+    the entire copyability term. Anchored to the floor, 0.82 scores 0.10."""
+    assert win_rate_score(0.82, FLOOR) == pytest.approx(0.10)
+    lo = _ws("just-passed", pnl=5000.0, win=0.82, copyable=60)
+    hi = _ws("stellar", pnl=5000.0, win=0.98, copyable=2)
+    ranked = rank_wallets([lo, hi], WEIGHTS, copyable_target=40, win_rate_floor=FLOOR)
+    # A far more copyable wallet is no longer buried by a 16-point win-rate gap.
+    assert ranked[0].wallet == "just-passed"
+
+
+def test_win_rate_term_does_not_drift_when_only_the_pool_changes():
+    """Pool-relative terms re-rank a wallet for someone ELSE's change, which is
+    a churn source in its own right. The anchored term is absolute, so a wallet
+    scores the same whoever it is standing next to."""
+    a = _ws("a", pnl=5000.0, win=0.90, copyable=50)
+    b = _ws("b", pnl=5000.0, win=0.84, copyable=50)
+    newcomer = _ws("c", pnl=5000.0, win=0.99, copyable=50)
+
+    pair = {r.wallet: r.score for r in
+            rank_wallets([a, b], WEIGHTS, copyable_target=40, win_rate_floor=FLOOR)}
+    trio = {r.wallet: r.score for r in
+            rank_wallets([a, b, newcomer], WEIGHTS, copyable_target=40, win_rate_floor=FLOOR)}
+    assert pair["a"] == pytest.approx(trio["a"])
+    assert pair["b"] == pytest.approx(trio["b"])
 
 
 def test_copyability_is_ignored_when_unweighted():

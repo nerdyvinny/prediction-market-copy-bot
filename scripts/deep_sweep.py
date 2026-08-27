@@ -246,7 +246,9 @@ def main() -> int:
     _log(f"  filter rejects: {dict(fails)}")
     _log(f"  ELIGIBLE: {len(eligible)}   near-miss (fail exactly 1): {len(near_miss)}")
 
-    ranked = rank_wallets(eligible, cfg.weights)
+    ranked = rank_wallets(eligible, cfg.weights,
+                          copyable_target=cfg.selection.copyable_target,
+                          win_rate_floor=cfg.filters.min_win_rate)
     _log(f"\n=== ranked eligible wallets (top 25 of {len(ranked)}) ===")
     _log(f"  {'wallet':<44}{'score':>7}{'pnl':>12}{'wr':>7}{'res':>5}{'cpy':>5}  src")
     for r in ranked[:25]:

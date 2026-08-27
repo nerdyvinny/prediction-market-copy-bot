@@ -12,6 +12,7 @@ from pmbot.leaders.scoring import (
     passes_filters,
     rank_wallets,
     seat_roster,
+    win_rate_score,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "passes_filters",
     "rank_wallets",
     "seat_roster",
+    "win_rate_score",
 ]

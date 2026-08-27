@@ -106,7 +106,9 @@ def main() -> None:
 
     # -- 4a) pmbot selection: filters -> weighted rank -> top 8 -> vet ------
     eligible = [st for st in stats if passes_filters(st, cfg.filters)]
-    ranked = rank_wallets(eligible, cfg.weights)
+    ranked = rank_wallets(eligible, cfg.weights,
+                          copyable_target=cfg.selection.copyable_target,
+                          win_rate_floor=cfg.filters.min_win_rate)
     pmbot_pre = [r.wallet for r in ranked[: cfg.selection.top_n]]
     pmbot_kept: list[str] = []
     for w in pmbot_pre:

@@ -223,11 +223,31 @@ def copyability(n_copyable: int, target: int) -> float:
     return min(float(n_copyable), float(target)) / float(target)
 
 
+def win_rate_score(win_rate: float, floor: float) -> float:
+    """Win rate on an absolute 0..1 scale, measured up from the eligibility bar.
+
+    Every wallet that reaches ranking has ALREADY cleared `min_win_rate`, so
+    min-max normalising the survivors stretched a narrow band -- 0.81 to 0.98
+    in a typical live pool -- across the full range, and handed the pool's
+    weakest wallet a flat 0.0 for a win rate that had just passed the filter.
+    That made a 1-point win-rate difference worth as much as the entire
+    copyability term, and made the score move when only the *pool* changed.
+
+    Anchoring to the floor fixes both: the interesting range really is
+    [floor, 1.0], and the same wallet scores the same tomorrow. `floor` of 0
+    degrades to plain win rate, still absolute rather than pool-relative.
+    """
+    if floor >= 1.0:
+        return 0.0
+    return min(max((win_rate - floor) / (1.0 - floor), 0.0), 1.0)
+
+
 def rank_wallets(
     stats: list[WalletStats],
     weights: dict[str, float],
     *,
     copyable_target: int = 40,
+    win_rate_floor: float = 0.0,
 ) -> list[LeaderScore]:
     if not stats:
         return []
@@ -239,7 +259,7 @@ def rank_wallets(
         return [(v - lo) / (hi - lo) for v in values]
 
     pnl = norm([s.realized_pnl for s in stats])
-    wr = norm([s.win_rate for s in stats])
+    wr = [win_rate_score(s.win_rate, win_rate_floor) for s in stats]
     cons = norm([float(s.n_categories) for s in stats])
     rec = norm([-s.recency_days for s in stats])   # more recent -> higher
     cop = [copyability(s.n_copyable_trades, copyable_target) for s in stats]
@@ -542,7 +562,9 @@ class LeaderSelector:
                 eligible.append(st)
 
         ranked = rank_wallets(
-            eligible, cfg.weights, copyable_target=cfg.selection.copyable_target
+            eligible, cfg.weights,
+            copyable_target=cfg.selection.copyable_target,
+            win_rate_floor=cfg.filters.min_win_rate,
         )
         top = seat_roster(
             ranked,
