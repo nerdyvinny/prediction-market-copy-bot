@@ -1,0 +1,49 @@
+# PMB — paper loop + dashboard, both from one image, sharing pmbot.db over a
+# named volume. `restart: unless-stopped` is the Docker equivalent of the
+# systemd Restart=always: survives crashes and host reboots (given the Docker
+# daemon is enabled at boot, which it is by default).
+#
+# Golden rule still applies: run in exactly ONE place. Don't run this while the
+# Windows tasks (or the systemd units) are also live — they'd double-trade and
+# diverge the DB.
+#
+#   docker compose up -d --build      # start (build image on first run)
+#   docker compose logs -f paper      # watch the loop
+#   docker compose down               # stop (volume + DB persist)
+
+services:
+  paper:
+    build: .
+    image: pmbot:local
+    command: ["pmbot", "paper"]
+    environment:
+      # Override the DB path onto the shared volume. Beats any value in .env
+      # (pydantic: process env > .env file).
+      PMBOT_DB_PATH: /data/pmbot.db
+    volumes:
+      # Config loads exactly as on the host: pydantic reads ./.env from WORKDIR
+      # (/app). Read-only so the container can't mutate your config.
+      - ./.env:/app/.env:ro
+      - pmbot-data:/data
+    restart: unless-stopped
+
+  dashboard:
+    image: pmbot:local        # reuses the image built by `paper`
+    command: ["uvicorn", "pmbot.dashboard.app:app", "--host", "0.0.0.0", "--port", "8090"]
+    environment:
+      PMBOT_DB_PATH: /data/pmbot.db
+    volumes:
+      - ./.env:/app/.env:ro
+      - pmbot-data:/data
+    ports:
+      # Bind 0.0.0.0 INSIDE the container, but publish ONLY to the host's
+      # loopback — so the dashboard is reachable via an SSH tunnel and never
+      # exposed to the internet. Same privacy posture as the systemd unit.
+      # For LAN access, change to "8090:8090" (and add auth/TLS first).
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      - paper
+    restart: unless-stopped
+
+volumes:
+  pmbot-data:

@@ -1,0 +1,38 @@
+[Unit]
+Description=PMB read-only dashboard (uvicorn, 127.0.0.1:8090)
+Documentation=https://github.com/nerdyvinny/prediction-market-copy-bot
+After=network-online.target
+Wants=network-online.target
+# The dashboard only reads pmbot.db; nice-to-have ordering, not a hard dep.
+After=pmbot-paper.service
+
+[Service]
+Type=simple
+User=pmbot
+Group=pmbot
+
+WorkingDirectory=/opt/pmbot/prediction-market-copy-bot
+Environment=PYTHONUNBUFFERED=1
+
+# Bind 127.0.0.1 ONLY — same decision as the Windows runner. app.py's
+# __main__ block binds 0.0.0.0, which would expose portfolio/P&L/leader
+# wallets to every network the box is on. Reach it over an SSH tunnel
+# (see MIGRATION.md). Change to 0.0.0.0 here only if you deliberately want
+# it public AND you put auth + TLS in front of it.
+ExecStart=/opt/pmbot/prediction-market-copy-bot/.venv/bin/uvicorn pmbot.dashboard.app:app --host 127.0.0.1 --port 8090
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pmbot-dashboard
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/pmbot/prediction-market-copy-bot
+
+[Install]
+WantedBy=multi-user.target

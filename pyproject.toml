@@ -22,12 +22,21 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.2", "pytest-asyncio>=0.23"]
 live = ["py-clob-client>=0.34"]  # Phase 6 only — install in a Python 3.12 venv
+dashboard = ["fastapi>=0.115", "uvicorn>=0.30", "psutil>=5.9"]  # local web dashboard
 
 [project.scripts]
 pmbot = "pmbot.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pmbot*"]
+
+# leaders.yaml is resolved relative to `pmbot/leaders/config.py`'s __file__, so
+# a NON-editable install (the Docker image) finds it in site-packages or not at
+# all — and load_leader_config() falls back to the dataclass defaults without a
+# word. That silently narrowed max_hours_since_last_trade from the tuned 96h
+# back to 48h. Editable installs read the repo directly and never hit this.
+[tool.setuptools.package-data]
+pmbot = ["config/*.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

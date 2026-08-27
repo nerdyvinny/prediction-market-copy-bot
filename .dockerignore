@@ -1,0 +1,16 @@
+# Keep the build context small and never bake host state into the image.
+.venv/
+logs/
+*.log
+pmbot.db            # DB belongs on the shared volume, not in the image
+.env                # secrets/config are bind-mounted at runtime, not baked in
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/

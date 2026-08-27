@@ -5,31 +5,36 @@ from __future__ import annotations
 import pmbot.engine as engine_mod
 from pmbot.config import Settings
 from pmbot.engine import Engine
+from pmbot.leaders.config import load_leader_config as _load_leader_config
 from pmbot.leaders.scoring import LeaderScore, WalletStats
 from pmbot.models import Signal  # noqa: F401  (imported for type parity with engine)
 
 
 def _score(wallet):
-    st = WalletStats(wallet=wallet, n_trades=200, n_markets=30, n_resolved_markets=20,
-                     realized_pnl=1000.0, win_rate=0.7, n_categories=5,
-                     recency_days=1.0, concentration=0.2)
+    st = WalletStats(wallet=wallet, n_trades=200, n_markets=30, n_resolved_markets=28,
+                     realized_pnl=1000.0, win_rate=0.85, n_categories=5,
+                     recency_days=1.0, profit_concentration=0.2)
     return LeaderScore(wallet=wallet, score=0.9, stats=st)
 
 
 class FakeSelector:
     def __init__(self, wallets):
         self._wallets = wallets
+        self.seen_incumbents = None
 
-    def select(self, now=None):
+    def select(self, now=None, incumbents=None, **kwargs):
+        self.seen_incumbents = incumbents
         return [_score(w) for w in self._wallets]
 
 
 class FakeStrategy:
     def __init__(self):
         self.leaders = []
+        self.exit_only = []
 
-    def set_leaders(self, leaders):
+    def set_leaders(self, leaders, *, exit_only=None):
         self.leaders = leaders
+        self.exit_only = list(exit_only or [])
 
     def generate(self):
         return []
@@ -44,31 +49,234 @@ class FakeReport:
 
 
 class FakeVetter:
-    """Stub for ExactCopyBacktester: per-wallet canned results."""
+    """Stub for ExactCopyBacktester: canned results per wallet per window.
 
-    outcomes = {}
+    The engine calls simulate() twice per wallet — recent window first, then
+    the older consistency window — so a call counter picks the answer. Wallets
+    absent from `prior` get a clean older record, keeping tests that only care
+    about recent behaviour short.
+    """
+
+    outcomes = {}                  # wallet -> (n_trades, net_pnl), recent window
+    prior = {}                     # wallet -> (n_trades, net_pnl), older window
+    DEFAULT_PRIOR = (25, 40.0)
 
     def __init__(self, *a, **kw):
-        pass
+        self._calls = {}
 
-    def run(self, leaders, **kw):
-        return FakeReport(*self.outcomes[leaders[0]])
+    def fetch_tapes(self, leaders, **kw):
+        return {leaders[0]: []}    # content unused; simulate() is canned
+
+    def simulate(self, tapes, **kw):
+        wallet = next(iter(tapes))
+        n = self._calls.get(wallet, 0)
+        self._calls[wallet] = n + 1
+        if n == 0:
+            return FakeReport(*self.outcomes[wallet])
+        return FakeReport(*self.prior.get(wallet, self.DEFAULT_PRIOR))
 
 
-def test_vetting_drops_unprofitable_keeps_profitable_and_unknown(monkeypatch):
+def test_vetting_drops_unprofitable_and_unproven(monkeypatch):
+    """Absence of evidence is a rejection now, not a free pass."""
     monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
     FakeVetter.outcomes = {
         "0xgood": (25, 40.0),     # profitable copy -> keep
         "0xbad": (25, -30.0),     # loses money when copied -> drop
-        "0xthin": (0, 0.0),       # no evidence -> keep
+        "0xthin": (0, 0.0),       # never makes a trade we'd mirror -> drop
     }
+    FakeVetter.prior = {}
     s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
     strat = FakeStrategy()
     eng = Engine(settings=s, selector=FakeSelector(["0xgood", "0xbad", "0xthin"]),
                  strategy=strat)
     ranked = eng.rescore()
-    assert [r.wallet for r in ranked] == ["0xgood", "0xthin"]
-    assert strat.leaders == ["0xgood", "0xthin"]
+    assert [r.wallet for r in ranked] == ["0xgood"]
+    assert strat.leaders == ["0xgood"]
+    eng.close()
+
+
+def test_vetting_drops_too_few_trades_to_judge(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xlucky": (3, 90.0)}   # 3 wins is not a track record
+    FakeVetter.prior = {}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_min_trades=10)
+    eng = Engine(settings=s, selector=FakeSelector(["0xlucky"]), strategy=FakeStrategy())
+    assert eng.rescore() == []
+    eng.close()
+
+
+def test_vetting_drops_hot_streak_that_fails_out_of_sample(monkeypatch):
+    """Profitable in the scoring window, a loser before it — that's the luck
+    case the single-window test could never separate from skill.
+
+    The floor is pinned rather than left to default: unset, it scales off
+    `max_per_market_usd`, which a developer's .env can move underneath the
+    test.
+    """
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xhot": (25, 120.0), "0xreal": (25, 60.0)}
+    FakeVetter.prior = {"0xhot": (20, -80.0), "0xreal": (20, 45.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xhot", "0xreal"]),
+                 strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xreal"]
+    eng.close()
+
+
+def test_small_prior_loss_is_within_slack(monkeypatch):
+    """The 0x5cd5c8d7 case: dropped 2026-08-12 for a -$17.13 older window on
+    the same day its recent window hit its best-ever +$127.75.
+
+    The older window slides daily, so its P&L drifts on its own; a loss
+    smaller than one maximum position is that drift, not evidence.
+    """
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0x5cd5": (19, 127.75)}
+    FakeVetter.prior = {"0x5cd5": (23, -17.13)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0x5cd5"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0x5cd5"]
+    eng.close()
+
+
+def test_thin_prior_window_may_not_excuse_a_loss(monkeypatch):
+    """The hole that admitted the two worst leaders of the first month.
+
+    0xea83902f passed on a prior window of -$5.03 over SEVEN trades, traded
+    once and lost 92% of it. 0xf0ea0711 passed on -$26.90 over 13. Both sat
+    inside the -$50 slack, but that slack exists to absorb drift in a sliding
+    window, and a 7-trade window has not got enough trades to drift.
+    """
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (30, 223.57), "0xf0ea": (30, 259.78)}
+    FakeVetter.prior = {"0xthin": (7, -5.03), "0xf0ea": (13, -26.90)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin", "0xf0ea"]),
+                 strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == []
+    eng.close()
+
+
+def test_thin_prior_window_that_made_money_is_kept(monkeypatch):
+    """The other half, and the reason not to just raise the trade count: the
+    trade feed truncates around six weeks for a heavy trader, so a thin older
+    window is often missing data rather than a bad record. 0xe839e7fe sat on
+    10-13 prior trades for a fortnight while consistently PROFITABLE there.
+    """
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xe839": (68, 147.93)}
+    FakeVetter.prior = {"0xe839": (10, 41.56)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xe839"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xe839"]
+    eng.close()
+
+
+def test_thin_window_rule_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (30, 223.57)}
+    FakeVetter.prior = {"0xthin": (7, -5.03)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0, copy_vet_oos_thin_trades=0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xthin"]
+    eng.close()
+
+
+def test_combined_windows_must_still_be_profitable(monkeypatch):
+    """Slack on the older window must not become a hole. A prior loss inside
+    the slack still drops the leader if the recent window can't pay for it."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (25, 10.0)}     # clears the recent floor
+    FakeVetter.prior = {"0xthin": (20, -40.0)}       # inside the -50 slack
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin"]), strategy=FakeStrategy())
+    assert eng.rescore() == []                        # 10 - 40 = -30 overall
+    eng.close()
+
+
+def test_combined_check_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (25, 10.0)}
+    FakeVetter.prior = {"0xthin": (20, -40.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0, copy_vet_require_combined=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xthin"]
+    eng.close()
+
+
+def test_oos_floor_defaults_to_one_max_position(monkeypatch):
+    """Unset, the slack tracks the size of a single bet."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xa": (25, 200.0), "0xb": (25, 200.0)}
+    FakeVetter.prior = {"0xa": (20, -60.0), "0xb": (20, -140.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 max_per_market_usd=100.0, copy_vet_oos_min_pnl_usd=None)
+    eng = Engine(settings=s, selector=FakeSelector(["0xa", "0xb"]),
+                 strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xa"]   # -60 inside, -140 past
+    eng.close()
+
+
+def test_allowlisted_leader_bypasses_vetting(monkeypatch, tmp_path):
+    """A manual pin is the override for when the automation gets it wrong, so
+    vetting must not be able to undo it — otherwise the allowlist bypasses the
+    selection filters only to lose the wallet one stage later."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    cfg = tmp_path / "leaders.yaml"
+    cfg.write_text('allowlist: ["0xpinned"]\nblocklist: []\n', encoding="utf-8")
+    monkeypatch.setattr(engine_mod, "load_leader_config",
+                        lambda *a, **kw: _load_leader_config(cfg))
+    # Numbers that would be dropped on every count: loses when copied, no
+    # track record to judge it on, and a losing older window.
+    FakeVetter.outcomes = {"0xpinned": (2, -500.0)}
+    FakeVetter.prior = {"0xpinned": (0, -900.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xpinned"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xpinned"]
+    eng.close()
+
+
+def test_vetting_drops_wallet_with_no_history_before_the_window(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xbrandnew": (25, 70.0)}
+    FakeVetter.prior = {"0xbrandnew": (0, 0.0)}     # tape starts inside the window
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xbrandnew"]),
+                 strategy=FakeStrategy())
+    assert eng.rescore() == []
+    eng.close()
+
+
+def test_consistency_check_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xhot": (25, 120.0)}
+    FakeVetter.prior = {"0xhot": (20, -80.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_require_consistency=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xhot"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xhot"]
+    eng.close()
+
+
+def test_lineup_is_not_padded_to_top_n(monkeypatch):
+    """The follow list is however many wallets are proven — not a quota."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {f"0xw{i}": (25, 40.0 if i < 3 else -10.0) for i in range(8)}
+    FakeVetter.prior = {}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    strat = FakeStrategy()
+    eng = Engine(settings=s, selector=FakeSelector([f"0xw{i}" for i in range(8)]),
+                 strategy=strat)
+    assert len(eng.rescore()) == 3
+    assert strat.leaders == ["0xw0", "0xw1", "0xw2"]
     eng.close()
 
 
@@ -78,4 +286,147 @@ def test_vetting_disabled_keeps_everyone(monkeypatch):
     s = Settings(db_path=":memory:", copy_vet_leaders=False, arb_enabled=False)
     eng = Engine(settings=s, selector=FakeSelector(["0xbad"]), strategy=FakeStrategy())
     assert [r.wallet for r in eng.rescore()] == ["0xbad"]
+    eng.close()
+
+
+def test_rescore_seeds_incumbents_from_open_positions(monkeypatch):
+    """Feed churn must never drop a leader we hold copied positions from:
+    open-position leaders are passed as incumbents even on a fresh engine."""
+    from datetime import datetime, timezone
+    from pmbot.models import Fill, Side, Signal
+
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xnew": (25, 40.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    sel = FakeSelector(["0xnew"])
+    eng = Engine(settings=s, selector=sel, strategy=FakeStrategy())
+    buy = Signal(market_id="m1", token_id="t1", outcome="Yes", side=Side.BUY,
+                 target_price=0.5, size_usd=50, reason="copy",
+                 source_leader="0xheld", source_uid="u1")
+    eng.ledger.record_fill(Fill(signal=buy, fill_price=0.5, size_usd=50, shares=100,
+                                timestamp=datetime.now(timezone.utc), mode="paper"))
+
+    eng.rescore()
+    assert sel.seen_incumbents == ["0xheld"]   # from the ledger, engine was fresh
+
+    # Followed leaders join the incumbent set on the next rescore.
+    eng.rescore()
+    assert sel.seen_incumbents == ["0xheld", "0xnew"]
+    eng.close()
+
+
+def test_rescore_persists_follow_list_across_restarts(monkeypatch, tmp_path):
+    """A followed leader with NO copied trades yet must survive a restart:
+    the rescore persists the follow list to the ledger, and a fresh engine
+    seeds incumbents from it. An empty rescore must NOT wipe the list."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xwhale": (25, 40.0)}
+    db = str(tmp_path / "eng.db")
+
+    s = Settings(db_path=db, copy_vet_leaders=True, arb_enabled=False)
+    eng = Engine(settings=s, selector=FakeSelector(["0xwhale"]), strategy=FakeStrategy())
+    eng.rescore()
+    eng.close()
+
+    # Restart: no fills in the ledger, yet the whale is still an incumbent.
+    sel = FakeSelector([])                       # feeds lost sight of everyone
+    eng2 = Engine(settings=s, selector=sel, strategy=FakeStrategy())
+    eng2.rescore()
+    assert sel.seen_incumbents == ["0xwhale"]
+    eng2.close()
+
+    # The empty rescore above must have kept (not wiped) the persisted list.
+    sel3 = FakeSelector([])
+    eng3 = Engine(settings=s, selector=sel3, strategy=FakeStrategy())
+    eng3.rescore()
+    assert sel3.seen_incumbents == ["0xwhale"]
+    eng3.close()
+
+
+def test_empty_rescore_keeps_current_leaders_and_watchlist(monkeypatch):
+    """API trouble (or a starved funnel) must not stop copying: an empty
+    rescore keeps the current leader set instead of wiping it and thrashing."""
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xgood": (25, 40.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    strat = FakeStrategy()
+    eng = Engine(settings=s, selector=FakeSelector(["0xgood"]), strategy=strat)
+    eng.rescore()
+    assert [r.wallet for r in eng.leaders] == ["0xgood"]
+
+    eng.selector = FakeSelector([])              # feeds lose everyone
+    eng.rescore()
+    assert [r.wallet for r in eng.leaders] == ["0xgood"]   # kept, not wiped
+    assert strat.leaders == ["0xgood"]                     # watchlist intact
+    eng.close()
+
+
+def test_rescore_passes_dropped_leaders_with_open_positions_as_exit_only(monkeypatch):
+    """A leader missing from the ranked list while we still hold their copied
+    positions goes to the strategy as exit-only (SELL mirroring continues)."""
+    from datetime import datetime, timezone
+    from pmbot.models import Fill, Side, Signal
+
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xnew": (25, 40.0)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False)
+    strat = FakeStrategy()
+    eng = Engine(settings=s, selector=FakeSelector(["0xnew"]), strategy=strat)
+    buy = Signal(market_id="m1", token_id="t1", outcome="Yes", side=Side.BUY,
+                 target_price=0.5, size_usd=50, reason="copy",
+                 source_leader="0xheld", source_uid="u1")
+    eng.ledger.record_fill(Fill(signal=buy, fill_price=0.5, size_usd=50, shares=100,
+                                timestamp=datetime.now(timezone.utc), mode="paper"))
+
+    eng.rescore()
+    assert strat.leaders == ["0xnew"]
+    assert strat.exit_only == ["0xheld"]
+    eng.close()
+
+
+# --- settle scheduling ----------------------------------------------------
+class _CountingSettler:
+    def __init__(self):
+        self.calls = 0
+
+    def settle_open_positions(self):
+        self.calls += 1
+        return 0
+
+
+def test_first_settle_sweep_runs_immediately_after_boot(monkeypatch):
+    """Regression: the first sweep must not wait out a whole settle interval.
+
+    `_last_settle` was 0.0 and compared against `time.monotonic()`, which is
+    seconds since BOOT on Linux. On a freshly rebooted VM `now - 0.0` was less
+    than the interval, so every already-resolved position stayed unsettled —
+    and its bankroll pinned — for up to half an hour, the exact thing a
+    30-minute settle interval exists to prevent.
+    """
+    s = Settings(db_path=":memory:", copy_vet_leaders=False, arb_enabled=False,
+                 settle_interval_hours=0.5, poll_interval_seconds=0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xgood"]), strategy=FakeStrategy())
+    settler = _CountingSettler()
+    eng.settler = settler
+    # Simulate a machine that booted 60s ago: monotonic() is small.
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: 60.0)
+    monkeypatch.setattr(engine_mod.time, "sleep", lambda _s: None)
+
+    eng.run(max_cycles=1)
+    assert settler.calls == 1
+    eng.close()
+
+
+def test_settle_sweep_does_not_rerun_inside_the_interval(monkeypatch):
+    """...and having run, it waits the full interval before the next one."""
+    s = Settings(db_path=":memory:", copy_vet_leaders=False, arb_enabled=False,
+                 settle_interval_hours=0.5, poll_interval_seconds=0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xgood"]), strategy=FakeStrategy())
+    settler = _CountingSettler()
+    eng.settler = settler
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: 60.0)
+    monkeypatch.setattr(engine_mod.time, "sleep", lambda _s: None)
+
+    eng.run(max_cycles=3)
+    assert settler.calls == 1        # once, not once per cycle
     eng.close()

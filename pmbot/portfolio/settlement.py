@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from pmbot.data import GammaClient, KalshiClient
 from pmbot.models import Fill, Position, Side, Signal, Venue
-from pmbot.portfolio.ledger import Ledger
+from pmbot.portfolio.ledger import SETTLEMENT_REASON, Ledger
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +29,8 @@ class Settler:
         """Settle every open position whose market has resolved.
 
         Returns the number of positions settled. Per-position failures are
-        isolated (a dead API can't block the rest).
+        isolated — neither a dead API nor a failed ledger write can block the
+        rest of the sweep.
         """
         settled = 0
         for pos in self.ledger.get_positions():
@@ -40,9 +41,32 @@ class Settler:
                 continue
             if price is None:
                 continue
-            self._record_settlement(pos, price)
+            try:
+                self._record_settlement(pos, price)
+            except Exception as e:
+                # The write used to sit outside the guard, so one failure (a
+                # locked DB, a full disk) aborted the whole sweep and left
+                # every later resolved position unsettled — with its bankroll
+                # pinned until the next interval. A write failure isn't
+                # transient noise, so it logs louder than a lookup miss.
+                log.warning("settle: recording %s failed: %s", pos.token_id[:24], e)
+                continue
             settled += 1
         return settled
+
+    def force_settle_market(self, market_id: str, price: float) -> int:
+        """Manually settle every open position in one market at `price`.
+
+        Escape hatch for markets that never resolve decisively (final winner
+        price below the 0.99 auto-settle threshold) — without it their
+        positions pin bankroll forever. Returns positions settled.
+        """
+        n = 0
+        for pos in self.ledger.get_positions():
+            if pos.market_id == market_id:
+                self._record_settlement(pos, price)
+                n += 1
+        return n
 
     # -- resolution lookups ------------------------------------------------
     def _settlement_price(self, pos: Position) -> float | None:
@@ -78,7 +102,10 @@ class Settler:
             side=side,
             target_price=price,
             size_usd=round(shares * price, 6),
-            reason="settlement",
+            # Leader attribution keys off this exact string: it marks where a
+            # token's previous round ended, so earlier fills stop counting
+            # toward any leader's slice. See `_SINCE_SETTLEMENT`.
+            reason=SETTLEMENT_REASON,
             venue=pos.venue,
         )
         fill = Fill(

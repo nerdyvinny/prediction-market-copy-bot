@@ -33,12 +33,19 @@ class Settings(BaseSettings):
     gamma_api_base: str = "https://gamma-api.polymarket.com"
     clob_api_base: str = "https://clob.polymarket.com"
     kalshi_api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
+    # Polymarket US (QCX LLC) public gateway — a separate CFTC-designated
+    # venue, NOT the global CLOB above. Read-only; trading there needs the
+    # authenticated api.polymarket.us host and is not wired up.
+    polymarket_us_api_base: str = "https://gateway.polymarket.us"
 
     # Poll loop. Every second of lag is edge lost to the drift guard, so poll
     # as fast as is polite to the public Data API (8 leader queries/cycle).
     poll_interval_seconds: float = 10.0
     # How often to check open positions for resolved markets (realize P&L).
-    settle_interval_hours: float = 6.0
+    # Settling is cheap (one Gamma call per open position) and every hour a
+    # resolved position sits unsettled is bankroll that can't fund new copies,
+    # so check often.
+    settle_interval_hours: float = 0.5
 
     # Capital & sizing. Walk-forward validated 2026-07 (tuned on the 45d
     # window ending 45d ago, validated on the most recent 45d): 0.10/100/400
@@ -47,13 +54,29 @@ class Settings(BaseSettings):
     bankroll_usd: float = 500.0
     copy_fraction: float = 0.10            # replicate this fraction of leader size
     max_per_market_usd: float = 100.0      # hard cap per market
+    # Per-market cap as a FRACTION of bankroll. When set it replaces
+    # `max_per_market_usd` outright (see `per_market_cap_usd`), so the cap
+    # scales with the account instead of drifting out of proportion whenever
+    # the bankroll changes. Live since 2026-08-13 at 0.03 -> $15 on $500,
+    # down from the flat $50: with $439 of $500 deployed across 11 positions,
+    # a single copy was risking 10% of the book. Default None so every sweep
+    # script that passes an explicit dollar cap is unaffected.
+    max_per_market_pct: float | None = None
     max_per_leader_usd: float = 400.0      # hard cap of exposure per leader
-    # Redeploy realized profits (and shrink after losses): free bankroll is
-    # bankroll + realized P&L - deployed, instead of a fixed starting amount.
-    # Off by default: in validation the extra compounding-funded trades were
-    # net losers ($1,333 vs $1,471); flip on for long horizons if desired.
+    # Redeploy realized profits: free bankroll is bankroll + realized P&L -
+    # deployed, instead of a fixed starting amount. Off by default: in
+    # validation the extra compounding-funded trades were net losers ($1,333
+    # vs $1,471). Note: net realized LOSSES always shrink the free bankroll
+    # regardless of this flag — a real account can't redeploy money it lost.
     compound_profits: bool = False
     min_market_liquidity_usd: float = 5000.0  # skip thin markets
+
+    # Smallest ENTRY worth placing: below this a copy is dust that dies to
+    # slippage. Exits are deliberately exempt — a leader trimming a small slice
+    # produced a sub-$1 exit that was silently rejected and then re-offered
+    # every poll, so the position could never be closed at all. Closing risk is
+    # never blocked; `exit_dust_usd` handles the genuinely negligible crumb.
+    min_ticket_usd: float = 1.0
 
     # Paper fill model.
     slippage_bps: float = 60.0             # assumed adverse slippage (0.60%)
@@ -74,19 +97,94 @@ class Settings(BaseSettings):
     # bounds how far a live fill can deviate from what the backtests assume
     # (they fill at the leader's price ± slippage), so keep it tight.
     copy_max_price_drift: float = 0.03
+    # Never copy a leader BUY older than this (minutes; 0 = off). Protects
+    # against replaying stale history when a NEW leader is first followed (or
+    # after downtime): their recent tape all looks "unseen", and the drift
+    # guard alone lets through old trades whose price happens to be unchanged.
+    # SELLs are never age-filtered — mirroring an exit reduces risk at any age.
+    copy_max_trade_age_minutes: float = 60.0
     # Only copy leader BUYs at or above this notional: a leader's small probes
     # carry little conviction and our slice of them dies to slippage/dust caps.
     # SELLs are always mirrored (reducing risk should never be filtered).
     # Swept 2026-07: $500 floor roughly doubled ROI vs $0/$100 at every
     # lookback (12-17% vs 1-8%) — conviction filtering is the biggest lever.
     copy_min_leader_notional_usd: float = 500.0
+    # A mirrored exit sizes off the leader's own exit ratio, which is rarely
+    # exactly 1.0 — a leader who leaves 0.001% behind makes us leave a crumb
+    # too, and the ledger's open test (ABS(shares) > 1e-9) then counts that
+    # fully-closed trade as open forever. When on, an exit that would leave
+    # less than `exit_dust_usd` of THIS leader's slice takes the whole slice.
+    # Clamped to the leader's own slice, never the combined position, so it
+    # can never liquidate another leader's copy of the same token.
+    #
+    # On by default: this is a hygiene fix, not a strategy knob. A backtest
+    # cannot measure it (the harness settles every position, so dust never
+    # survives) — 60d on the 8 live leaders was byte-identical at $5,032.48
+    # net both ways while the branch fired 24 times for $0.016 total. Its real
+    # risk is multi-leader safety, covered by tests/test_multi_leader_exits.py.
+    # Set PMBOT_SWEEP_EXIT_DUST=false to fall back to the old behaviour.
+    sweep_exit_dust: bool = True
+    exit_dust_usd: float = 0.01
+    # Don't copy a leader BUY when the same `get_trades` window already shows
+    # them fully back out of it. Both halves of a completed round-trip land in
+    # one poll cycle, so we'd open and close at the same current price —
+    # capturing none of the leader's move and paying the spread twice. The age
+    # filter can't catch these: the entry really is minutes old, just already
+    # dead. Only FULL exits retire an entry; a leader who trimmed and still
+    # holds is still expressing conviction. Set PMBOT_SKIP_ROUND_TRIPPED_ENTRIES
+    # =false to fall back to the old behaviour.
+    skip_round_tripped_entries: bool = True
     # After scoring, vet each would-be leader by backtesting an exact copy of
     # their recent tape; drop leaders whose copy P&L comes out below the floor.
     # (Scoring measures THEIR profit; vetting measures OURS, after our sizing,
     # caps and slippage — a leader can be profitable yet not copyable.)
     copy_vet_leaders: bool = True
-    copy_vet_lookback_days: int = 45
+    copy_vet_lookback_days: int = 30   # matches the 30d selection window
     copy_vet_min_pnl_usd: float = 0.0
+    # --- proof requirements (2026-08-06) --------------------------------
+    # Vetting used to fail OPEN: a wallet with no copyable resolved trades was
+    # kept "no evidence either way". That is how an unfollowable wallet held a
+    # slot for weeks making zero trades, and how wallets with no history at all
+    # got followed. Absence of evidence is now a rejection, not a pass.
+    copy_vet_min_trades: int = 10      # copyable resolved trades needed to judge
+    # A single recent window is in-sample by construction: the same window that
+    # picks a wallet also scores it, so one hot month reads as skill. Require a
+    # SECOND, older, non-overlapping window to be profitable too. The older
+    # window is [now - oos_lookback_days, now - lookback_days].
+    copy_vet_require_consistency: bool = True
+    copy_vet_oos_lookback_days: int = 90
+    copy_vet_oos_min_trades: int = 5   # lower bar: older tape is thinner
+    # Below this many trades the older window is too thin for `oos_min_pnl_usd`
+    # slack to mean anything, so it must be outright PROFITABLE. The slack is
+    # calibrated for a window with enough trades to be noisy; on 9 trades a
+    # -$21 window is not drift, it is the whole record. Deliberately does NOT
+    # reject a thin window that made money -- the tape truncates at ~6 weeks
+    # for heavy traders, so thin often means missing data, not a bad leader.
+    copy_vet_oos_thin_trades: int = 15
+    # The older window is a SLIDING one: every day it drops trades off the back
+    # and picks up newer ones at the front, so its P&L wanders on its own even
+    # when the leader's behaviour is unchanged. Judging it against the same $0
+    # floor as the recent window made that wander a firing pin. Two leaders were
+    # dropped on it while strongly profitable recently — 0x06a22231 (recent
+    # +$72.04, prior -$4.51) and 0x5cd5c8d7 (recent +$127.75, prior -$17.13,
+    # its best recent reading ever, after four days parked at +$14.01). Every
+    # leader the rule KEPT sat between +$14 and +$1,570, so the boundary was
+    # doing nothing but clipping noise near zero.
+    #
+    # The floor is now separate and slack by one maximum position: a prior
+    # window that lost less than a single bet is not evidence of anything.
+    # `_vet_leaders` scales it to `max_per_market_usd` when this is None.
+    copy_vet_oos_min_pnl_usd: float | None = None
+    # ...but slack on one window must not let a hot streak paper over a bad
+    # history, which is the whole point of looking back. The two windows
+    # TOGETHER still have to clear `copy_vet_min_pnl_usd`, so a leader can be
+    # mildly negative in the older window only if the recent one more than
+    # pays for it.
+    copy_vet_require_combined: bool = True
+    # Vetting can no longer be bricked open, but a transient backtest error is
+    # not proof of anything either — such a wallet is skipped for this rescore.
+    # `_apply_rescore` already keeps the last good set if everything drops out.
+    copy_vet_fail_open: bool = False
     # EXPERIMENTAL: scale each leader's copy_fraction by their vet-backtest
     # ROI relative to the pack (clamped 0.5x-2x). Off by default: Data-API
     # tape depth couldn't reach the tune window for heavy traders, so this
@@ -128,6 +226,19 @@ class Settings(BaseSettings):
     clob_api_key: str | None = None
     clob_api_secret: str | None = None
     clob_api_passphrase: str | None = None
+
+    @property
+    def per_market_cap_usd(self) -> float:
+        """The per-market cap actually in force, in dollars.
+
+        `max_per_market_pct` wins when set; otherwise the fixed dollar cap.
+        Anything that ENFORCES or REPORTS the per-market cap must read this
+        rather than `max_per_market_usd` — reading the raw field silently
+        ignores a percentage cap and sizes off a number nothing applies.
+        """
+        if self.max_per_market_pct is not None:
+            return self.bankroll_usd * self.max_per_market_pct
+        return self.max_per_market_usd
 
 
 @lru_cache

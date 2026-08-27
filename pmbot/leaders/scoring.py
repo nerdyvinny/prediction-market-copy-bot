@@ -1,37 +1,68 @@
 """Score candidate wallets and pick the top-N leaders to copy.
 
-`compute_wallet_stats` is pure (inject a `resolver`) so the P&L reconstruction
-is unit-testable offline. `LeaderSelector` wires it to the live APIs.
+The selection funnel (LeaderSelector.select):
+
+  1. PROFILE the whole pool from market feeds (discovery.profile_candidates)
+     — a few hundred API calls regardless of pool size.
+  2. SHORTLIST the wallets whose feed profile already shows winning behavior
+     (plus incumbents, the allowlist, and a random exploration slice so we
+     are never systematically blind to wallets the feeds under-sample).
+  3. DEEP-SCORE the shortlist in parallel from each wallet's own full tape,
+     with cheap early exits (dead or too-quiet wallets are rejected from the
+     first page, before any resolution lookups).
+  4. FILTER -> RANK -> top-N, and keep a rejection report (`last_report`)
+     showing what each stage and each filter eliminated.
+
+`compute_wallet_stats` is pure (inject a `resolver`) so the P&L
+reconstruction is unit-testable offline.
 
 Reconstruction approach: replay a wallet's trades through the same signed
 average-cost accounting the ledger uses (`apply_fill`). Sells realize P&L vs.
-prior buys; positions still open in a *resolved* market are settled at the
-outcome payout (1.0 winner / 0.0 loser). Win rate is over resolved markets.
+prior buys — clamped to the shares actually tracked in the window, since
+Polymarket has no naked shorts and a sell-from-zero can only be the exit of a
+pre-window position (scoring it as a short would fake losses on winners).
+Positions still open in a *resolved* market are settled at the outcome payout
+(1.0 winner / 0.0 loser). Win rate is over resolved markets.
 
-Honest caveats (refined in Strategy #2):
+Honest caveats:
 - "categories" uses distinct event groups (event_slug) as a breadth proxy.
-- win-rate is only enforced once enough markets have resolved.
-- only the wallet's most recent `trades_limit` trades are considered.
+- the Data API silently truncates deep tapes (~1-2k trades), so hyperactive
+  wallets' windows can be partially covered even with pagination.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+import math
+import random
+import threading
+from collections import Counter, defaultdict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from pmbot.data.resolution_cache import ResolutionStore
 from pmbot.leaders.config import FilterConfig, LeaderConfig, load_leader_config
-from pmbot.leaders.discovery import harvest_candidates
-from pmbot.models import LeaderTrade
+from pmbot.leaders.discovery import _shrunk_win_frac, profile_candidates
+from pmbot.leaders.records import RecordStore, harvest_resolved_records
+from pmbot.models import LeaderTrade, Side
 from pmbot.portfolio.ledger import apply_fill
 
 log = logging.getLogger(__name__)
 
 # resolver(condition_id) -> (closed, winning_token_id)
 Resolver = Callable[[str], tuple[bool, str | None]]
+
+# Early-exit reject reasons (cheap checks that skip resolution lookups).
+# They reuse filter names so the rejection report reads as one story.
+_REJECT_TRADES = "min_trades"
+_REJECT_RECENCY = "recency"
+_REJECT_COPYABLE = "copyable_trades"
+_REJECT_TAPE_SPAN = "tape_span"
+_REJECT_ERROR = "fetch_error"
 
 
 @dataclass
@@ -44,7 +75,11 @@ class WalletStats:
     win_rate: float
     n_categories: int
     recency_days: float
-    concentration: float
+    # Largest single market's profit / total profit (0 when not net-positive;
+    # can exceed 1.0 when one big win is propping up net losers elsewhere).
+    profit_concentration: float
+    # BUYs the copy strategy would actually mirror (notional + price band).
+    n_copyable_trades: int = 0
 
 
 @dataclass
@@ -59,9 +94,19 @@ def compute_wallet_stats(
     trades: list[LeaderTrade],
     resolver: Resolver,
     now: datetime | None = None,
+    *,
+    copyable_notional_min: float = 0.0,
+    copyable_price_min: float = 0.0,
+    copyable_price_max: float = 1.0,
 ) -> WalletStats:
     now = now or datetime.now(timezone.utc)
     trades = sorted(trades, key=lambda t: t.timestamp)
+    n_copyable = sum(
+        1 for t in trades
+        if t.side is Side.BUY
+        and t.usd_size >= copyable_notional_min
+        and copyable_price_min <= t.price <= copyable_price_max
+    )
 
     pos: dict[str, tuple[float, float]] = {}      # token -> (shares, avg)
     token_market: dict[str, str] = {}
@@ -73,22 +118,34 @@ def compute_wallet_stats(
     for t in trades:
         if not t.token_id or not t.market_id:
             continue
+        last_ts = t.timestamp              # any trade counts as activity/recency
+        shares, avg = pos.get(t.token_id, (0.0, 0.0))
+        fill_shares = t.shares
+        if t.side is Side.SELL:
+            # Polymarket has no naked shorts: a SELL beyond the shares we've
+            # tracked means the BUY predates this window. Realize only the
+            # tracked part and never fabricate a short position — the old
+            # behavior scored a pre-window winner's profitable exit as a
+            # losing "short" bet, systematically failing exactly the patient
+            # long-horizon wallets the filters are meant to find.
+            fill_shares = min(t.shares, shares) if shares > 0 else 0.0
+            if fill_shares <= 1e-9:
+                continue                   # exit of an untracked position: unscoreable
         token_market[t.token_id] = t.market_id
         market_gross[t.market_id] += t.usd_size
         if t.event_slug:
             categories.add(t.event_slug)
-        shares, avg = pos.get(t.token_id, (0.0, 0.0))
-        eff = apply_fill(shares, avg, t.side, t.shares, t.price)
+        eff = apply_fill(shares, avg, t.side, fill_shares, t.price)
         pos[t.token_id] = (eff.new_shares, eff.new_avg)
         market_realized[t.market_id] += eff.realized_delta
-        last_ts = t.timestamp
 
     # Settle still-open positions in resolved markets; mark resolved markets.
     resolved: set[str] = set()
     resolution_cache: dict[str, tuple[bool, str | None]] = {}
     for market in market_gross:
-        closed, winner = resolution_cache.setdefault(market, resolver(market))
-        if closed:
+        if market not in resolution_cache:
+            resolution_cache[market] = resolver(market)
+        if resolution_cache[market][0]:
             resolved.add(market)
     for token, (shares, avg) in pos.items():
         if abs(shares) <= 1e-9:
@@ -103,8 +160,8 @@ def compute_wallet_stats(
     n_resolved = len(resolved)
     wins = sum(1 for m in resolved if market_realized[m] > 0)
     win_rate = wins / n_resolved if n_resolved else 0.0
-    total_gross = sum(market_gross.values())
-    concentration = (max(market_gross.values()) / total_gross) if total_gross else 0.0
+    best_market = max((v for v in market_realized.values() if v > 0), default=0.0)
+    profit_concentration = best_market / realized_pnl if realized_pnl > 0 else 0.0
     recency_days = (now - last_ts).total_seconds() / 86_400 if last_ts else 1e9
 
     return WalletStats(
@@ -116,26 +173,131 @@ def compute_wallet_stats(
         win_rate=win_rate,
         n_categories=len(categories),
         recency_days=recency_days,
-        concentration=concentration,
+        profit_concentration=profit_concentration,
+        n_copyable_trades=n_copyable,
     )
 
 
-def passes_filters(st: WalletStats, f: FilterConfig) -> bool:
-    if st.n_trades < f.min_resolved_trades:
-        return False
+def failing_filters(st: WalletStats, f: FilterConfig) -> list[str]:
+    """Every filter this wallet fails (empty = eligible). Names match the
+    yaml knobs so the rejection report maps 1:1 to what you'd tune."""
+    fails: list[str] = []
+    if st.n_trades < f.min_trades:
+        fails.append("min_trades")
+    if st.recency_days * 24.0 > f.max_hours_since_last_trade:
+        fails.append("recency")
     if st.realized_pnl < f.min_realized_pnl_usd:
-        return False
+        fails.append("pnl")
     if st.n_categories < f.min_distinct_categories:
-        return False
-    if st.concentration > f.max_position_concentration:
-        return False
-    # Only enforce win-rate once we have a meaningful resolved sample.
-    if st.n_resolved_markets >= 5 and st.win_rate < f.min_win_rate:
-        return False
-    return True
+        fails.append("categories")
+    if st.n_resolved_markets < f.min_resolved_markets:
+        fails.append("resolved_markets")
+    if st.win_rate < f.min_win_rate:
+        fails.append("win_rate")
+    if st.profit_concentration > f.max_profit_concentration:
+        fails.append("profit_concentration")
+    if st.n_copyable_trades < f.min_copyable_trades:
+        fails.append("copyable_trades")
+    return fails
 
 
-def rank_wallets(stats: list[WalletStats], weights: dict[str, float]) -> list[LeaderScore]:
+def passes_filters(st: WalletStats, f: FilterConfig) -> bool:
+    return not failing_filters(st, f)
+
+
+def copyability(n_copyable: int, target: int) -> float:
+    """How much of a wallet's tape we could actually mirror, on a 0..1 scale.
+
+    Saturating on purpose. A wallet with 200 copyable BUYs in the window is a
+    scalper, not five times more followable than one with 40 -- and the live
+    tape bears that out: the highest-copyable wallet of the month was also the
+    worst leader. Rewarding "enough to be worth following" beats rewarding raw
+    volume.
+
+    Deliberately NOT min-max normalised like the other ranking components.
+    Those are relative to whoever else happens to be in the pool that day, so a
+    wallet's score drifts when nothing about the wallet changed; an absolute
+    scale keeps this term stable across rescores.
+    """
+    if target <= 0:
+        return 0.0
+    return min(float(n_copyable), float(target)) / float(target)
+
+
+def pnl_score(realized_pnl: float, floor_usd: float, target_usd: float) -> float:
+    """Realized P&L on an absolute 0..1 scale, log-spaced between two anchors.
+
+    Min-maxing dollar P&L let one whale flatten the field: on a live pool
+    spanning $1.5k to $56k, every wallet but the largest scored below 0.20 and
+    the largest scored exactly 1.0. The term therefore encoded little beyond
+    "is this the richest wallet in today's pool", and it moved for everyone
+    whenever the richest wallet joined or left.
+
+    Log-spaced because a leader's absolute P&L tracks their bankroll at least
+    as much as their skill, and we copy a fixed small fraction of their size
+    either way: $50k is better evidence than $5k, but not ten times better.
+    Absolute anchors so the term does not drift with the pool. Everything at
+    or below `floor_usd` scores 0 -- the filters already require P&L above
+    `min_realized_pnl_usd`, so this only separates the profitable.
+    """
+    if floor_usd <= 0 or target_usd <= floor_usd:
+        return 0.0
+    if realized_pnl <= floor_usd:
+        return 0.0
+    return min(
+        math.log(realized_pnl / floor_usd) / math.log(target_usd / floor_usd), 1.0
+    )
+
+
+def recency_score(recency_days: float, max_hours: float) -> float:
+    """How fresh a wallet's last trade is, on an absolute 0..1 scale.
+
+    Anchored to `max_hours_since_last_trade` -- the staleness gate every
+    ranked wallet has already cleared -- for the same reason win_rate is
+    anchored to its floor. Min-maxing the survivors of a 96-hour gate
+    stretched a band at most four days wide across the entire range, so a
+    wallet that traded an hour ago and one that traded yesterday could sit at
+    1.0 and 0.0, and both moved whenever a fresher wallet joined the pool.
+
+    Recency was the last pool-relative term, and on the 2026-08-27 lineup it
+    appeared to dominate the ordering -- the ranking could not be explained by
+    pnl, win rate and copyability alone. It was also unobservable: nothing
+    logged it. Both are fixed here.
+    """
+    if max_hours <= 0:
+        return 0.0
+    return min(max(1.0 - (recency_days * 24.0) / max_hours, 0.0), 1.0)
+
+
+def win_rate_score(win_rate: float, floor: float) -> float:
+    """Win rate on an absolute 0..1 scale, measured up from the eligibility bar.
+
+    Every wallet that reaches ranking has ALREADY cleared `min_win_rate`, so
+    min-max normalising the survivors stretched a narrow band -- 0.81 to 0.98
+    in a typical live pool -- across the full range, and handed the pool's
+    weakest wallet a flat 0.0 for a win rate that had just passed the filter.
+    That made a 1-point win-rate difference worth as much as the entire
+    copyability term, and made the score move when only the *pool* changed.
+
+    Anchoring to the floor fixes both: the interesting range really is
+    [floor, 1.0], and the same wallet scores the same tomorrow. `floor` of 0
+    degrades to plain win rate, still absolute rather than pool-relative.
+    """
+    if floor >= 1.0:
+        return 0.0
+    return min(max((win_rate - floor) / (1.0 - floor), 0.0), 1.0)
+
+
+def rank_wallets(
+    stats: list[WalletStats],
+    weights: dict[str, float],
+    *,
+    copyable_target: int = 40,
+    win_rate_floor: float = 0.0,
+    pnl_floor_usd: float = 0.0,
+    pnl_target_usd: float = 0.0,
+    recency_max_hours: float = 0.0,
+) -> list[LeaderScore]:
     if not stats:
         return []
 
@@ -145,10 +307,19 @@ def rank_wallets(stats: list[WalletStats], weights: dict[str, float]) -> list[Le
             return [0.5] * len(values)
         return [(v - lo) / (hi - lo) for v in values]
 
-    pnl = norm([s.realized_pnl for s in stats])
-    wr = norm([s.win_rate for s in stats])
+    # Absolute anchors when configured; otherwise fall back to pool min-max so
+    # existing callers that pass neither keep their old behaviour.
+    if pnl_floor_usd > 0 and pnl_target_usd > pnl_floor_usd:
+        pnl = [pnl_score(s.realized_pnl, pnl_floor_usd, pnl_target_usd) for s in stats]
+    else:
+        pnl = norm([s.realized_pnl for s in stats])
+    wr = [win_rate_score(s.win_rate, win_rate_floor) for s in stats]
     cons = norm([float(s.n_categories) for s in stats])
-    rec = norm([-s.recency_days for s in stats])   # more recent -> higher
+    if recency_max_hours > 0:
+        rec = [recency_score(s.recency_days, recency_max_hours) for s in stats]
+    else:
+        rec = norm([-s.recency_days for s in stats])   # more recent -> higher
+    cop = [copyability(s.n_copyable_trades, copyable_target) for s in stats]
 
     out: list[LeaderScore] = []
     for i, s in enumerate(stats):
@@ -157,14 +328,51 @@ def rank_wallets(stats: list[WalletStats], weights: dict[str, float]) -> list[Le
             + weights.get("win_rate", 0) * wr[i]
             + weights.get("consistency", 0) * cons[i]
             + weights.get("recency", 0) * rec[i]
+            + weights.get("copyability", 0) * cop[i]
         )
         out.append(LeaderScore(wallet=s.wallet, score=score, stats=s))
     out.sort(key=lambda x: x.score, reverse=True)
     return out
 
 
+def seat_roster(
+    ranked: list[LeaderScore],
+    incumbents: list[str],
+    top_n: int,
+    *,
+    keep_incumbents: bool = True,
+    explore_slots: int = 0,
+) -> list[LeaderScore]:
+    """Pick the lineup from ranked candidates, seating incumbents first.
+
+    Plain top-N is a relative cut: when the eligible pool grows, leaders that
+    got no worse are evicted by strangers who merely scored higher that day.
+    Seating incumbents first removes that churn without weakening any bar --
+    everyone here has already passed the filters, and copy vetting still runs
+    downstream. `explore_slots` seats stay contestable so the lineup can still
+    turn over on merit.
+    """
+    if top_n <= 0:
+        return []
+    if not keep_incumbents:
+        return ranked[:top_n]
+
+    held = {w.lower() for w in incumbents}
+    protected = max(top_n - max(explore_slots, 0), 0)
+    seated = [r for r in ranked if r.wallet.lower() in held][:protected]
+    seen = {r.wallet for r in seated}
+    for r in ranked:                      # remaining seats go by rank, to
+        if len(seated) >= top_n:          # newcomers and unseated incumbents
+            break                         # alike
+        if r.wallet not in seen:
+            seated.append(r)
+            seen.add(r.wallet)
+    seated.sort(key=lambda r: r.score, reverse=True)
+    return seated
+
+
 class LeaderSelector:
-    """Orchestrates discovery -> stats -> filter -> rank -> top-N (live)."""
+    """Orchestrates profile -> shortlist -> deep-score -> filter -> rank (live)."""
 
     def __init__(
         self,
@@ -172,67 +380,287 @@ class LeaderSelector:
         gamma: GammaClient,
         config: LeaderConfig | None = None,
         *,
-        max_candidates: int = 200,
-        trades_limit: int = 300,
-        top_markets: int = 8,
-        per_market: int = 50,
+        resolution_store: ResolutionStore | None = None,
+        # The resolved-market ledger: accumulated per-wallet win records that
+        # keep winners shortlisted even when today's feeds don't show them.
+        record_store: RecordStore | None = None,
+        records_shortlist_n: int = 300,
+        records_harvest_limit: int = 150,
+        # 1000 (was 300): a qualifying wallet fell off the 350 cut between
+        # two 2026-07-18 runs purely from feed churn. Early exits + the warm
+        # resolution cache make the wider sweep cost ~a minute, not hours.
+        deep_score_limit: int = 1000,
+        explore_n: int = 50,
+        feed_min_trades: int = 3,
+        trades_page: int = 500,
+        trades_cap: int = 1500,
+        top_open_markets: int = 30,
+        top_closed_markets: int = 30,
+        per_market_trades: int = 1000,
+        max_workers: int = 6,
+        copy_notional_min: float | None = None,
+        copy_price_min: float | None = None,
+        copy_price_max: float | None = None,
     ):
         self.data = data
         self.gamma = gamma
         self.config = config or load_leader_config()
-        self.max_candidates = max_candidates
-        self.trades_limit = trades_limit
-        self.top_markets = top_markets
-        self.per_market = per_market
-        self._resolution_memo: dict[str, tuple[bool, str | None]] = {}
+        # "Copyable" mirrors the strategy's own entry gates, so the leader
+        # finder can't select wallets the strategy would then ignore.
+        s = get_settings()
+        self.copy_notional_min = (
+            s.copy_min_leader_notional_usd if copy_notional_min is None else copy_notional_min
+        )
+        self.copy_price_min = s.copy_price_min if copy_price_min is None else copy_price_min
+        self.copy_price_max = s.copy_price_max if copy_price_max is None else copy_price_max
+        self.store = resolution_store
+        self.record_store = record_store
+        self.records_shortlist_n = records_shortlist_n
+        self.records_harvest_limit = records_harvest_limit
+        self.deep_score_limit = deep_score_limit
+        self.explore_n = explore_n
+        self.feed_min_trades = feed_min_trades
+        self.trades_page = trades_page
+        self.trades_cap = trades_cap
+        self.top_open_markets = top_open_markets
+        self.top_closed_markets = top_closed_markets
+        self.per_market_trades = per_market_trades
+        self.max_workers = max_workers
+        self.last_report: dict = {}
+        self._memo: dict[str, tuple[bool, str | None]] = {}
+        self._memo_lock = threading.Lock()
+        self._new_terminal: dict[str, str] = {}
 
+    # -- resolution lookups (thread-safe, staleness-proof) ----------------
     def _resolver(self, condition_id: str) -> tuple[bool, str | None]:
-        if condition_id in self._resolution_memo:
-            return self._resolution_memo[condition_id]
+        with self._memo_lock:
+            hit = self._memo.get(condition_id)
+        if hit is not None:
+            return hit
         try:
             res = self.gamma.get_resolution(condition_id)
         except Exception:
-            res = (False, None)
-        self._resolution_memo[condition_id] = res
+            # Transient failure: report "open" for this call but do NOT cache
+            # it — a cached error would permanently hide a resolved market.
+            return (False, None)
+        with self._memo_lock:
+            self._memo[condition_id] = res
+            if res[0] and res[1] is not None:
+                self._new_terminal[condition_id] = res[1]
         return res
 
-    def select(self, now: datetime | None = None) -> list[LeaderScore]:
+    # -- deep scoring -----------------------------------------------------
+    def _fetch_window(self, wallet: str, cutoff: datetime) -> list[LeaderTrade]:
+        """Newest-first paginated tape, stopping once past the window."""
+        out: list[LeaderTrade] = []
+        offset = 0
+        while len(out) < self.trades_cap:
+            want = min(self.trades_page, self.trades_cap - len(out))
+            page = self.data.get_trades(user=wallet, limit=want, offset=offset)
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < want:
+                break
+            if min(t.timestamp for t in page) < cutoff:
+                break                      # already reached beyond the window
+            offset += len(page)
+        return out
+
+    def _deep_score(
+        self, wallet: str, cutoff: datetime, now: datetime
+    ) -> tuple[str, WalletStats | None, str | None]:
+        """Return (wallet, stats, early_reject_reason). Early rejects skip
+        all resolution lookups — that's what makes a wide shortlist cheap."""
+        f = self.config.filters
+        try:
+            trades = self._fetch_window(wallet, cutoff)
+        except Exception as e:
+            log.debug("scoring: tape fetch failed for %s: %s", wallet[:10], e)
+            return (wallet, None, _REJECT_ERROR)
+        if not trades:
+            return (wallet, None, _REJECT_TRADES)
+        # An allowlisted wallet is a manual override, so the early rejects below
+        # have to be skipped too — they run BEFORE the filter stage that the
+        # allowlist was documented to bypass, so a pinned wallet that was quiet
+        # for a day (recency) or trades in a style the copy path dislikes
+        # (copyable) was thrown out before the bypass could ever apply. Only an
+        # empty tape still stops us: there is nothing to score.
+        if wallet in self.config.allowlist:
+            return (wallet, compute_wallet_stats(
+                wallet, [t for t in trades if t.timestamp >= cutoff] or trades,
+                self._resolver, now=now,
+                copyable_notional_min=self.copy_notional_min,
+                copyable_price_min=self.copy_price_min,
+                copyable_price_max=self.copy_price_max,
+            ), None)
+        newest = max(t.timestamp for t in trades)
+        if (now - newest).total_seconds() / 3600.0 > f.max_hours_since_last_trade:
+            return (wallet, None, _REJECT_RECENCY)
+        if len(trades) >= self.trades_cap:
+            # Tape truncated at the cap: `trades` is NOT the whole window, and
+            # how much time the cap covers is the wallet's pace. A capped tape
+            # spanning days = active human; spanning hours = HFT bot whose
+            # leaderboard win rate is latency we can't copy (and whose vet
+            # window we can't even fetch). Uncapped tapes skip this check —
+            # short span there just means few trades, judged by min_trades.
+            oldest = min(t.timestamp for t in trades)
+            span_days = (newest - oldest).total_seconds() / 86_400
+            if span_days < f.min_tape_span_days:
+                return (wallet, None, _REJECT_TAPE_SPAN)
+        recent = [t for t in trades if t.timestamp >= cutoff]
+        if len(recent) < f.min_trades:
+            return (wallet, None, _REJECT_TRADES)
+        n_copyable = sum(
+            1 for t in recent
+            if t.side is Side.BUY
+            and t.usd_size >= self.copy_notional_min
+            and self.copy_price_min <= t.price <= self.copy_price_max
+        )
+        if n_copyable < f.min_copyable_trades:
+            # Tape-only check, so it runs BEFORE resolution lookups: the
+            # hyperactive penny-bet bots are exactly the wallets with the
+            # most markets to resolve — rejecting them here is the big saver.
+            return (wallet, None, _REJECT_COPYABLE)
+        st = compute_wallet_stats(
+            wallet, recent, self._resolver, now=now,
+            copyable_notional_min=self.copy_notional_min,
+            copyable_price_min=self.copy_price_min,
+            copyable_price_max=self.copy_price_max,
+        )
+        return (wallet, st, None)
+
+    # -- the funnel -------------------------------------------------------
+    def select(
+        self, now: datetime | None = None, *, incumbents: list[str] | None = None
+    ) -> list[LeaderScore]:
         now = now or datetime.now(timezone.utc)
         cfg = self.config
-
-        candidates = harvest_candidates(
-            self.data, self.gamma, top_markets=self.top_markets, per_market=self.per_market
-        )
-        candidates |= set(cfg.allowlist)
-        candidates -= set(cfg.blocklist)
-        # Score every harvested candidate — cutting the pool alphabetically
-        # before scoring would discard most wallets on a quality-blind basis.
-        # `max_candidates` only guards against a pathologically large harvest.
-        ordered = sorted(candidates)
-        if len(ordered) > self.max_candidates:
-            ordered = ordered[: self.max_candidates]
-
-        cutoff = now - timedelta(days=cfg.filters.lookback_days)
-        stats: list[WalletStats] = []
-        for wallet in ordered:
-            try:
-                trades = self.data.get_trades(user=wallet, limit=self.trades_limit)
-            except Exception as e:
-                log.debug("scoring: trades fetch failed for %s: %s", wallet[:10], e)
-                continue
-            trades = [t for t in trades if t.timestamp >= cutoff]
-            if not trades:
-                continue
-            stats.append(compute_wallet_stats(wallet, trades, self._resolver, now=now))
-
-        eligible = [s for s in stats if passes_filters(s, cfg.filters)]
-        # Allowlisted wallets bypass filters entirely.
         allow = set(cfg.allowlist)
-        for s in stats:
-            if s.wallet in allow and s not in eligible:
-                eligible.append(s)
+        block = set(cfg.blocklist)
 
-        ranked = rank_wallets(eligible, cfg.weights)
-        log.info("scoring: %d candidates -> %d eligible -> top %d",
-                 len(stats), len(eligible), cfg.selection.top_n)
-        return ranked[: cfg.selection.top_n]
+        # Stage 1: profile the whole pool from feeds, and grow the persistent
+        # resolved-market ledger. Feeds see only the loudest markets of the
+        # moment; the accumulated records remember every winner they've ever
+        # covered, so proven wallets stay visible through feed churn.
+        profiles = profile_candidates(
+            self.data,
+            self.gamma,
+            top_open_markets=self.top_open_markets,
+            top_closed_markets=self.top_closed_markets,
+            per_market_trades=self.per_market_trades,
+            lookback_days=cfg.filters.lookback_days,
+            now=now,
+        )
+        record_quality: dict[str, float] = {}
+        if self.record_store is not None:
+            try:
+                harvest_resolved_records(
+                    self.data, self.gamma, self.record_store,
+                    market_limit=self.records_harvest_limit,
+                    lookback_days=cfg.filters.lookback_days,
+                    per_market_trades=self.per_market_trades,
+                    now=now,
+                )
+                since = (now - timedelta(days=cfg.filters.lookback_days)).isoformat()
+                for w, (wins, losses, pnl) in self.record_store.wallet_summaries(since).items():
+                    if pnl > 0:            # only net winners earn shortlist slots
+                        record_quality[w] = _shrunk_win_frac(wins, losses)
+            except Exception as e:
+                log.warning("records: harvest failed (%s); continuing without", e)
+        pool = (set(profiles) | set(record_quality) | allow) - block
+
+        # Stage 2: shortlist by estimated win quality — NOT by activity, which
+        # would hand the deep-score slots to high-frequency market-maker bots.
+        # Two evidence sources: today's feeds and the accumulated records.
+        active = [
+            w for w in pool
+            if w in profiles and profiles[w].n_trades >= self.feed_min_trades
+        ]
+        shortlist = sorted(active, key=lambda w: profiles[w].quality, reverse=True)
+        chosen = set(shortlist[: self.deep_score_limit])
+        if record_quality:
+            by_record = sorted(record_quality, key=record_quality.__getitem__, reverse=True)
+            chosen |= set(by_record[: self.records_shortlist_n]) - block
+        chosen |= {w.lower() for w in (incumbents or [])} - block
+        chosen |= allow
+        rest = sorted(pool - chosen)
+        if self.explore_n and rest:
+            chosen |= set(random.sample(rest, min(self.explore_n, len(rest))))
+
+        # Stage 3: deep-score in parallel. Rebuild the memo from the store
+        # each run: terminal results persist forever, open markets re-check.
+        self._memo = dict(self.store.load()) if self.store else {}
+        self._new_terminal = {}
+        cutoff = now - timedelta(days=cfg.filters.lookback_days)
+        targets = sorted(chosen)
+        if self.max_workers > 1 and len(targets) > 1:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+                results = list(ex.map(lambda w: self._deep_score(w, cutoff, now), targets))
+        else:
+            results = [self._deep_score(w, cutoff, now) for w in targets]
+        if self.store and self._new_terminal:
+            self.store.save_many(self._new_terminal)
+
+        # Stage 4: filter -> rank -> top-N, with the rejection report.
+        early = Counter(reason for _, _, reason in results if reason)
+        stats = [st for _, st, _ in results if st is not None]
+        filter_fails: Counter[str] = Counter()
+        eligible: list[WalletStats] = []
+        for st in stats:
+            fails = failing_filters(st, cfg.filters)
+            if not fails:
+                eligible.append(st)
+            else:
+                filter_fails.update(fails)
+        # Allowlisted wallets bypass filters entirely (still need a tape).
+        for st in stats:
+            if st.wallet in allow and st not in eligible:
+                eligible.append(st)
+
+        ranked = rank_wallets(
+            eligible, cfg.weights,
+            copyable_target=cfg.selection.copyable_target,
+            win_rate_floor=cfg.filters.min_win_rate,
+            pnl_floor_usd=cfg.selection.pnl_floor_usd,
+            pnl_target_usd=cfg.selection.pnl_target_usd,
+            recency_max_hours=cfg.filters.max_hours_since_last_trade,
+        )
+        top = seat_roster(
+            ranked,
+            list(incumbents or []),
+            cfg.selection.top_n,
+            keep_incumbents=cfg.selection.keep_incumbents,
+            explore_slots=cfg.selection.explore_slots,
+        )
+        # top_n is the last place an allowlisted wallet could still be dropped:
+        # it bypasses the filters only to be cut here if it ranks below the
+        # line. A manual pin has to survive its own ranking.
+        if allow:
+            picked = {r.wallet for r in top}
+            top = top + [r for r in ranked if r.wallet in allow and r.wallet not in picked]
+        rejects = Counter(early)
+        rejects.update(filter_fails)
+        held = {w.lower() for w in (incumbents or [])}
+        retained = sum(1 for r in top if r.wallet.lower() in held)
+        self.last_report = {
+            "pool": len(pool),
+            "record_wallets": len(record_quality),
+            "deep_scored": len(targets),
+            "early_rejects": dict(early),
+            "filter_rejects": dict(filter_fails),
+            "rejects": dict(rejects),
+            "eligible": len(eligible),
+            "followed": len(top),
+            # Churn, logged every run. The first month averaged 5.5 leaders a
+            # rescore and still burned through 33 wallets, which is why no
+            # leader ever accumulated a record worth reading.
+            "retained": retained,
+        }
+        log.info(
+            "scoring: %d pool -> %d deep-scored -> %d eligible -> "
+            "%d followed (%d retained, %d new)",
+            len(pool), len(targets), len(eligible), len(top),
+            retained, len(top) - retained,
+        )
+        return top

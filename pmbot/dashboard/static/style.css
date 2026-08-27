@@ -1,0 +1,544 @@
+/* pmbot dashboard — Apple-inspired: system fonts, light/dark, hairlines. */
+
+:root {
+  --bg: #f5f5f7;
+  --card: #ffffff;
+  --ink: #1d1d1f;
+  --ink-2: #6e6e73;
+  --ink-3: #86868b;
+  --hairline: #e8e8ed;
+  --pos: #248a3d;   /* Apple accessible green (light) */
+  --neg: #d70015;   /* Apple accessible red (light) */
+  --accent: #0071e3;
+  --chip-open-bg: #eaf2fd;
+  --chip-open-ink: #0064cd;
+  --chip-closed-bg: #ededf0;
+  --chip-closed-ink: #6e6e73;
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --card: #1c1c1e;
+    --ink: #f5f5f7;
+    --ink-2: #a1a1a6;
+    --ink-3: #86868b;
+    --hairline: #38383a;
+    --pos: #30db5b;   /* Apple accessible green (dark) */
+    --neg: #ff6961;   /* Apple accessible red (dark) */
+    --accent: #2997ff;
+    --chip-open-bg: #0f2a47;
+    --chip-open-ink: #64b5ff;
+    --chip-closed-bg: #2c2c2e;
+    --chip-closed-ink: #a1a1a6;
+    --shadow: none;
+  }
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+               "Helvetica Neue", "Segoe UI", Roboto, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- header ---------------------------------------------------------- */
+
+header {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 22px 22px 6px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.brand { display: flex; align-items: center; gap: 10px; }
+
+.wordmark { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; }
+
+.badge {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+  border: 1px solid var(--hairline);
+  border-radius: 980px;
+  padding: 2px 9px;
+}
+
+.badge.live { color: var(--neg); border-color: var(--neg); }
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.engine { display: inline-flex; align-items: center; gap: 6px; }
+
+.dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ink-3);
+  display: inline-block;
+}
+.dot.on  { background: var(--pos); }
+.dot.off { background: var(--neg); }
+
+.sep { color: var(--ink-3); }
+
+/* ---- layout ---------------------------------------------------------- */
+
+main {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 10px 22px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* ---- hero ------------------------------------------------------------ */
+
+.hero {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 18px;
+}
+
+@media (max-width: 640px) { .hero { grid-template-columns: 1fr; } }
+
+.hero-tile {
+  background: var(--card);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  padding: 26px 28px 22px;
+  text-align: center;
+}
+
+.hero-tile .label { font-size: 15px; font-weight: 500; color: var(--ink-2); }
+
+.hero-tile .value {
+  font-size: 48px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin: 6px 0 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.hero-tile .caption { font-size: 13px; color: var(--ink-3); }
+
+.strip {
+  text-align: center;
+  font-size: 13px;
+  color: var(--ink-2);
+  margin-top: -6px;
+}
+
+/* ---- P&L calendar ----------------------------------------------------- */
+
+.cal-nav { display: flex; align-items: center; gap: 4px; }
+
+.cal-arrow {
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--ink-2);
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.cal-arrow:hover:not(:disabled) { background: var(--chip-closed-bg); color: var(--ink); }
+.cal-arrow:disabled { opacity: 0.3; cursor: default; }
+
+.cal-dow, .cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+}
+
+.cal-dow {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+  text-align: center;
+  margin-bottom: 6px;
+}
+
+.cal-cell {
+  min-height: 62px;
+  border-radius: 10px;
+  border: 1px solid var(--hairline);
+  padding: 5px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+}
+
+.cal-cell.blank { border: none; }
+
+.cal-cell.today { border-color: var(--accent); }
+
+/* --cell-a is set per cell from that day's share of the month's biggest move. */
+.cal-cell.pos { background: color-mix(in srgb, var(--pos) calc(var(--cell-a) * 100%), transparent); }
+.cal-cell.neg { background: color-mix(in srgb, var(--neg) calc(var(--cell-a) * 100%), transparent); }
+.cal-cell.flat { background: var(--chip-closed-bg); }
+
+.cal-d { font-size: 11px; color: var(--ink-3); }
+.cal-cell.has .cal-d { color: var(--ink-2); font-weight: 500; }
+
+.cal-pnl {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cal-n { font-size: 11px; color: var(--ink-2); }
+
+.cal-cell .narrow { display: none; }
+
+.cal-cell.has { cursor: pointer; }
+.cal-cell.has:hover { border-color: var(--ink-3); }
+.cal-cell.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
+.cal-foot { font-size: 12px; color: var(--ink-3); margin-top: 10px; }
+
+/* ---- one day's trades --------------------------------------------------- */
+
+.day-panel {
+  margin-top: 14px;
+  padding: 12px 14px 4px;
+  background: var(--bg);
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+}
+
+.day-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.day-title { font-size: 15px; font-weight: 600; margin-right: 8px; }
+
+.day-sub { font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+.day-close {
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--ink-3);
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 4px 7px;
+  cursor: pointer;
+  flex: none;
+}
+.day-close:hover { background: var(--chip-closed-bg); color: var(--ink); }
+
+.day-sec {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 14px 0 2px;
+}
+
+.day-secsub {
+  margin-left: 8px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 560px) {
+  .cal-dow, .cal-grid { gap: 3px; }
+  .cal-cell { min-height: 48px; padding: 3px 4px; }
+  .cal-pnl { font-size: 11px; }
+  .cal-n { font-size: 10px; }
+  .cal-cell .wide { display: none; }
+  .cal-cell .narrow { display: inline; }
+}
+
+/* ---- leader drill-down ------------------------------------------------- */
+
+.leader-row { cursor: pointer; }
+.leader-row:hover > td { background: var(--chip-closed-bg); }
+.leader-row.open > td { background: var(--chip-open-bg); }
+
+.caret {
+  display: inline-block;
+  width: 14px;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.lp-row > td { padding: 6px 10px 14px; background: var(--bg); }
+
+.lp-note { font-size: 13px; color: var(--ink-2); padding: 6px 2px; }
+
+.lp-table td { padding: 8px 10px; }
+
+/* Their tape vs. what they're holding — two views of the same leader. */
+.lp-tabs { display: flex; gap: 6px; padding: 6px 0 2px; }
+
+.lp-tab {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: none;
+  border: 1px solid var(--hairline);
+  border-radius: 980px;
+  padding: 3px 12px;
+  cursor: pointer;
+}
+.lp-tab:hover { color: var(--ink); }
+.lp-tab.on {
+  color: var(--chip-open-ink);
+  background: var(--chip-open-bg);
+  border-color: transparent;
+  font-weight: 500;
+}
+
+/* A leader's tape is long by design: scroll it instead of pushing the rest of
+   the page down a screen and a half. */
+.lp-scroll { max-height: 420px; overflow-y: auto; }
+
+/* The whole point of this panel is spotting what the bot took vs. skipped, so
+   copied rows get a tint + rail, and the skipped ones recede. */
+.lp-table tr.lp-copied > td { background: var(--chip-open-bg); }
+.lp-table tr.lp-copied > td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+  font-weight: 500;
+}
+.lp-table tr:not(.lp-copied) > td:first-child { color: var(--ink-2); }
+
+.lp-skip { font-size: 12px; color: var(--ink-3); }
+
+/* ---- cards ----------------------------------------------------------- */
+
+.card {
+  background: var(--card);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  padding: 20px 24px;
+}
+
+.card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.card-head h2 { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+
+.card-head .sub { font-size: 13px; color: var(--ink-3); }
+
+/* Sort toggles (open positions): same pill as the leader tabs, so a control
+   that reorders a table looks like the other control that swaps one. */
+.sorts { display: flex; align-items: center; gap: 6px; margin-right: auto; }
+
+.sorts-label { font-size: 12px; color: var(--ink-3); }
+
+.sort-btn {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: none;
+  border: 1px solid var(--hairline);
+  border-radius: 980px;
+  padding: 3px 12px;
+  cursor: pointer;
+}
+.sort-btn:hover { color: var(--ink); }
+.sort-btn.on {
+  color: var(--chip-open-ink);
+  background: var(--chip-open-bg);
+  border-color: transparent;
+  font-weight: 500;
+}
+.sort-arrow { font-size: 11px; }
+
+/* ---- tables ---------------------------------------------------------- */
+
+.table-wrap { overflow-x: auto; }
+
+table { width: 100%; border-collapse: collapse; }
+
+th {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-3);
+  text-align: right;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+
+th.left, td.left { text-align: left; }
+
+td {
+  font-size: 14px;
+  text-align: right;
+  padding: 10px;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+tr:last-child td { border-bottom: none; }
+
+td.market {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowsub {
+  display: block;
+  font-size: 12px;
+  color: var(--ink-3);
+  margin-top: 1px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pos { color: var(--pos); }
+.neg { color: var(--neg); }
+.dim { color: var(--ink-3); }
+
+/* Seven columns is wider than the five this table used to hold, so the market
+   name gives up the room the two time columns need. */
+#positions td.market { max-width: 230px; }
+
+.when { font-size: 13px; color: var(--ink-2); }
+
+/* Past its end date, still on our books: waiting on Polymarket, not stuck. */
+.due { color: var(--ink); font-weight: 500; }
+
+td.nowrap { white-space: nowrap; }
+
+.side-buy  { color: var(--pos); font-weight: 600; }
+.side-sell { color: var(--neg); font-weight: 600; }
+
+.mono-id {
+  font-family: "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.leader-link {
+  font-family: "SF Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.leader-link:hover { text-decoration: underline; }
+
+/* Market name → the market's page on polymarket.com. Flex so a long question
+   ellipsises on its own and the ↗ stays visible instead of being the first
+   thing the truncation eats. */
+a.mkt-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  max-width: 100%;
+  color: var(--accent);
+  text-decoration: none;
+}
+a.mkt-link .mkt-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+a.mkt-link:hover .mkt-name { text-decoration: underline; }
+.mkt-arrow { flex: none; font-size: 11px; opacity: 0.7; }
+
+.chip {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 980px;
+  padding: 2px 10px;
+}
+.chip.open   { background: var(--chip-open-bg);   color: var(--chip-open-ink); }
+.chip.closed { background: var(--chip-closed-bg); color: var(--chip-closed-ink); }
+
+.flag {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--neg);
+}
+
+.empty { color: var(--ink-3); font-size: 14px; padding: 14px 10px; }
+
+/* ---- updates feed ---------------------------------------------------- */
+
+.updates {
+  list-style: none;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.updates li {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  font-size: 13px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.updates li:last-child { border-bottom: none; }
+
+.updates .t {
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.updates .what { color: var(--ink-2); }
+
+.updates .what strong { color: var(--ink); font-weight: 600; }
+
+/* ---- footer ---------------------------------------------------------- */
+
+footer {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 0 22px 30px;
+  font-size: 12px;
+  color: var(--ink-3);
+  text-align: center;
+}

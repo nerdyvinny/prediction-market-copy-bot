@@ -21,14 +21,27 @@ venv/
 
 # Data / runtime artifacts
 *.db
+*.db.*
+# WAL sidecars — the hyphen means *.db.* does NOT cover these.
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 data/*.json
 logs/
 *.log
 
+# Tooling caches (regenerable; never commit)
+graphify-out/
+
 # OS / editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+
+# Deep-sweep report artifacts (regenerate with scripts/deep_sweep.py)
+deep_sweep_results.json
+
+# Cached leader tapes from research scripts (multi-MB, refetchable).
+.tapes_*.pkl

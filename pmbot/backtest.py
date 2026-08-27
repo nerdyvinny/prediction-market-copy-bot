@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import heapq
 import logging
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
@@ -23,11 +24,65 @@ from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.models import Fill, LeaderTrade, Market, Side, Signal
 from pmbot.portfolio.ledger import Ledger
 from pmbot.risk import RiskManager
+from pmbot.strategy.exact_copy import EXIT_CRUMB_SHARES, observe_leader_fill
 
 log = logging.getLogger(__name__)
 
 _MIN_PRICE = 1e-4
 _MAX_PRICE = 1 - 1e-4
+
+# What the live loop can actually see when it decides on an entry: it polls
+# every `poll_interval_seconds` and fetches `trades_per_leader` trades.
+_LIVE_POLL_SECONDS = 10.0
+_LIVE_TAPE_DEPTH = 25
+
+
+def round_tripped_entry_uids(
+    ordered: list[LeaderTrade],
+    *,
+    window_seconds: float | None = _LIVE_POLL_SECONDS,
+    tape_depth: int | None = _LIVE_TAPE_DEPTH,
+) -> set[str]:
+    """BUY uids the live bot would skip as already-round-tripped.
+
+    Share accounting (including the crumb tolerance) mirrors
+    `ExactCopyStrategy._round_tripped_entry_uids` exactly — see that docstring
+    for why only FULL exits retire an entry.
+
+    The two limits here are what a whole-tape scan gets wrong. Live, an entry
+    is evaluated at the FIRST poll after it appears and then marked seen, so it
+    is skipped only if the leader's full exit has already landed by that poll:
+    within one `poll_interval_seconds`, and still inside the 25-trade window
+    the strategy fetches. Scanning a deep research tape instead retires entries
+    the leader exited hours later — which the live bot copied long before that
+    exit existed. That is the difference between "44% of entries are
+    round-tripped" (measured on a deep tape) and the far smaller share the bot
+    actually declines. Pass `None`/`None` to reproduce the whole-tape number.
+    """
+    held: dict[str, float] = {}
+    bought: dict[str, float] = {}
+    open_uids: dict[str, list[tuple[str, datetime, int]]] = {}
+    closed: set[str] = set()
+    for idx, t in enumerate(ordered):
+        prior = held.get(t.token_id, 0.0)
+        if t.side is Side.BUY:
+            held[t.token_id] = prior + t.shares
+            bought[t.token_id] = bought.get(t.token_id, 0.0) + t.shares
+            open_uids.setdefault(t.token_id, []).append((t.uid, t.timestamp, idx))
+            continue
+        remaining = max(0.0, prior - t.shares)
+        if remaining <= max(EXIT_CRUMB_SHARES, 1e-4 * bought.get(t.token_id, 0.0)):
+            remaining = 0.0
+            for uid, ts, i in open_uids.pop(t.token_id, []):
+                if (window_seconds is not None
+                        and (t.timestamp - ts).total_seconds() > window_seconds):
+                    continue                       # we had already copied it
+                if tape_depth is not None and (idx - i) >= tape_depth:
+                    continue                       # entry had scrolled off the window
+                closed.add(uid)
+            bought.pop(t.token_id, None)
+        held[t.token_id] = remaining
+    return closed
 
 
 @dataclass
@@ -42,6 +97,9 @@ class CopyResult:
     shares: float
     won: bool
     pnl: float
+    token_id: str = ""
+    # "resolution" | "leader-exit" | "stop-loss" — how the tranche ended.
+    closed_by: str = "resolution"
 
 
 def max_drawdown(cumulative: list[float]) -> float:
@@ -145,7 +203,11 @@ class Backtester:
             try:
                 self._mkt_cache[condition_id] = self.gamma.get_market_with_resolution(condition_id)
             except Exception:
-                self._mkt_cache[condition_id] = (None, None)
+                # Transient failure (rate limit, timeout): skip THIS call but do
+                # NOT cache — a poisoned entry silently drops every trade in the
+                # market for the process lifetime, gutting backtests and vetting.
+                # (Same fix as LeaderSelector._resolver.)
+                return (None, None)
         return self._mkt_cache[condition_id]
 
     def run(self, leaders: list[str], now: datetime | None = None) -> BacktestReport:
@@ -319,30 +381,69 @@ class ExactCopyBacktester:
             try:
                 self._mkt_cache[condition_id] = self.gamma.get_market_with_resolution(condition_id)
             except Exception:
-                self._mkt_cache[condition_id] = (None, None)
+                # Transient failure (rate limit, timeout): skip THIS call but do
+                # NOT cache — a poisoned entry silently drops every trade in the
+                # market for the process lifetime, gutting backtests and vetting.
+                # (Same fix as LeaderSelector._resolver.)
+                return (None, None)
         return self._mkt_cache[condition_id]
 
-    def fetch_tapes(self, leaders: list[str]) -> dict[str, list[LeaderTrade]]:
-        """Fetch each leader's trade tape (paginated, newest-first from API)."""
+    def fetch_tapes(
+        self, leaders: list[str], *, page_attempts: int = 3
+    ) -> dict[str, list[LeaderTrade]]:
+        """Fetch each leader's trade tape (paginated, newest-first from API).
+
+        Pagination stops ONLY on a definitive end-of-tape signal: an empty page,
+        a page carrying no unseen uids, or `trades_limit` reached. A short page
+        is NOT such a signal — the API returns one intermittently, and treating
+        it as the end silently truncated a 3000-trade/113-day tape to 998
+        trades/27 days, quietly changing backtest P&L by ~28%. The extra request
+        that confirms the real end (an empty page) is worth far more than the
+        wrong answer it prevents.
+
+        A page that keeps failing is retried with backoff and then reported at
+        WARNING, never swallowed at DEBUG: `_vet_leaders` keeps or drops live
+        leaders off this tape, so a short one is a wrong trading decision, not
+        just a thin report.
+        """
         tapes: dict[str, list[LeaderTrade]] = {}
         chunk = 500
         for leader in leaders:
             trades: list[LeaderTrade] = []
             seen: set[str] = set()
             offset = 0
+            failure: str | None = None
             while len(trades) < self.trades_limit:
                 want = min(chunk, self.trades_limit - len(trades))
-                try:
-                    page = self.data.get_trades(user=leader, limit=want, offset=offset)
-                except Exception as e:
-                    log.debug("backtest: tape fetch failed for %s: %s", leader[:10], e)
-                    break
+                page = None
+                for attempt in range(1, page_attempts + 1):
+                    try:
+                        page = self.data.get_trades(user=leader, limit=want, offset=offset)
+                        break
+                    except Exception as e:
+                        if attempt == page_attempts:
+                            failure = f"{type(e).__name__}: {e}"
+                            log.debug("backtest: tape page failed for %s at offset %d: %s",
+                                      leader[:10], offset, e)
+                        else:
+                            time.sleep(min(0.5 * 2 ** (attempt - 1), 4.0))
+                if page is None:
+                    break                          # exhausted retries; reported below
+                if not page:
+                    break                          # empty page = true end of tape
                 fresh = [t for t in page if t.uid not in seen]
+                if not fresh:
+                    break                          # only duplicates: not advancing
                 seen.update(t.uid for t in fresh)
                 trades.extend(fresh)
-                if len(page) < want:
-                    break
                 offset += len(page)
+            if failure is not None:
+                log.warning(
+                    "backtest: tape for %s TRUNCATED at %d trades after %d failed "
+                    "attempts (%s) — this leader's window covers less history than "
+                    "requested; vetting and backtests over it are understated",
+                    leader[:10], len(trades), page_attempts, failure,
+                )
             tapes[leader.lower()] = trades
         return tapes
 
@@ -375,6 +476,12 @@ class ExactCopyBacktester:
         slippage_bps: float | None = None,
         leader_weights: dict[str, float] | None = None,
         min_hours_to_resolution: float = 0.0,
+        max_hours_to_resolution: float = 0.0,
+        stop_loss_frac: float | None = None,
+        price_series: dict[str, list[tuple[int, float]]] | None = None,
+        resolve_at: dict[str, datetime] | None = None,
+        skip_round_tripped_entries: bool = False,
+        skip_price_band: tuple[float, float] | None = None,
     ) -> BacktestReport:
         """Simulate the tapes over the window [now - lookback_days, now].
 
@@ -385,7 +492,39 @@ class ExactCopyBacktester:
         `leader_weights` are per-leader copy_fraction multipliers (see
         `vet_weights`); `min_hours_to_resolution` skips entries placed within
         that many hours of the market's close (in-game/near-resolution trades
-        are the ones our live lag copies worst).
+        are the ones our live lag copies worst); `max_hours_to_resolution`
+        skips entries placed more than that many hours before it, capping how
+        long a copy can tie up bankroll.
+
+        Both horizon knobs read Gamma's `end_date`, never `resolve_at`: that
+        stamp is the only horizon the LIVE bot has at entry time, so scoring
+        them against a data-derived resolution would validate a rule we cannot
+        actually run. The max knob is also unharmed by the start-of-day
+        `end_date` quirk described below — that quirk makes `hours_left`
+        negative, which sits under any positive ceiling, so in-game sports
+        entries pass the max filter exactly as they do live.
+
+        `skip_price_band` punches a hole in the middle of the copy window:
+        entries priced inside [lo, hi) are refused while everything cheaper and
+        everything dearer is still copied. `price_min`/`price_max` can only
+        move the window's edges, so a "the middle is where we bleed" claim is
+        not expressible with them — hence the separate knob. Half-open on the
+        top so adjacent bands tile without double-counting a boundary price.
+
+        `stop_loss_frac` arms a protective exit: if the token's observed price
+        falls to `avg_entry * (1 - frac)` before the leader exits or the market
+        resolves, the whole tranche is sold there. It needs `price_series`
+        ({token_id: [(unix_ts, price), …]}, ascending) — the CLOB price history
+        is hourly by default, so a stop can only fire as fast as that sampling
+        and will MISS intra-hour spikes through the level. Both default to off,
+        leaving live leader-vetting behaviour untouched.
+
+        `resolve_at` ({token_id: datetime}) overrides Gamma's `end_date` as the
+        settlement instant. Daily-sports markets stamp end_date at the START of
+        the day, so an in-game entry "resolves" before it was opened and the
+        tranche settles instantly — fine for P&L (the payout is still right),
+        useless for anything time-dependent. A stop needs a real holding
+        window, so pass a data-derived resolution for those markets.
         """
         s = settings or self.s
         slip = self.slip if slippage_bps is None else slippage_bps / 10_000
@@ -393,6 +532,17 @@ class ExactCopyBacktester:
         cutoff = now - timedelta(days=lookback_days)
         p_min = s.copy_price_min if price_min is None else price_min
         p_max = s.copy_price_max if price_max is None else price_max
+
+        # Detect per leader on that leader's own tape, and only on trades at or
+        # before `now` — using an exit the live bot could not yet have seen
+        # would leak the future into a walk-forward test.
+        round_tripped: set[str] = set()
+        if skip_round_tripped_entries:
+            for tape in tapes.values():
+                visible = sorted(
+                    (t for t in tape if t.timestamp <= now), key=lambda t: t.timestamp
+                )
+                round_tripped |= round_tripped_entry_uids(visible)
 
         all_trades = [t for tape in tapes.values() for t in tape if cutoff <= t.timestamp <= now]
         all_trades.sort(key=lambda t: t.timestamp)
@@ -409,13 +559,68 @@ class ExactCopyBacktester:
         settled: set[tuple[str, str]] = set()
         seq = 0
 
+        def _resolves(token: str, market: Market) -> datetime:
+            """When this position actually settles (override beats Gamma)."""
+            if resolve_at and token in resolve_at:
+                return resolve_at[token]
+            return market.end_date
+
+        armed: dict[tuple[str, str], tuple[datetime, float]] = {}  # key -> (trigger_ts, price)
+
+        def arm_stop(key: tuple[str, str], after: datetime) -> None:
+            """(Re)compute when this tranche's stop would trigger, if ever."""
+            if stop_loss_frac is None or not price_series:
+                return
+            armed.pop(key, None)
+            tr = tranches.get(key)
+            if tr is None or tr.shares <= 1e-9 or key in settled:
+                return
+            series = price_series.get(key[1])
+            if not series:
+                return
+            threshold = tr.avg * (1 - stop_loss_frac)
+            after_u, until_u = after.timestamp(), _resolves(key[1], tr.market).timestamp()
+            for t, p in series:                     # ascending
+                if t <= after_u:
+                    continue
+                if t > until_u:
+                    break
+                if p <= threshold:
+                    armed[key] = (datetime.fromtimestamp(t, tz=timezone.utc), p)
+                    return
+
+        def stop_out(key: tuple[str, str], sts: datetime, price: float) -> None:
+            """Sell the whole tranche at the stop price; tranche is then done."""
+            tr = tranches[key]
+            leader, token = key
+            exit_price = min(max(price * (1 - slip), _MIN_PRICE), _MAX_PRICE)
+            tr.realized += (exit_price - tr.avg) * tr.shares
+            ledger.record_fill(Fill(
+                signal=Signal(tr.market.market_id, token, tr.outcome, Side.SELL,
+                              exit_price, exit_price * tr.shares, "backtest-stop",
+                              source_leader=leader),
+                fill_price=exit_price, size_usd=exit_price * tr.shares,
+                shares=tr.shares, timestamp=sts, mode="backtest",
+            ))
+            tr.shares = 0.0
+            settled.add(key)
+            armed.pop(key, None)
+            results.append(CopyResult(
+                leader=leader, market_id=tr.market.market_id, outcome=tr.outcome,
+                entry_ts=tr.entry_ts, resolve_ts=sts, entry_price=tr.avg,
+                size_usd=tr.cost, shares=tr.bought, won=tr.realized > 0,
+                pnl=tr.realized, token_id=token, closed_by="stop-loss",
+            ))
+
         def finish(key: tuple[str, str], rts: datetime, winner: str) -> None:
             if key in settled:
                 return
             settled.add(key)
+            armed.pop(key, None)
             tr = tranches[key]
             leader, token = key
-            if tr.shares > 1e-9:
+            held_to_resolution = tr.shares > 1e-9
+            if held_to_resolution:
                 payout = 1.0 if token == winner else 0.0
                 tr.realized += (payout - tr.avg) * tr.shares
                 ledger.record_fill(Fill(
@@ -430,13 +635,30 @@ class ExactCopyBacktester:
                 leader=leader, market_id=tr.market.market_id, outcome=tr.outcome,
                 entry_ts=tr.entry_ts, resolve_ts=rts, entry_price=tr.avg,
                 size_usd=tr.cost, shares=tr.bought, won=tr.realized > 0,
-                pnl=tr.realized,
+                pnl=tr.realized, token_id=token,
+                closed_by="resolution" if held_to_resolution else "leader-exit",
             ))
 
         def settle_until(ts: datetime) -> None:
-            while pending and pending[0][0] <= ts:
-                rts, _, key, winner = heapq.heappop(pending)
-                finish(key, rts, winner)
+            """Fire stops and resolutions up to `ts`, in true chronological order."""
+            while True:
+                nxt_settle = pending[0][0] if pending else None
+                stop_key, stop_at = None, None
+                for k, (sts, _px) in armed.items():
+                    if stop_at is None or sts < stop_at:
+                        stop_key, stop_at = k, sts
+                events = []
+                if nxt_settle is not None and nxt_settle <= ts:
+                    events.append((nxt_settle, 1))
+                if stop_at is not None and stop_at <= ts:
+                    events.append((stop_at, 0))     # stop wins an exact tie
+                if not events:
+                    return
+                if min(events)[1] == 0:
+                    stop_out(stop_key, stop_at, armed[stop_key][1])
+                else:
+                    rts, _, key, winner = heapq.heappop(pending)
+                    finish(key, rts, winner)
 
         for t in all_trades:
             if not t.token_id or not t.market_id:
@@ -444,20 +666,43 @@ class ExactCopyBacktester:
             settle_until(t.timestamp)
             lkey = (t.leader.lower(), t.token_id)
             prior = leader_pos.get(lkey, 0.0)
-            delta = t.shares if t.side is Side.BUY else -t.shares
-            leader_pos[lkey] = max(0.0, prior + delta)
+            # Shared with ExactCopyStrategy so the two cannot drift: live used
+            # to track this through `apply_fill` (which goes short) while the
+            # sim clamped at zero, so identical tapes produced different exit
+            # fractions and vetting judged a bot that did not exist.
+            leader_pos[lkey] = observe_leader_fill(prior, t.side, t.shares)
 
             if t.side is Side.BUY:
+                if t.uid in round_tripped:
+                    continue                       # leader already flat before our next poll
                 if not (p_min <= t.price <= p_max):
                     continue
+                if skip_price_band is not None and (
+                    skip_price_band[0] <= t.price < skip_price_band[1]
+                ):
+                    continue                       # punched-out middle band
                 if t.usd_size < min_leader_notional:
                     continue
                 market, winner = self._market(t.market_id)
                 if market is None or not market.closed or winner is None or market.end_date is None:
                     continue                       # only resolved markets have a known payout
-                hours_left = (market.end_date - t.timestamp).total_seconds() / 3600
-                if hours_left < min_hours_to_resolution:
-                    continue
+                # Only enforce when the knob is ON (matches ExactCopyStrategy).
+                # Daily-sports markets carry end_date at START of day, so every
+                # in-game trade has NEGATIVE hours_left; with the knob at its
+                # default 0 the unguarded compare silently dropped all of them,
+                # while the live bot copies them — backtests wildly undercounted
+                # for sports-heavy leaders.
+                if min_hours_to_resolution > 0 or max_hours_to_resolution > 0:
+                    hours_left = (market.end_date - t.timestamp).total_seconds() / 3600
+                    if min_hours_to_resolution > 0 and hours_left < min_hours_to_resolution:
+                        continue
+                    # No symmetric guard needed on the max side: the same
+                    # start-of-day stamp that makes hours_left negative for
+                    # in-game trades keeps them under every ceiling, which is
+                    # what we want — the ceiling is aimed at months-out macro
+                    # markets, not at sports.
+                    if max_hours_to_resolution > 0 and hours_left > max_hours_to_resolution:
+                        continue
                 sized = risk.size(Signal(
                     t.market_id, t.token_id, t.outcome, Side.BUY, t.price,
                     t.usd_size, "backtest", source_leader=t.leader.lower(), source_uid=t.uid,
@@ -475,17 +720,26 @@ class ExactCopyBacktester:
                     settled.discard(lkey)
                     tr = _Tranche(market=market, outcome=t.outcome, entry_ts=t.timestamp)
                     tranches[lkey] = tr
-                    heapq.heappush(pending, (market.end_date, seq, lkey, winner))
+                    heapq.heappush(pending, (_resolves(t.token_id, market), seq, lkey, winner))
                     seq += 1
                 tr.shares += shares
                 tr.bought += shares
                 tr.cost += sized.size_usd
+                arm_stop(lkey, t.timestamp)        # avg moved: recompute trigger
             else:
                 tr = tranches.get(lkey)
                 if tr is None or lkey in settled or tr.shares <= 1e-9:
                     continue                       # nothing of ours to mirror-sell
                 fraction = 1.0 if prior <= 1e-9 else min(1.0, t.shares / prior)
                 sell_shares = tr.shares * fraction
+                # Mirrors ExactCopyStrategy's dust sweep. Tranches are keyed
+                # (leader, token), so tr.shares is already this leader's own
+                # slice — the multi-leader clamp the live path needs is
+                # structural here.
+                if s.sweep_exit_dust:
+                    residual_value = (tr.shares - sell_shares) * tr.avg
+                    if 0 < residual_value < s.exit_dust_usd:
+                        sell_shares = tr.shares
                 exit_price = min(max(t.price * (1 - slip), _MIN_PRICE), _MAX_PRICE)
                 tr.realized += (exit_price - tr.avg) * sell_shares
                 tr.shares -= sell_shares
@@ -496,7 +750,14 @@ class ExactCopyBacktester:
                     fill_price=exit_price, size_usd=exit_price * sell_shares,
                     shares=sell_shares, timestamp=t.timestamp, mode="backtest",
                 ))
+                arm_stop(lkey, t.timestamp)        # position shrank (maybe to zero)
 
+        # Drain: stops still pending fire at their own time, ahead of resolution.
+        if pending or armed:
+            horizon = max(
+                [p[0] for p in pending] + [sts for sts, _ in armed.values()]
+            )
+            settle_until(horizon)
         while pending:
             rts, _, key, winner = heapq.heappop(pending)
             finish(key, rts, winner)

@@ -62,7 +62,9 @@ class LongTermCopyStrategy(Strategy):
         self._market_cache_ttl = market_cache_ttl
         self._market_cache: dict[str, tuple[float, Market | None]] = {}
 
-    def set_leaders(self, leaders: list[str]) -> None:
+    def set_leaders(self, leaders: list[str], *, exit_only: list[str] | None = None) -> None:
+        # `exit_only` is accepted for engine-interface parity but unused:
+        # this strategy holds to resolution and never mirrors exits.
         self.leaders = [w.lower() for w in leaders]
 
     def _market(self, condition_id: str) -> Market | None:
@@ -73,8 +75,13 @@ class LongTermCopyStrategy(Strategy):
         try:
             m = self.gamma.get_market(condition_id)
         except Exception as e:
+            # Transient failure (rate limit, timeout): serve the stale entry if
+            # we have one, but never CACHE the error — a poisoned entry would
+            # silently drop every trade in the market for the next TTL window.
+            # (Same fix as ExactCopyStrategy._market, LeaderSelector._resolver
+            # and both backtesters.)
             log.debug("strategy: market lookup failed %s: %s", condition_id[:12], e)
-            m = None
+            return hit[1] if hit else None
         self._market_cache[condition_id] = (now, m)
         return m
 

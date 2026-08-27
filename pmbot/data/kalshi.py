@@ -32,6 +32,7 @@ from tenacity import (
 )
 
 from pmbot.config import get_settings
+from pmbot.data.errors import raise_for_status_smart
 from pmbot.models import KalshiMarket
 
 log = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ class KalshiClient:
     )
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         resp = self._client.get(f"{self.base_url}{path}", params=params)
-        resp.raise_for_status()
+        raise_for_status_smart(resp)   # 4xx (except 429) are not retried
         return resp.json()
 
     # -- markets -----------------------------------------------------------

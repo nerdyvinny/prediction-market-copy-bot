@@ -45,6 +45,78 @@ def _bt(resolutions, **kw):
                                settings=_settings(), **kw)
 
 
+def test_in_game_entry_copied_when_hours_filter_off():
+    """PM daily-sports markets put end_date at START of day, so in-game trades
+    sit 'after close'. With min_hours_to_resolution at its default 0 they must
+    still be copied (the live strategy copies them); only a positive knob may
+    exclude them."""
+    res = {"m1": (_mkt("m1", end_days_ago=2.0), "tokW")}
+    # Trade 1 day ago = a full day AFTER the market's end_date.
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert len(rep.results) == 1                 # copied and settled at payout
+    rep2 = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                             min_hours_to_resolution=6.0)
+    assert len(rep2.results) == 0                # knob ON excludes it
+
+
+def test_skip_price_band_punches_out_the_middle_only():
+    """The band knob must remove the middle and leave both tails copied.
+
+    A plain `price_min`/`price_max` narrowing cannot express this, which is the
+    whole reason the knob exists — if it ever collapsed to an edge move, a
+    "the middle is where we bleed" test would silently become "we stopped
+    buying anything dear", a different rule with a different P&L.
+    """
+    res = {c: (_mkt(c), f"tok{c}") for c in ("m1", "m2", "m3")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokm1", Side.BUY, 0.30, 1000, 10, "u1"),   # below the hole
+        _trade("m2", "tokm2", Side.BUY, 0.70, 1000, 10, "u2"),   # inside it
+        _trade("m3", "tokm3", Side.BUY, 0.82, 1000, 10, "u3"),   # above it
+    ]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert {r.token_id for r in rep.results} == {"tokm1", "tokm2", "tokm3"}
+
+    held = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                             skip_price_band=(0.60, 0.80))
+    assert {r.token_id for r in held.results} == {"tokm1", "tokm3"}
+
+
+def test_skip_price_band_is_half_open_at_the_top():
+    """Adjacent bands must tile: 0.80 belongs to the next band up, not this one.
+    A closed upper bound would double-count a boundary price whenever two bands
+    are compared side by side."""
+    res = {c: (_mkt(c), f"tok{c}") for c in ("m1", "m2")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokm1", Side.BUY, 0.60, 1000, 10, "u1"),   # lower edge: excluded
+        _trade("m2", "tokm2", Side.BUY, 0.80, 1000, 10, "u2"),   # upper edge: kept
+    ]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                            skip_price_band=(0.60, 0.80))
+    assert {r.token_id for r in rep.results} == {"tokm2"}
+
+
+def test_market_lookup_error_not_cached():
+    """A transient Gamma failure (rate limit) must not poison the memo: the
+    next call for the same market retries and succeeds. A poisoned entry
+    silently drops every trade in that market for the whole run."""
+    good = (_mkt("m1"), "tokW")
+
+    class FlakyGamma(FakeGamma):
+        calls = 0
+
+        def get_market_with_resolution(self, cid):
+            FlakyGamma.calls += 1
+            if FlakyGamma.calls == 1:
+                raise RuntimeError("429 rate limited")
+            return good
+
+    bt = ExactCopyBacktester(data=None, gamma=FlakyGamma({}), settings=_settings())
+    assert bt._market("m1") == (None, None)      # failed call: skipped, not stored
+    assert bt._market("m1") == good              # retry succeeds
+    assert bt._market("m1") == good and FlakyGamma.calls == 2   # now memoized
+
+
 def test_buy_and_hold_settles_at_payout():
     res = {"m1": (_mkt("m1"), "tokW")}
     tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.50, 1000, 10, "u1")]}
@@ -187,3 +259,86 @@ def test_bankroll_frees_after_resolution():
     assert len(rep.results) == 2
     assert all(r.size_usd == pytest.approx(50.0) for r in rep.results)
     assert all(r.won for r in rep.results)
+
+
+# --- protective stop-loss (opt-in; off by default) -------------------------
+
+def _series(*points):
+    """(hours_before_NOW, price) -> the (unix_ts, price) shape simulate() wants."""
+    return [(int((NOW - timedelta(hours=h)).timestamp()), p) for h, p in points]
+
+
+def test_stop_fires_before_resolution_and_caps_the_loss():
+    """A loser that drifts down must be cut at the stop instead of settling at 0."""
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokLOSE")}   # our token loses
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 2, "u1")]}
+    # entry 48h before NOW at 0.80; price slides to 0.40 (a -50% drawdown) at 24h.
+    prices = {"tokW": _series((47, 0.78), (24, 0.40), (2, 0.05))}
+
+    held = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert held.results[0].closed_by == "resolution"
+
+    stopped = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                                stop_loss_frac=0.30, price_series=prices)
+    r = stopped.results[0]
+    assert r.closed_by == "stop-loss"
+    assert r.pnl > held.results[0].pnl           # cutting beat riding it to zero
+    assert r.resolve_ts == NOW - timedelta(hours=24)   # fired at the first breach
+
+
+def test_stop_does_not_fire_when_price_holds_above_trigger():
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokW")}      # our token wins
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 2, "u1")]}
+    prices = {"tokW": _series((47, 0.75), (24, 0.70), (2, 0.95))}   # dips to -12% only
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                            stop_loss_frac=0.30, price_series=prices)
+    assert rep.results[0].closed_by == "resolution"
+
+
+def test_stop_is_off_by_default_and_needs_a_price_series():
+    """Live leader-vetting calls simulate() with neither arg — behaviour must
+    be untouched, and a stop without prices must not silently half-apply."""
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokLOSE")}
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 2, "u1")]}
+    prices = {"tokW": _series((24, 0.10))}
+
+    plain = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    no_prices = _bt(res).simulate(tapes, lookback_days=30, now=NOW, stop_loss_frac=0.30)
+    assert [r.pnl for r in plain.results] == [r.pnl for r in no_prices.results]
+    armed = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                              stop_loss_frac=0.30, price_series=prices)
+    assert armed.results[0].pnl != plain.results[0].pnl   # prices supplied: it bites
+
+
+def test_leader_exit_before_the_stop_wins():
+    """If the leader bails first, that's the exit we copy — no later stop fires."""
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokLOSE")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokW", Side.BUY, 0.80, 1000, 3, "u1"),
+        _trade("m1", "tokW", Side.SELL, 0.70, 1000, 2, "u2"),   # full exit at 48h
+    ]}
+    prices = {"tokW": _series((24, 0.10))}                       # breach comes later
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                            stop_loss_frac=0.30, price_series=prices)
+    assert len(rep.results) == 1
+    assert rep.results[0].closed_by == "leader-exit"
+
+
+def test_resolve_at_override_gives_in_game_trades_a_real_holding_window():
+    """Sports end_date precedes an in-game entry, so the tranche settles at once
+    and no stop can ever bite. An override restores a real window."""
+    res = {"m1": (_mkt("m1", end_days_ago=2.0), "tokLOSE")}   # end_date BEFORE entry
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.80, 1000, 1, "u1")]}
+    prices = {"tokW": _series((12, 0.30))}                    # -62% twelve hours out
+
+    # Without the override the position is already "resolved" at entry.
+    blind = _bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                              stop_loss_frac=0.30, price_series=prices)
+    assert blind.results[0].closed_by == "resolution"
+
+    fixed = _bt(res).simulate(
+        tapes, lookback_days=30, now=NOW, stop_loss_frac=0.30, price_series=prices,
+        resolve_at={"tokW": NOW - timedelta(hours=6)},
+    )
+    assert fixed.results[0].closed_by == "stop-loss"
+    assert fixed.results[0].pnl > blind.results[0].pnl

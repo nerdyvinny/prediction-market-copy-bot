@@ -67,7 +67,12 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="[auto] similarity floor for auto-matched pairs (default 0.75)")
 
     sub.add_parser("status", help="show paper portfolio summary + open positions")
-    sub.add_parser("settle", help="realize P&L for any open positions whose markets resolved")
+    st = sub.add_parser("settle", help="realize P&L for any open positions whose markets resolved")
+    st.add_argument("--market", type=str, default=None,
+                    help="force-settle every open position in this market (condition id) "
+                         "at --price; for markets that never resolve decisively")
+    st.add_argument("--price", type=float, default=None,
+                    help="[--market] payout per share, 0..1 (e.g. 1.0 winner / 0.0 loser)")
     sub.add_parser("live", help="GATED live trading (disabled by default)")
     return p
 
@@ -298,9 +303,18 @@ def main(argv: list[str] | None = None) -> int:
 
         led, gamma, kalshi = Ledger(settings.db_path), GammaClient(), KalshiClient()
         try:
-            n = Settler(led, gamma, kalshi).settle_open_positions()
+            settler = Settler(led, gamma, kalshi)
+            if args.market is not None:
+                if args.price is None or not (0.0 <= args.price <= 1.0):
+                    print("--market requires --price between 0 and 1 (payout per share).")
+                    return 2
+                n = settler.force_settle_market(args.market, args.price)
+                print(f"Force-settled {n} position(s) in {args.market} at {args.price:.2f}.")
+            else:
+                n = settler.settle_open_positions()
+                print(f"Settled {n} position(s).")
             s = led.summary()
-            print(f"Settled {n} position(s). realized=${s['realized_pnl']:,.2f} "
+            print(f"realized=${s['realized_pnl']:,.2f} "
                   f"fees=${s['fees_usd']:,.2f} net=${s['net_pnl']:,.2f}")
         finally:
             led.close()

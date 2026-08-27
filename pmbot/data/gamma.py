@@ -24,6 +24,7 @@ from tenacity import (
 )
 
 from pmbot.config import get_settings
+from pmbot.data.errors import raise_for_status_smart
 from pmbot.models import Market
 
 log = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class GammaClient:
     )
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         resp = self._client.get(f"{self.base_url}{path}", params=params)
-        resp.raise_for_status()
+        raise_for_status_smart(resp)   # 4xx (except 429) are not retried
         return resp.json()
 
     def get_markets(
@@ -148,6 +149,12 @@ class GammaClient:
         liquidity = m.get("liquidityNum")
         if liquidity is None:
             liquidity = m.get("liquidity")
+        prices = [_to_float_or_none(p) for p in _load_json_list(m.get("outcomePrices"))]
+        outcome_prices = {
+            str(t): p
+            for t, p in zip(token_ids, prices)
+            if t is not None and p is not None
+        }
         return Market(
             market_id=str(m.get("conditionId", "")),
             question=str(m.get("question", "")),
@@ -156,6 +163,9 @@ class GammaClient:
             liquidity_usd=_to_float_or_none(liquidity),
             closed=bool(m.get("closed", False)),
             tokens=tokens,
+            outcome_prices=outcome_prices,
+            slug=_to_str_or_none(m.get("slug")),
+            event_slug=cls._extract_event_slug(m),
         )
 
     @staticmethod
@@ -169,6 +179,18 @@ class GammaClient:
                 if isinstance(first, dict):
                     return first.get("label") or first.get("slug")
                 return str(first)
+        return None
+
+    @staticmethod
+    def _extract_event_slug(m: dict) -> str | None:
+        """Slug of the event this market belongs to.
+
+        Events group sibling markets ("Game 2 winner", "1st half O/U 1.5"), and
+        the event slug is the first segment of the market's public URL.
+        """
+        events = m.get("events")
+        if isinstance(events, list) and events and isinstance(events[0], dict):
+            return _to_str_or_none(events[0].get("slug"))
         return None
 
 
@@ -202,3 +224,8 @@ def _to_float_or_none(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _to_str_or_none(v: Any) -> str | None:
+    """Empty and missing both mean 'no value' — never an empty-string slug."""
+    return str(v) if v else None

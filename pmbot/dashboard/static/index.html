@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pmbot</title>
+<link rel="stylesheet" href="/static/style.css?v=7">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="wordmark">pmbot</span>
+    <span class="badge" id="mode-badge">—</span>
+  </div>
+  <div class="header-status">
+    <span class="engine" id="engine">
+      <span class="dot" id="engine-dot"></span><span id="engine-text">Checking…</span>
+    </span>
+    <span class="sep">·</span>
+    <span id="updated">Loading…</span>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="hero-tile">
+      <div class="label">Open positions</div>
+      <div class="value" id="open-pnl">—</div>
+      <div class="caption">unrealized P&amp;L at current prices</div>
+    </div>
+    <div class="hero-tile">
+      <div class="label">Closed positions</div>
+      <div class="value" id="closed-pnl">—</div>
+      <div class="caption">realized P&amp;L, net of fees</div>
+    </div>
+    <div class="hero-tile">
+      <div class="label">Win rate</div>
+      <div class="value" id="win-rate">—</div>
+      <div class="caption" id="win-rate-caption">closed trades in profit</div>
+    </div>
+  </section>
+  <p class="strip" id="strip"></p>
+
+  <section class="card">
+    <div class="card-head">
+      <div class="cal-nav">
+        <button id="cal-prev" class="cal-arrow" type="button" aria-label="Previous month">‹</button>
+        <h2 id="cal-month">—</h2>
+        <button id="cal-next" class="cal-arrow" type="button" aria-label="Next month">›</button>
+      </div>
+      <span class="sub" id="cal-sub"></span>
+    </div>
+    <div class="cal-dow">
+      <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span>
+      <span>Thu</span><span>Fri</span><span>Sat</span>
+    </div>
+    <div class="cal-grid" id="cal-grid"></div>
+    <div class="day-panel" id="cal-day" hidden></div>
+    <p class="cal-foot">Daily realized P&amp;L, net of fees · trade count is fills that day · click a day to see its trades</p>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Leaders you're following</h2>
+      <span class="sub" id="leaders-sub"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="leaders">
+        <thead><tr>
+          <th class="left">Leader</th><th>Score</th>
+          <th>Open exposure</th><th>Copied</th><th>Win rate</th>
+          <th>Our P&amp;L</th><th class="left"></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Open positions</h2>
+      <div class="sorts" id="pos-sorts">
+        <span class="sorts-label">Sort</span>
+        <button type="button" class="sort-btn" data-sort="copied">
+          Copied <span class="sort-arrow"></span>
+        </button>
+        <button type="button" class="sort-btn" data-sort="resolves">
+          Resolves <span class="sort-arrow"></span>
+        </button>
+      </div>
+      <span class="sub" id="pos-sub"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="positions">
+        <thead><tr>
+          <th class="left">Market</th><th class="left">Side</th>
+          <th class="left">Copied</th><th class="left">Resolves</th>
+          <th>Put in</th><th>Worth now</th><th>P&amp;L</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Copied trades</h2>
+      <span class="sub" id="trades-sub"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="trades">
+        <thead><tr>
+          <th class="left">Market</th><th>Put in</th>
+          <th class="left">Where it stands</th><th>Net</th><th class="left">Status</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Trade log</h2>
+      <span class="sub" id="fills-sub"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="fills">
+        <thead><tr>
+          <th class="left">Time</th><th class="left">Market</th><th class="left">Action</th>
+          <th>Price</th><th>Amount</th><th class="left">Copied from</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Updates</h2>
+      <span class="sub" id="updates-sub"></span>
+    </div>
+    <ul class="updates" id="updates"></ul>
+  </section>
+</main>
+
+<footer>Read-only paper ledger · no orders are placed from this page</footer>
+
+<script src="/static/app.js?v=7"></script>
+</body>
+</html>

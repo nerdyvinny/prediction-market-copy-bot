@@ -37,6 +37,11 @@ class PaperExecutor(TradeExecutor):
         self.ledger = ledger
         self.price_cache = price_cache or PriceCache()
         self.slippage_bps = settings.slippage_bps if slippage_bps is None else slippage_bps
+        # Limit-order semantics for copied entries: never pay more than the
+        # leader's price + the drift budget. The strategy's drift guard checks
+        # the MID; a thin book's ask can sit far above it, and chasing it
+        # would let live fills run away from what every backtest assumes.
+        self.max_entry_premium = settings.copy_max_price_drift
 
     def execute(self, signal: Signal) -> Fill | None:
         if signal.size_usd <= 0:
@@ -47,9 +52,12 @@ class PaperExecutor(TradeExecutor):
             return None
         self.ledger.record_fill(fill)
         log.info(
+            # fill.size_usd, not signal.size_usd: a SELL's requested size is
+            # valued at our avg cost, so logging it printed the cost basis
+            # instead of the proceeds and made every exit look flat.
             "paper %s %s %.2f sh @ %.4f ($%.2f) %s",
             signal.side.value, signal.outcome, fill.shares, fill.fill_price,
-            signal.size_usd, signal.reason,
+            fill.size_usd, signal.reason,
         )
         return fill
 
@@ -74,7 +82,22 @@ class PaperExecutor(TradeExecutor):
         price = self._resolve_fill_price(signal)
         if price is None:
             return None
-        shares = signal.size_usd / price
+        if signal.side is Side.SELL:
+            # Fill SELLs in shares, never size_usd / price: size_usd is valued
+            # at our avg cost, so converting it at a collapsed market price
+            # would sell orders of magnitude more shares than we hold and flip
+            # the position into a fictitious short. Hard-cap at held shares.
+            pos = self.ledger.get_position(signal.token_id)
+            held = abs(pos.shares) if pos else 0.0
+            if held <= 1e-9:
+                log.warning("paper: sell of %s with no position; skipping", signal.token_id[:10])
+                return None
+            desired = signal.size_usd / price if signal.size_shares is None else signal.size_shares
+            shares = min(desired, held)
+            size_usd = shares * price
+        else:
+            shares = signal.size_usd / price
+            size_usd = signal.size_usd
         fee = 0.0
         if signal.venue == Venue.KALSHI.value:
             # Kalshi taker fee on the order (contracts == shares).
@@ -82,7 +105,7 @@ class PaperExecutor(TradeExecutor):
         return Fill(
             signal=signal,
             fill_price=price,
-            size_usd=signal.size_usd,
+            size_usd=size_usd,
             shares=shares,
             timestamp=datetime.now(timezone.utc),
             mode=self.mode,
@@ -102,11 +125,51 @@ class PaperExecutor(TradeExecutor):
         # CLOB cache can't quote Kalshi tokens, and the scan happened seconds
         # ago in the same cycle. Slippage budget still applies.
 
+        is_copy_buy = (
+            signal.side is Side.BUY
+            and signal.source_leader is not None
+            and signal.venue == Venue.POLYMARKET.value
+        )
         if signal.side is Side.BUY:
-            base = quote.ask if (quote and quote.ask) else signal.target_price
+            if quote and quote.ask:
+                base = quote.ask
+            elif is_copy_buy:
+                # No live book -> no copied entry. Falling back to the leader's
+                # own price would grant perfect fills exactly when we're blind
+                # (CLOB outage), inflating paper P&L with trades a live order
+                # could never get.
+                log.info("paper: no book for %s; skipping copy buy", signal.token_id[:10])
+                return None
+            else:
+                base = signal.target_price
             price = base * (1 + slip) if base else None
+            if price and is_copy_buy and price > signal.target_price + self.max_entry_premium:
+                log.info(
+                    "paper: fill %.4f beyond limit %.4f (leader %.4f); skipping copy buy",
+                    price, signal.target_price + self.max_entry_premium, signal.target_price,
+                )
+                return None
         else:
-            base = quote.bid if (quote and quote.bid) else signal.target_price
+            is_copy_sell = (
+                signal.source_leader is not None
+                and signal.venue == Venue.POLYMARKET.value
+            )
+            if quote and quote.bid:
+                base = quote.bid
+            elif is_copy_sell:
+                # Symmetric with the copy-BUY guard above. Falling back to the
+                # leader's own price grants an exit no live order could get —
+                # and an empty book is exactly where that bites: a dead,
+                # illiquid, or already-resolved market (the strategy's market
+                # cache is 300s stale, so "closed since we last looked" is
+                # routine). The uid is not retired, so this retries every poll;
+                # if the book never comes back, settlement books the true
+                # payout, which is the honest answer since we could not have
+                # sold either.
+                log.info("paper: no bid for %s; skipping copy sell", signal.token_id[:10])
+                return None
+            else:
+                base = signal.target_price
             price = base * (1 - slip) if base else None
 
         if not price or price <= 0:

@@ -23,6 +23,7 @@ from tenacity import (
 )
 
 from pmbot.config import get_settings
+from pmbot.data.errors import raise_for_status_smart
 from pmbot.models import Quote
 
 log = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ class PriceCache:
     )
     def _get(self, path: str, params: dict[str, Any]) -> Any:
         resp = self._client.get(f"{self.base_url}{path}", params=params)
-        resp.raise_for_status()
+        raise_for_status_smart(resp)   # 4xx (except 429) are not retried
         return resp.json()
 
     def get_quote(self, token_id: str, *, force: bool = False) -> Quote:
@@ -126,11 +127,18 @@ def _to_float(v: Any) -> float | None:
 
 
 def _best_level(levels: list, *, want_max: bool) -> tuple[float, float] | None:
-    """Best (price, size) from a CLOB book side; None if side is empty."""
+    """Best (price, size) from a CLOB book side; None if side is empty.
+
+    Zero-size levels are skipped: they are not tradeable, but `min(asks)` over
+    a list that includes one happily returns it as the best ask. Paired with
+    the executor's `_MIN_PRICE` floor and `shares = size_usd / price`, a single
+    stale zero-size level at 0.0001 turns a $50 order into 500,000 shares.
+    """
     parsed = [
-        (p, _to_float(lvl.get("size")) or 0.0)
+        (p, size)
         for lvl in levels
         if (p := _to_float(lvl.get("price"))) is not None
+        and (size := _to_float(lvl.get("size")) or 0.0) > 0
     ]
     if not parsed:
         return None

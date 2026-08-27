@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pmbot-dashboard",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "pmbot.dashboard.app"],
+      "port": 8091,
+      "autoPort": true
+    }
+  ]
+}

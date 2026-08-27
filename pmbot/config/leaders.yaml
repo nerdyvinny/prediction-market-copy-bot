@@ -1,31 +1,116 @@
 # Automatic leader selection + scoring config.
 #
-# The bot pulls Polymarket's PUBLIC leaderboard, scores every candidate wallet,
-# and auto-follows the top_n that pass all `filters`. You don't list wallets
-# here (selection is automatic) — you set the BAR. Tune during paper testing.
+# The bot profiles every wallet visible in the top market feeds, shortlists
+# the ones that already look like winners, deep-scores those, and follows the
+# top_n that pass ALL `filters`. You don't list wallets here (selection is
+# automatic) — you set the BAR. After each rescore the bot prints a rejection
+# report showing how many wallets each rule eliminated: if the pool comes up
+# empty, that report tells you which knob to loosen.
 
 selection:
-  top_n: 8                     # diversify across more leaders instead of just 2
-  rescore_interval_hours: 24   # re-rank the leaderboard on this cadence
+  top_n: 8                     # diversify across up to this many leaders
+  rescore_interval_hours: 24   # re-rank the pool on this cadence
 
-# A wallet must pass ALL of these to be eligible. These sanity caps exist to
-# reject lucky/low-sample wallets (the #1 killer of copy trading).
+  # top_n is a RELATIVE cut, and it binds on every rescore (the eligible pool
+  # ran 9-27, median 15, over the first month). That evicted leaders which had
+  # got no worse: 0xc23dc0ec passed vetting on 2026-08-20 with the most
+  # copyable tape of any wallet, then vanished the next day when the pool grew
+  # 19 -> 27. Nothing rejected it; it was simply out-ranked.
+  #
+  # With keep_incumbents on, a leader we already follow keeps its seat. It
+  # still has to clear every filter below AND the copy vetting, so a seat is
+  # only ever lost by failing a test -- never by someone else's good day.
+  keep_incumbents: true
+  explore_slots: 2             # seats kept contestable so the funnel still
+                               # discovers; incumbency can claim at most
+                               # top_n - explore_slots.
+
+  # Copyable BUYs that count as "enough of this tape is mirrorable". The
+  # copyability weight saturates here instead of rewarding raw volume: the
+  # highest-copyable wallet of the first month (235) was also the worst
+  # leader we followed, so more is not better past a point.
+  copyable_target: 40
+
+  # realized_pnl is still POOL-RELATIVE (min-max), unlike win_rate and
+  # copyability. That is a known wart: one whale flattens the field (on a live
+  # pool spanning $1.5k-$56k every other wallet scored below 0.20), and a
+  # wallet is re-scored when only the pool changed (max drift 0.037, larger
+  # than several adjacent rank gaps).
+  #
+  # A log-spaced absolute scale is implemented and tested (`pnl_score`), and it
+  # fixes both -- set these two to switch to it. It is OFF because it measured
+  # WORSE where it counts. Correlation of rank with trades we actually filled:
+  #     Aug-26 lineup  +0.03 -> +0.21   (better)
+  #     Aug-23 lineup  +0.08 -> -0.63   (much worse)
+  # On Aug-23 it drops 0x5cd5c8d7 from 2nd to LAST -- the wallet that supplied
+  # 25 of that month's 91 buys, and the smallest P&L in the pool.
+  #
+  # The reason is the finding, not the scale: over the 10 wallets we have both
+  # readings for, corr(realized_pnl, buys we filled) is **-0.035**. Dollar P&L
+  # does not predict what we can copy, because it tracks a leader's bankroll,
+  # and the wallet we copy most is small. Min-max was accidentally hiding that
+  # by squashing everyone under the whale; making the term faithful exposes it.
+  # Sweeping the anchors only confirms it -- the sole setting that does not hurt
+  # ($5000 floor) works by re-flattening the field, i.e. by doing less.
+  #
+  # So the real question is the WEIGHT on realized_pnl, not its normalisation.
+  # Do not tune that here: 2 lineups and 10 wallets is nowhere near enough, and
+  # this repo has a history of changes that looked right and failed live.
+  pnl_floor_usd: 0        # e.g. 1000  } both must be set,
+  pnl_target_usd: 0       # e.g. 50000 } and target > floor
+
+# A wallet must pass ALL of these to be eligible. One 30-day window covers
+# everything — recent form only, no credit for ancient history.
 filters:
-  lookback_days: 45            # recent form only (45d won the 2026-07 copy-P&L sweep)
-  min_resolved_trades: 100
-  min_win_rate: 0.55
-  min_realized_pnl_usd: 0
-  min_distinct_categories: 2          # consistency across market types
-  min_avg_market_liquidity_usd: 5000  # leader must trade liquid markets
-  max_position_concentration: 0.40    # largest single position <= 40% of book
+  lookback_days: 30
+  min_trades: 50                    # ≥50 trades in the window (alive + active)
+  min_resolved_markets: 25          # ≥25 FINISHED bets behind the win rate —
+                                    # 80% of 2 is luck; 80% of 25 is a signal
+  min_win_rate: 0.80                # over resolved markets, always enforced
+  min_realized_pnl_usd: 0           # must be net-positive in the window
+  min_distinct_categories: 1        # 1 = single-market specialists welcome
+  max_profit_concentration: 0.40    # no market may be >40% of total profit
+  max_hours_since_last_trade: 96    # dead-account guard (was 48; widened to
+                                    # readmit e.g. sports bettors between
+                                    # game days — biggest reject bucket)
+  min_copyable_trades: 5            # ≥5 BUYs the copy side would actually
+                                    # mirror (≥$500 notional, in price band) —
+                                    # filters out uncopyable penny-bet bots
+  min_tape_span_days: 7             # HFT guard: if the ~1500-trade tape we
+                                    # fetch is FULL yet covers under 7 days,
+                                    # the wallet fires hundreds of trades/day —
+                                    # a latency bot (in-game sports sniper /
+                                    # market maker). Its win rate is speed we
+                                    # can't inherit at a 10s poll, and so
+                                    # shallow a tape can't be vetted anyway.
 
-# Ranking weights for eligible wallets (must sum to ~1.0). Higher total = followed first.
+# Ranking weights for eligible wallets (should sum to ~1.0). Consistency
+# (category spread) is zeroed: with specialists allowed it mostly punishes
+# exactly the profile we now want.
+#
+# 2026-08-23, from 37 rescores of live data: the old weights ranked wallets on
+# how rich they are, which barely predicts whether we get to copy them. The
+# score's correlation with trades we actually filled was +0.13; the count of
+# copyable trades scored +0.35. The top-ranked wallet held its seat for 76% of
+# the month and produced TWO fills, while the wallets behind 46% of all buys
+# ranked 7th and 17th. `copyability` exists to close that gap -- it is the one
+# term measured on an absolute scale, so it does not drift with the pool.
 weights:
-  realized_pnl: 0.35
+  realized_pnl: 0.25
   win_rate: 0.25
-  consistency: 0.20            # spread across categories
-  recency: 0.20                # decay-weighted toward recent activity
+  consistency: 0.00
+  recency: 0.20
+  copyability: 0.30
 
-# Manual overrides (optional).
-allowlist: []   # wallet addresses to always include (bypass filters)
+# Manual overrides (optional). Allowlisted wallets bypass BOTH the selection
+# filters above and the copy-vetting backtest — they are followed on your say-so
+# until you remove them, so review them when you review the lineup.
+allowlist:
+  # Dropped 2026-08-12 by the out-of-sample vetting rule on a -$17.13 older
+  # window, on the same day its recent window hit its best-ever +$127.75. It
+  # was the source of 13 of the bot's fills over Aug 8-10 and its trades clear
+  # the entry filters better than anything except 0xc23dc0ec. The rule that
+  # dropped it has since been given slack (copy_vet_oos_min_pnl_usd), but this
+  # pin keeps it in regardless of what the sliding window does next.
+  - "0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33"
 blocklist: []   # wallet addresses to never follow
