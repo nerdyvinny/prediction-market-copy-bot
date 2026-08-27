@@ -154,6 +154,13 @@ class Settings(BaseSettings):
     copy_vet_require_consistency: bool = True
     copy_vet_oos_lookback_days: int = 90
     copy_vet_oos_min_trades: int = 5   # lower bar: older tape is thinner
+    # Below this many trades the older window is too thin for `oos_min_pnl_usd`
+    # slack to mean anything, so it must be outright PROFITABLE. The slack is
+    # calibrated for a window with enough trades to be noisy; on 9 trades a
+    # -$21 window is not drift, it is the whole record. Deliberately does NOT
+    # reject a thin window that made money -- the tape truncates at ~6 weeks
+    # for heavy traders, so thin often means missing data, not a bad leader.
+    copy_vet_oos_thin_trades: int = 15
     # The older window is a SLIDING one: every day it drops trades off the back
     # and picks up newer ones at the front, so its P&L wanders on its own even
     # when the leader's behaviour is unchanged. Judging it against the same $0

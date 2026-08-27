@@ -142,6 +142,52 @@ def test_small_prior_loss_is_within_slack(monkeypatch):
     eng.close()
 
 
+def test_thin_prior_window_may_not_excuse_a_loss(monkeypatch):
+    """The hole that admitted the two worst leaders of the first month.
+
+    0xea83902f passed on a prior window of -$5.03 over SEVEN trades, traded
+    once and lost 92% of it. 0xf0ea0711 passed on -$26.90 over 13. Both sat
+    inside the -$50 slack, but that slack exists to absorb drift in a sliding
+    window, and a 7-trade window has not got enough trades to drift.
+    """
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (30, 223.57), "0xf0ea": (30, 259.78)}
+    FakeVetter.prior = {"0xthin": (7, -5.03), "0xf0ea": (13, -26.90)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin", "0xf0ea"]),
+                 strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == []
+    eng.close()
+
+
+def test_thin_prior_window_that_made_money_is_kept(monkeypatch):
+    """The other half, and the reason not to just raise the trade count: the
+    trade feed truncates around six weeks for a heavy trader, so a thin older
+    window is often missing data rather than a bad record. 0xe839e7fe sat on
+    10-13 prior trades for a fortnight while consistently PROFITABLE there.
+    """
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xe839": (68, 147.93)}
+    FakeVetter.prior = {"0xe839": (10, 41.56)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xe839"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xe839"]
+    eng.close()
+
+
+def test_thin_window_rule_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(engine_mod, "ExactCopyBacktester", FakeVetter)
+    FakeVetter.outcomes = {"0xthin": (30, 223.57)}
+    FakeVetter.prior = {"0xthin": (7, -5.03)}
+    s = Settings(db_path=":memory:", copy_vet_leaders=True, arb_enabled=False,
+                 copy_vet_oos_min_pnl_usd=-50.0, copy_vet_oos_thin_trades=0)
+    eng = Engine(settings=s, selector=FakeSelector(["0xthin"]), strategy=FakeStrategy())
+    assert [r.wallet for r in eng.rescore()] == ["0xthin"]
+    eng.close()
+
+
 def test_combined_windows_must_still_be_profitable(monkeypatch):
     """Slack on the older window must not become a hole. A prior loss inside
     the slack still drops the leader if the recent window can't pay for it."""

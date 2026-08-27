@@ -330,6 +330,21 @@ class Engine:
                              "window — %d trades in the prior %dd)",
                              r.wallet[:10], prior["n_trades"], span)
                     continue
+                if (prior["n_trades"] < s.copy_vet_oos_thin_trades
+                        and prior["net_pnl"] <= 0):
+                    # The slack below exists to absorb drift in a sliding
+                    # window, which needs enough trades to drift. A thin
+                    # window that also lost money is not noise, it is the
+                    # whole record -- and this was the hole that admitted the
+                    # two worst leaders of the first month (prior -$5.03/7t
+                    # and -$26.90/13t). A thin window that MADE money is left
+                    # alone: the trade feed truncates around six weeks for a
+                    # heavy trader, so few trades often means missing data.
+                    log.info("vet: %s DROPPED (prior window too thin to excuse a "
+                             "loss — $%.2f over %d trades, under %d)",
+                             r.wallet[:10], prior["net_pnl"], prior["n_trades"],
+                             s.copy_vet_oos_thin_trades)
+                    continue
                 if prior["net_pnl"] < oos_floor:
                     log.info("vet: %s DROPPED (recent $%.2f, but lost $%.2f over "
                              "the prior %dd — past the $%.2f slack)",
