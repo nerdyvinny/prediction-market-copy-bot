@@ -27,6 +27,11 @@ class SelectionConfig:
     # copyability score saturates here rather than rewarding raw volume --
     # see rank_wallets.
     copyable_target: int = 40
+    # Absolute anchors for the realized_pnl term, log-spaced between them.
+    # OFF by default (0 = fall back to pool-relative min-max) -- the scale is
+    # sound but measured WORSE on live outcomes; see leaders.yaml.
+    pnl_floor_usd: float = 0.0
+    pnl_target_usd: float = 0.0
 
 
 @dataclass
@@ -86,6 +91,8 @@ def load_leader_config(path: str | Path | None = None) -> LeaderConfig:
             keep_incumbents=bool(sel.get("keep_incumbents", True)),
             explore_slots=int(sel.get("explore_slots", 2)),
             copyable_target=int(sel.get("copyable_target", 40)),
+            pnl_floor_usd=float(sel.get("pnl_floor_usd", 0.0)),
+            pnl_target_usd=float(sel.get("pnl_target_usd", 0.0)),
         ),
         filters=FilterConfig(
             lookback_days=int(flt.get("lookback_days", d.lookback_days)),

@@ -15,6 +15,7 @@ from pmbot.leaders.scoring import (
     copyability,
     failing_filters,
     passes_filters,
+    pnl_score,
     rank_wallets,
     seat_roster,
     win_rate_score,
@@ -223,6 +224,34 @@ def test_win_rate_no_longer_flattens_a_wallet_that_just_cleared_the_bar():
     ranked = rank_wallets([lo, hi], WEIGHTS, copyable_target=40, win_rate_floor=FLOOR)
     # A far more copyable wallet is no longer buried by a 16-point win-rate gap.
     assert ranked[0].wallet == "just-passed"
+
+
+def test_pnl_score_is_log_spaced_between_absolute_anchors():
+    assert pnl_score(1000, 1000, 50000) == 0.0        # at the floor
+    assert pnl_score(500, 1000, 50000) == 0.0         # below it
+    assert pnl_score(50000, 1000, 50000) == pytest.approx(1.0)
+    assert pnl_score(90000, 1000, 50000) == pytest.approx(1.0)   # clamped
+    # log spacing: each 10x step is worth the same, so a whale is better
+    # evidence than a mid-pack wallet but not proportionally better.
+    step = pnl_score(10000, 100, 100000) - pnl_score(1000, 100, 100000)
+    assert step == pytest.approx(pnl_score(100000, 100, 100000)
+                                 - pnl_score(10000, 100, 100000))
+    assert pnl_score(5000, 0, 0) == 0.0               # disabled anchors
+    assert pnl_score(5000, 1000, 500) == 0.0          # target below floor
+
+
+def test_pnl_falls_back_to_pool_minmax_when_anchors_are_unset():
+    """Shipped OFF: the anchored scale measured worse on live outcomes, so the
+    default must leave ranking byte-identical to before it existed."""
+    pool = [_ws("small", pnl=2000.0, win=0.90, copyable=50),
+            _ws("whale", pnl=90000.0, win=0.90, copyable=50)]
+    unset = rank_wallets(pool, WEIGHTS, copyable_target=40, win_rate_floor=FLOOR)
+    legacy = rank_wallets(pool, WEIGHTS, copyable_target=40, win_rate_floor=FLOOR,
+                          pnl_floor_usd=0.0, pnl_target_usd=0.0)
+    assert [r.score for r in unset] == [r.score for r in legacy]
+    # min-max still gives the pool leader 1.0 and the other 0.0 -- the wart the
+    # anchored scale would fix, kept deliberately until there is data to justify it.
+    assert unset[0].score - unset[1].score == pytest.approx(WEIGHTS["realized_pnl"])
 
 
 def test_win_rate_term_does_not_drift_when_only_the_pool_changes():

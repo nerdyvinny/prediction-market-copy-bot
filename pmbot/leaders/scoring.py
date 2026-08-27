@@ -33,6 +33,7 @@ Honest caveats:
 from __future__ import annotations
 
 import logging
+import math
 import random
 import threading
 from collections import Counter, defaultdict
@@ -223,6 +224,31 @@ def copyability(n_copyable: int, target: int) -> float:
     return min(float(n_copyable), float(target)) / float(target)
 
 
+def pnl_score(realized_pnl: float, floor_usd: float, target_usd: float) -> float:
+    """Realized P&L on an absolute 0..1 scale, log-spaced between two anchors.
+
+    Min-maxing dollar P&L let one whale flatten the field: on a live pool
+    spanning $1.5k to $56k, every wallet but the largest scored below 0.20 and
+    the largest scored exactly 1.0. The term therefore encoded little beyond
+    "is this the richest wallet in today's pool", and it moved for everyone
+    whenever the richest wallet joined or left.
+
+    Log-spaced because a leader's absolute P&L tracks their bankroll at least
+    as much as their skill, and we copy a fixed small fraction of their size
+    either way: $50k is better evidence than $5k, but not ten times better.
+    Absolute anchors so the term does not drift with the pool. Everything at
+    or below `floor_usd` scores 0 -- the filters already require P&L above
+    `min_realized_pnl_usd`, so this only separates the profitable.
+    """
+    if floor_usd <= 0 or target_usd <= floor_usd:
+        return 0.0
+    if realized_pnl <= floor_usd:
+        return 0.0
+    return min(
+        math.log(realized_pnl / floor_usd) / math.log(target_usd / floor_usd), 1.0
+    )
+
+
 def win_rate_score(win_rate: float, floor: float) -> float:
     """Win rate on an absolute 0..1 scale, measured up from the eligibility bar.
 
@@ -248,6 +274,8 @@ def rank_wallets(
     *,
     copyable_target: int = 40,
     win_rate_floor: float = 0.0,
+    pnl_floor_usd: float = 0.0,
+    pnl_target_usd: float = 0.0,
 ) -> list[LeaderScore]:
     if not stats:
         return []
@@ -258,7 +286,12 @@ def rank_wallets(
             return [0.5] * len(values)
         return [(v - lo) / (hi - lo) for v in values]
 
-    pnl = norm([s.realized_pnl for s in stats])
+    # Absolute anchors when configured; otherwise fall back to pool min-max so
+    # existing callers that pass neither keep their old behaviour.
+    if pnl_floor_usd > 0 and pnl_target_usd > pnl_floor_usd:
+        pnl = [pnl_score(s.realized_pnl, pnl_floor_usd, pnl_target_usd) for s in stats]
+    else:
+        pnl = norm([s.realized_pnl for s in stats])
     wr = [win_rate_score(s.win_rate, win_rate_floor) for s in stats]
     cons = norm([float(s.n_categories) for s in stats])
     rec = norm([-s.recency_days for s in stats])   # more recent -> higher
@@ -565,6 +598,8 @@ class LeaderSelector:
             eligible, cfg.weights,
             copyable_target=cfg.selection.copyable_target,
             win_rate_floor=cfg.filters.min_win_rate,
+            pnl_floor_usd=cfg.selection.pnl_floor_usd,
+            pnl_target_usd=cfg.selection.pnl_target_usd,
         )
         top = seat_roster(
             ranked,

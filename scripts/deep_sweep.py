@@ -248,7 +248,9 @@ def main() -> int:
 
     ranked = rank_wallets(eligible, cfg.weights,
                           copyable_target=cfg.selection.copyable_target,
-                          win_rate_floor=cfg.filters.min_win_rate)
+                          win_rate_floor=cfg.filters.min_win_rate,
+                          pnl_floor_usd=cfg.selection.pnl_floor_usd,
+                          pnl_target_usd=cfg.selection.pnl_target_usd)
     _log(f"\n=== ranked eligible wallets (top 25 of {len(ranked)}) ===")
     _log(f"  {'wallet':<44}{'score':>7}{'pnl':>12}{'wr':>7}{'res':>5}{'cpy':>5}  src")
     for r in ranked[:25]:
