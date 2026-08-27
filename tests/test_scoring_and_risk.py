@@ -17,6 +17,7 @@ from pmbot.leaders.scoring import (
     passes_filters,
     pnl_score,
     rank_wallets,
+    recency_score,
     seat_roster,
     win_rate_score,
 )
@@ -252,6 +253,54 @@ def test_pnl_falls_back_to_pool_minmax_when_anchors_are_unset():
     # min-max still gives the pool leader 1.0 and the other 0.0 -- the wart the
     # anchored scale would fix, kept deliberately until there is data to justify it.
     assert unset[0].score - unset[1].score == pytest.approx(WEIGHTS["realized_pnl"])
+
+
+GATE = 96.0     # leaders.yaml max_hours_since_last_trade
+
+
+def test_recency_score_is_anchored_to_the_staleness_gate():
+    assert recency_score(0.0, GATE) == pytest.approx(1.0)       # just traded
+    assert recency_score(2.0, GATE) == pytest.approx(0.5)       # 48h of a 96h gate
+    assert recency_score(4.0, GATE) == pytest.approx(0.0)       # at the gate
+    assert recency_score(9.0, GATE) == 0.0                      # past it, clamped
+    assert recency_score(1.0, 0.0) == 0.0                       # gate off
+
+
+def test_recency_no_longer_spends_the_full_weight_on_a_few_hours():
+    """The old bug: min-max across wallets that have ALL cleared a 96-hour gate
+    gave the freshest 1.0 and the least fresh 0.0, so a 19-hour gap between two
+    perfectly current wallets was worth the entire recency weight."""
+    fresh = _ws("traded-1h", recency=1 / 24)
+    older = _ws("traded-20h", recency=20 / 24)
+    minmax = rank_wallets([fresh, older], WEIGHTS, copyable_target=40, win_rate_floor=FLOOR)
+    anchored = rank_wallets([fresh, older], WEIGHTS, copyable_target=40,
+                            win_rate_floor=FLOOR, recency_max_hours=GATE)
+    assert abs(minmax[0].score - minmax[1].score) == pytest.approx(WEIGHTS["recency"])
+    gap = abs(anchored[0].score - anchored[1].score)
+    assert gap == pytest.approx(WEIGHTS["recency"] * 19 / GATE, abs=1e-6)
+    assert gap < WEIGHTS["recency"] / 4
+
+
+def test_recency_term_does_not_drift_when_only_the_pool_changes():
+    """Recency was the LAST pool-relative term and the worst drifter: removing
+    one stale wallet moved everyone else's score by up to 0.116, several times
+    the gap between adjacent leaders in a real lineup."""
+    a = _ws("a", recency=2 / 24)
+    b = _ws("b", recency=6 / 24)
+    stale = _ws("stale", recency=70 / 24)
+    kw = dict(copyable_target=40, win_rate_floor=FLOOR, recency_max_hours=GATE)
+    withs = {r.wallet: r.score for r in rank_wallets([a, b, stale], WEIGHTS, **kw)}
+    without = {r.wallet: r.score for r in rank_wallets([a, b], WEIGHTS, **kw)}
+    assert withs["a"] == pytest.approx(without["a"])
+    assert withs["b"] == pytest.approx(without["b"])
+
+
+def test_recency_falls_back_to_pool_minmax_when_the_gate_is_unset():
+    pool = [_ws("x", recency=1 / 24), _ws("y", recency=3.0)]
+    unset = rank_wallets(pool, WEIGHTS, copyable_target=40, win_rate_floor=FLOOR)
+    legacy = rank_wallets(pool, WEIGHTS, copyable_target=40, win_rate_floor=FLOOR,
+                          recency_max_hours=0.0)
+    assert [r.score for r in unset] == [r.score for r in legacy]
 
 
 def test_win_rate_term_does_not_drift_when_only_the_pool_changes():

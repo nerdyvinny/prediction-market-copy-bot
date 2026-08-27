@@ -110,7 +110,8 @@ def main() -> None:
                           copyable_target=cfg.selection.copyable_target,
                           win_rate_floor=cfg.filters.min_win_rate,
                           pnl_floor_usd=cfg.selection.pnl_floor_usd,
-                          pnl_target_usd=cfg.selection.pnl_target_usd)
+                          pnl_target_usd=cfg.selection.pnl_target_usd,
+                          recency_max_hours=cfg.filters.max_hours_since_last_trade)
     pmbot_pre = [r.wallet for r in ranked[: cfg.selection.top_n]]
     pmbot_kept: list[str] = []
     for w in pmbot_pre:

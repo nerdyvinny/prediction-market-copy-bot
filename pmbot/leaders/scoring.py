@@ -249,6 +249,26 @@ def pnl_score(realized_pnl: float, floor_usd: float, target_usd: float) -> float
     )
 
 
+def recency_score(recency_days: float, max_hours: float) -> float:
+    """How fresh a wallet's last trade is, on an absolute 0..1 scale.
+
+    Anchored to `max_hours_since_last_trade` -- the staleness gate every
+    ranked wallet has already cleared -- for the same reason win_rate is
+    anchored to its floor. Min-maxing the survivors of a 96-hour gate
+    stretched a band at most four days wide across the entire range, so a
+    wallet that traded an hour ago and one that traded yesterday could sit at
+    1.0 and 0.0, and both moved whenever a fresher wallet joined the pool.
+
+    Recency was the last pool-relative term, and on the 2026-08-27 lineup it
+    appeared to dominate the ordering -- the ranking could not be explained by
+    pnl, win rate and copyability alone. It was also unobservable: nothing
+    logged it. Both are fixed here.
+    """
+    if max_hours <= 0:
+        return 0.0
+    return min(max(1.0 - (recency_days * 24.0) / max_hours, 0.0), 1.0)
+
+
 def win_rate_score(win_rate: float, floor: float) -> float:
     """Win rate on an absolute 0..1 scale, measured up from the eligibility bar.
 
@@ -276,6 +296,7 @@ def rank_wallets(
     win_rate_floor: float = 0.0,
     pnl_floor_usd: float = 0.0,
     pnl_target_usd: float = 0.0,
+    recency_max_hours: float = 0.0,
 ) -> list[LeaderScore]:
     if not stats:
         return []
@@ -294,7 +315,10 @@ def rank_wallets(
         pnl = norm([s.realized_pnl for s in stats])
     wr = [win_rate_score(s.win_rate, win_rate_floor) for s in stats]
     cons = norm([float(s.n_categories) for s in stats])
-    rec = norm([-s.recency_days for s in stats])   # more recent -> higher
+    if recency_max_hours > 0:
+        rec = [recency_score(s.recency_days, recency_max_hours) for s in stats]
+    else:
+        rec = norm([-s.recency_days for s in stats])   # more recent -> higher
     cop = [copyability(s.n_copyable_trades, copyable_target) for s in stats]
 
     out: list[LeaderScore] = []
@@ -600,6 +624,7 @@ class LeaderSelector:
             win_rate_floor=cfg.filters.min_win_rate,
             pnl_floor_usd=cfg.selection.pnl_floor_usd,
             pnl_target_usd=cfg.selection.pnl_target_usd,
+            recency_max_hours=cfg.filters.max_hours_since_last_trade,
         )
         top = seat_roster(
             ranked,

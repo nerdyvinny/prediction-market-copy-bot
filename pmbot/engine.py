@@ -187,10 +187,11 @@ class Engine:
         for r in ranked:
             st = r.stats
             log.info(
-                "leader %s score=%.3f pnl=$%.0f win=%.0f%% mkts=%d/%d cats=%d copyable=%d",
+                "leader %s score=%.3f pnl=$%.0f win=%.0f%% mkts=%d/%d cats=%d "
+                "copyable=%d last_trade=%.1fh",
                 r.wallet[:10], r.score, st.realized_pnl, st.win_rate * 100,
                 st.n_resolved_markets, st.n_markets, st.n_categories,
-                st.n_copyable_trades,
+                st.n_copyable_trades, st.recency_days * 24.0,
             )
         return True
 
@@ -567,7 +568,8 @@ class Engine:
             print(f"    {r.wallet}  score={r.score:.2f}  "
                   f"pnl=${st.realized_pnl:,.0f}  win={st.win_rate*100:.0f}%  "
                   f"trades={st.n_trades}  resolved_mkts={st.n_resolved_markets}  "
-                  f"copyable={st.n_copyable_trades}")
+                  f"copyable={st.n_copyable_trades}  "
+                  f"last_trade={st.recency_days * 24.0:.1f}h")
 
     def close(self) -> None:
         for c in (self.data, self.gamma, self.price_cache, self.kalshi,
