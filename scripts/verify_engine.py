@@ -1,8 +1,10 @@
-"""Phase 3 smoke test: run auto-selection + one paper cycle against LIVE data.
+"""Smoke test: rank candidates + run one paper cycle against LIVE data.
 
-Uses small API caps and relaxed filters so the full pipeline
-(discover -> score -> select -> copy -> size -> paper-fill) actually exercises
-end to end. Reads public data only; places no real orders.
+Exercises both halves end to end: the RESEARCH path (discover -> score -> rank,
+which no longer feeds the engine) and the TRADING path (roster -> copy -> size
+-> paper-fill). Selection is manual now, so the script ranks candidates and
+then hands the top few to the engine as an explicit roster -- which is exactly
+what a human does with `pmbot leaders`. Reads public data only; no real orders.
 
 Run: .venv/Scripts/python.exe scripts/verify_engine.py
 """

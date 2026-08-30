@@ -48,9 +48,7 @@ class FakeCache:
         return self._q
 
 
-class NoopSelector:
-    def select(self, now=None, incumbents=None, **kw):
-        return []
+
 
 
 def _round_trip_engine(*, skip_round_tripped: bool):
@@ -77,7 +75,7 @@ def _round_trip_engine(*, skip_round_tripped: bool):
     eng = Engine(
         settings=s, data=FakeData([]), gamma=FakeGamma(markets), price_cache=quote,
         ledger=ledger, executor=PaperExecutor(ledger, price_cache=quote, slippage_bps=0),
-        risk=RiskManager(ledger, s), selector=NoopSelector(), strategy=strategy,
+        risk=RiskManager(ledger, s), strategy=strategy,
     )
     return eng, ledger
 
@@ -135,7 +133,7 @@ def test_sell_only_batch_still_skips_cleanly_when_nothing_held():
     eng = Engine(
         settings=s, data=FakeData([]), gamma=FakeGamma(markets), price_cache=quote,
         ledger=ledger, executor=PaperExecutor(ledger, price_cache=quote, slippage_bps=0),
-        risk=RiskManager(ledger, s), selector=NoopSelector(), strategy=strategy,
+        risk=RiskManager(ledger, s), strategy=strategy,
     )
     fills, n_signals = eng.poll_once()
     assert (fills, n_signals) == (0, 0)

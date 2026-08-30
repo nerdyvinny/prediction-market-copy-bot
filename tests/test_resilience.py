@@ -94,52 +94,13 @@ def test_settlement_write_failure_does_not_abort_the_sweep():
 
 
 # -- retry deadlines ------------------------------------------------------
-class _Boom:
-    """Selector whose result the engine cannot adopt."""
-
-    last_report: dict = {}
-
-    def select(self, incumbents=None):
-        return [object()]                          # not a LeaderScore -> apply blows up
-
-
-def _engine_with_broken_rescore(tmp_path):
-    from pmbot.config import get_settings
-    from pmbot.engine import Engine
-
-    s = get_settings().model_copy(update={"db_path": str(tmp_path / "pmbot.db")})
-    return Engine(settings=s, selector=_Boom())
-
-
-def test_rescore_deadline_is_armed_even_when_applying_the_result_throws(tmp_path):
-    """An un-advanced deadline restarts a ~15-minute network-heavy rescore on
-    every 10s cycle instead of backing off once."""
-    import time
-
-    eng = _engine_with_broken_rescore(tmp_path)
-    try:
-        eng._rescore_result = [object()]           # unusable payload
-        eng._rescore_thread = _DeadThread()
-        before = time.monotonic()
-        try:
-            eng._rescore_tick()
-        except Exception:
-            pass                                   # the throw is expected
-        assert eng._next_rescore >= before + eng._rescore_retry_s - 1
-    finally:
-        eng.close()
-
-
-class _DeadThread:
-    def is_alive(self) -> bool:
-        return False
-
-
 def test_settle_deadline_is_armed_even_when_the_sweep_throws(tmp_path):
-    """Same shape as the rescore deadline: a throwing sweep must not retry
-    every cycle."""
-    import time
+    """A throwing sweep must not retry every cycle.
 
+    The deadline is armed BEFORE the sweep runs, so an exception inside it
+    still costs one interval rather than re-running the whole sweep on every
+    10s cycle.
+    """
     from pmbot.config import get_settings
     from pmbot.engine import Engine
 
@@ -154,11 +115,9 @@ def test_settle_deadline_is_armed_even_when_the_sweep_throws(tmp_path):
         "db_path": str(tmp_path / "pmbot.db"),
         "poll_interval_seconds": 0.0,              # don't sleep through the test
     })
-    eng = Engine(settings=s, selector=_Boom())
+    eng = Engine(settings=s, roster=[])
     try:
-        eng.leaders = [object()]                   # skip the first-rescore branch
         eng.settler = _ExplodingSettler()
-        eng._next_rescore = time.monotonic() + 10_000   # keep rescore out of the way
         eng.run(max_cycles=3)
         # Without the fix this fires once per cycle; with it, only the first.
         assert _ExplodingSettler.calls == 1

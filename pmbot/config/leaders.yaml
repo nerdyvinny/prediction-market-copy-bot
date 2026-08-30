@@ -1,11 +1,51 @@
-# Automatic leader selection + scoring config.
+# WHO WE COPY (`roster`) + the research tool's settings (everything else).
 #
-# The bot profiles every wallet visible in the top market feeds, shortlists
-# the ones that already look like winners, deep-scores those, and follows the
-# top_n that pass ALL `filters`. You don't list wallets here (selection is
-# automatic) — you set the BAR. After each rescore the bot prints a rejection
-# report showing how many wallets each rule eliminated: if the pool comes up
-# empty, that report tells you which knob to loosen.
+# The bot copies exactly the wallets listed under `roster` below. It does NOT
+# discover, rank, or rotate leaders while it runs. Editing this list is how the
+# lineup changes, and it takes effect on the next restart.
+#
+# Why selection is manual now
+# ---------------------------
+# 34 days of paper trading (2026-07-27..08-30, 115 closed round-trips) measured
+# the premise the automatic funnel rested on, and it did not hold:
+#
+#   * corr(a leader's trailing ROI in OUR fills, their next trade's ROI) = -0.018
+#   * after a POSITIVE record with us, the next trade returned -11.3% (n=30)
+#   * after a NEGATIVE record with us, it returned  -9.6% (n=40)
+#   * the funnel's picks did not beat copying every candidate (p=0.717)
+#   * all three leaders with enough tape decayed first-half -> second-half
+#
+# It also churned 33 wallets through 8 seats in a month; 11 of them never
+# produced a single trade. Nothing accumulated enough evidence to judge.
+#
+# So the ranking/vetting machinery no longer runs in the live loop. It survives
+# as a research command — `pmbot leaders` — which prints ranked candidates for
+# you to read. Nothing it prints is followed until you paste it into `roster`.
+#
+# Adding a wallet: run `pmbot leaders`, then `pmbot backtest --leaders 0x...`
+# to see how it would actually have copied, then add the line.
+# Removing a wallet: delete the line and restart. Positions you already hold
+# from them become exit-only — their SELLs are still mirrored, their BUYs are
+# ignored — so nothing is stranded.
+
+roster:
+  # Seeded 2026-08-30 from the roster the bot had selected for itself, so the
+  # strip changed the mechanism without changing who was being copied on that
+  # day. Judge these on their own merits from here; the scores that put them
+  # here came from the ranking that is no longer trusted.
+  - "0xcae693bcf9696a2ebf0a62de767719b45f354f85"
+  - "0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33"   # most productive source of the first month (25 buys)
+  - "0xd487f513cfead22d76b6db4567c756b3cf25053e"
+  - "0x455e565fdaa9c4d106e1aebd557b8443925af7f9"
+  - "0xc23dc0eca9e1c2e293de8911b9ac254f0bcd82c8"   # most copyable tape of any wallet (184 trades)
+  - "0x9cdda449d7cedf1072d74982a5dc2349df3d3e97"
+  - "0x61171892acad4064e139ca4fcb6ce3321a362faf"
+
+# ---------------------------------------------------------------------------
+# Everything below this line feeds `pmbot leaders` ONLY. The live loop never
+# reads it. It is kept because finding candidate wallets is still useful — it
+# is deciding which ones are good, automatically and daily, that did not work.
+# ---------------------------------------------------------------------------
 
 selection:
   top_n: 8                     # diversify across up to this many leaders

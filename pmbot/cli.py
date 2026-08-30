@@ -66,6 +66,13 @@ def _build_parser() -> argparse.ArgumentParser:
     abt.add_argument("--min-sim", type=float, default=0.75,
                      help="[auto] similarity floor for auto-matched pairs (default 0.75)")
 
+    ldr = sub.add_parser("leaders",
+                         help="RESEARCH: rank candidate wallets for the roster (never auto-followed)")
+    ldr.add_argument("--vet", action="store_true",
+                     help="also replay each candidate as WE would have copied it (slow)")
+    ldr.add_argument("--lookback", type=int, default=45,
+                     help="[--vet] days of history to replay (default 45)")
+
     sub.add_parser("status", help="show paper portfolio summary + open positions")
     st = sub.add_parser("settle", help="realize P&L for any open positions whose markets resolved")
     st.add_argument("--market", type=str, default=None,
@@ -94,6 +101,107 @@ def _setup_logging(verbose: bool) -> None:
     if not verbose:
         for noisy in ("httpx", "httpcore"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def _run_leader_research(args, settings) -> int:
+    """Rank candidate wallets for a human to choose from.
+
+    This is the old automatic funnel, demoted to a research tool. Nothing it
+    prints is followed: the bot copies `roster` in leaders.yaml and only that.
+    Selection stopped being automatic because it was measured not to predict --
+    see the module docstring in pmbot/engine.py.
+    """
+    from datetime import datetime, timezone
+
+    from pmbot.data import GammaClient, PolymarketDataClient, ResolutionStore
+    from pmbot.leaders import load_leader_config
+    from pmbot.leaders.records import RecordStore
+    from pmbot.leaders.scoring import LeaderSelector
+
+    cfg = load_leader_config()
+    on_roster = {w.lower() for w in cfg.roster}
+
+    data, gamma = PolymarketDataClient(), GammaClient()
+    resolutions = ResolutionStore(settings.db_path)
+    records = RecordStore(settings.db_path)
+    try:
+        selector = LeaderSelector(data, gamma, resolution_store=resolutions,
+                                  record_store=records)
+        print("- scoring candidate wallets (a few minutes)...")
+        print()
+        ranked = selector.select(incumbents=sorted(on_roster))
+
+        rep = getattr(selector, "last_report", None) or {}
+        if rep:
+            print(f"  funnel: {rep.get('pool', 0)} in pool -> "
+                  f"{rep.get('deep_scored', 0)} deep-scored -> "
+                  f"{rep.get('eligible', 0)} eligible")
+            rejects = rep.get("rejects") or {}
+            if rejects:
+                detail = ", ".join(f"{k}={v}" for k, v in
+                                   sorted(rejects.items(), key=lambda kv: -kv[1]))
+                print(f"  rejected by: {detail}")
+            print()
+
+        if not ranked:
+            print("No candidates cleared the filters. Loosen them in leaders.yaml.")
+            return 0
+
+        print(f"{len(ranked)} candidate(s), best first. [R] = already on your roster.")
+        print()
+        for r in ranked:
+            st = r.stats
+            mark = "[R]" if r.wallet.lower() in on_roster else "   "
+            print(f"  {mark} {r.wallet}")
+            print(f"       score={r.score:.3f}  pnl=${st.realized_pnl:,.0f}  "
+                  f"win={st.win_rate * 100:.0f}%  trades={st.n_trades}  "
+                  f"resolved_mkts={st.n_resolved_markets}  "
+                  f"copyable={st.n_copyable_trades}  "
+                  f"last_trade={st.recency_days * 24.0:.1f}h")
+
+        if args.vet:
+            from pmbot.backtest import ExactCopyBacktester
+
+            print()
+            print(f"- replaying each candidate as we would have copied it "
+                  f"({args.lookback}d)...")
+            print()
+            vetter = ExactCopyBacktester(data, gamma, settings, trades_limit=4000)
+            now = datetime.now(timezone.utc)
+            for r in ranked:
+                try:
+                    tapes = vetter.fetch_tapes([r.wallet])
+                    m = vetter.simulate(
+                        tapes, lookback_days=args.lookback, now=now,
+                        min_leader_notional=settings.copy_min_leader_notional_usd,
+                        skip_round_tripped_entries=settings.skip_round_tripped_entries,
+                    ).metrics()
+                except Exception as e:
+                    print(f"  {r.wallet[:12]}  vet failed: {e}")
+                    continue
+                invested = m.get("invested", 0.0) or 0.0
+                roi = (m["net_pnl"] / invested * 100) if invested else 0.0
+                print(f"  {r.wallet[:12]}  copy-pnl=${m['net_pnl']:>9.2f}  "
+                      f"trades={m['n_trades']:<4} deployed=${invested:>9.2f}  "
+                      f"roi={roi:>7.2f}%")
+
+        print()
+        print("Nothing here is followed automatically. To copy a wallet, add it to "
+              "`roster:` in pmbot/config/leaders.yaml and restart the bot.")
+        print("A single month of a wallet's history is far too little to judge it on "
+              "-- treat these as leads, not verdicts.")
+        return 0
+    finally:
+        for c in (data, gamma):
+            try:
+                c.close()
+            except Exception:
+                pass
+        for store in (resolutions, records):
+            try:
+                store.close()
+            except Exception:
+                pass
 
 
 def _run_arb_scan(args, settings) -> int:
@@ -233,6 +341,9 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             engine.close()
         return 0
+
+    if args.mode == "leaders":
+        return _run_leader_research(args, settings)
 
     if args.mode == "backtest":
         from pmbot.backtest import Backtester, ExactCopyBacktester

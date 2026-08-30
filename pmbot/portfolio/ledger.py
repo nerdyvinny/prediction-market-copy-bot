@@ -385,9 +385,11 @@ class Ledger:
     def set_followed_leaders(self, wallets: dict[str, float]) -> None:
         """Replace the persisted follow list (wallet -> score).
 
-        The engine writes this after every rescore so a restart remembers who
-        it was following even before the first copied trade reaches `fills` —
-        full addresses live nowhere else (logs truncate them)."""
+        The engine writes this when it installs the roster, so the dashboard
+        can show who we follow even before the first copied trade reaches
+        `fills` — full addresses live nowhere else (logs truncate them).
+        Score is retained for the column but is 0 under a static roster:
+        there is no ranking any more."""
         now = datetime.now(timezone.utc).isoformat()
         with self.conn:
             self.conn.execute("DELETE FROM followed_leaders")

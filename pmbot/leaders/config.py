@@ -71,6 +71,12 @@ class LeaderConfig:
             "recency": 0.20, "copyability": 0.30,
         }
     )
+    # The wallets the bot actually copies. This is the ONLY input to the live
+    # loop — everything else in this file feeds the `pmbot leaders` research
+    # tool, which ranks candidates for a human to choose from. Selection is
+    # manual because automatic selection was measured not to work: see the
+    # module docstring in pmbot/engine.py.
+    roster: list[str] = field(default_factory=list)
     allowlist: list[str] = field(default_factory=list)
     blocklist: list[str] = field(default_factory=list)
 
@@ -121,6 +127,7 @@ def load_leader_config(path: str | Path | None = None) -> LeaderConfig:
             ),
         ),
         weights={**LeaderConfig().weights, **(raw.get("weights") or {})},
+        roster=[str(w).lower() for w in (raw.get("roster") or [])],
         allowlist=[str(w).lower() for w in (raw.get("allowlist") or [])],
         blocklist=[str(w).lower() for w in (raw.get("blocklist") or [])],
     )
