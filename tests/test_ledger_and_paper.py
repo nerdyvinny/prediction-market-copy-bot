@@ -248,7 +248,7 @@ def test_paper_executor_copy_buy_skipped_without_book():
 
 
 def test_paper_executor_noncopy_buy_still_falls_back_to_target():
-    # Non-copy signals (arb legs price at scan time) keep the fallback.
+    # Non-copy signals keep the fallback.
     led = Ledger(":memory:")
     cache = FakeCache(Quote(token_id="tokA", bid=None, ask=None))
     ex = PaperExecutor(led, price_cache=cache, slippage_bps=0)
@@ -317,7 +317,7 @@ def test_paper_executor_copy_sell_skipped_without_book():
 
 
 def test_paper_executor_settlement_sell_still_uses_target_price():
-    """Settlement and arb legs carry no source_leader and keep the fallback —
+    """Settlement carries no source_leader and keeps the fallback —
     settlement's target IS the true payout, not a leader's quote."""
     led = Ledger(":memory:")
     _fill(led, _sig(side=Side.BUY, size_usd=50, uid="b1"), price=0.50)

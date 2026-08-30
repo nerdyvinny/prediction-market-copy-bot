@@ -18,20 +18,6 @@ class TradeExecutor(ABC):
     def execute(self, signal: Signal) -> Fill | None:
         """Attempt to fill a sized signal. Returns the Fill, or None if skipped."""
 
-    def execute_group(self, signals: list[Signal]) -> list[Fill] | None:
-        """Fill a multi-leg group all-or-nothing (arbitrage legs).
-
-        Default is sequential and NOT atomic; executors that can should
-        override to guarantee both-or-neither.
-        """
-        fills = []
-        for sig in signals:
-            fill = self.execute(sig)
-            if fill is None:
-                return None
-            fills.append(fill)
-        return fills
-
     @abstractmethod
     def get_positions(self) -> list[Position]:
         """Current open positions."""

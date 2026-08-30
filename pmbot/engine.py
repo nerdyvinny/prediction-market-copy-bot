@@ -31,20 +31,14 @@ import logging
 import time
 
 from pmbot.config import Settings, get_settings
-from pmbot.data import (
-    GammaClient,
-    KalshiClient,
-    PolymarketDataClient,
-    PriceCache,
-)
+from pmbot.data import GammaClient, PolymarketDataClient, PriceCache
 from pmbot.execution import PaperExecutor
 from pmbot.execution.executor import TradeExecutor
 from pmbot.leaders import load_leader_config
-from pmbot.models import Signal
 from pmbot.portfolio.ledger import Ledger
 from pmbot.portfolio.settlement import Settler
 from pmbot.risk import RiskManager
-from pmbot.strategy import ArbitrageStrategy, ExactCopyStrategy, Strategy
+from pmbot.strategy import ExactCopyStrategy, Strategy
 
 log = logging.getLogger(__name__)
 
@@ -61,8 +55,6 @@ class Engine:
         executor: TradeExecutor | None = None,
         risk: RiskManager | None = None,
         strategy: Strategy | None = None,
-        kalshi: KalshiClient | None = None,
-        arb_strategy: ArbitrageStrategy | None = None,
         roster: list[str] | None = None,
     ):
         self.settings = settings or get_settings()
@@ -75,15 +67,7 @@ class Engine:
         self.strategy = strategy or ExactCopyStrategy(
             self.data, self.gamma, self.ledger, leaders=[], price_cache=self.price_cache
         )
-        self.kalshi = kalshi
-        self.arb_strategy = arb_strategy
-        if self.arb_strategy is None and self.settings.arb_enabled:
-            self.kalshi = self.kalshi or KalshiClient()
-            self.arb_strategy = ArbitrageStrategy(
-                self.gamma, self.price_cache, self.kalshi, self.ledger
-            )
-
-        self.settler = Settler(self.ledger, self.gamma, self.kalshi)
+        self.settler = Settler(self.ledger, self.gamma)
 
         # The roster we copy. `roster=` is for tests and smoke scripts; the
         # live loop reads leaders.yaml.
@@ -162,55 +146,22 @@ class Engine:
         their BUY inside one batch, and it only finds our position to mirror
         if that BUY's fill is already in the ledger. (Batching here once
         consumed such SELLs unmirrored — the position then rode unmanaged to
-        resolution.) Arbitrage legs still collect into leg groups and execute
-        both-or-neither. Per-signal/group failures are isolated so one bad
-        market can't abort the cycle.
+        resolution.) Per-signal failures are isolated so one bad market
+        can't abort the cycle.
         """
         fills = 0
         n_signals = 0
-        groups: dict[str, list[Signal]] = {}
 
-        def execute_single(sig: Signal) -> None:
-            nonlocal fills
+        for sig in self.strategy.generate():
+            n_signals += 1
             try:
                 sized = self.risk.size(sig)
                 if sized is None:
-                    return
+                    continue
                 if self.executor.execute(sized) is not None:
                     fills += 1
             except Exception as e:
                 log.warning("poll: failed on %s: %s", sig.token_id[:10], e)
-
-        for sig in self.strategy.generate():
-            n_signals += 1
-            if sig.leg_group:
-                groups.setdefault(sig.leg_group, []).append(sig)
-            else:
-                execute_single(sig)
-        if self.arb_strategy is not None:
-            try:
-                for sig in self.arb_strategy.generate():
-                    n_signals += 1
-                    if sig.leg_group:
-                        groups.setdefault(sig.leg_group, []).append(sig)
-                    else:
-                        execute_single(sig)
-            except Exception as e:
-                log.warning("poll: arb generate failed: %s", e)
-
-        for group_id, legs in groups.items():
-            try:
-                if len(legs) < 2:
-                    log.warning("poll: leg group %s incomplete; skipping", group_id[:20])
-                    continue
-                if not self.risk.check_group(legs):
-                    continue
-                done = self.executor.execute_group(legs)
-                if done:
-                    fills += len(done)
-                    print(f"  ARB entered: {legs[0].reason}")
-            except Exception as e:
-                log.warning("poll: arb group %s failed: %s", group_id[:20], e)
         return fills, n_signals
 
     # -- loop ------------------------------------------------------------
@@ -275,7 +226,7 @@ class Engine:
                 print(f"    {w}")
 
     def close(self) -> None:
-        for c in (self.data, self.gamma, self.price_cache, self.kalshi):
+        for c in (self.data, self.gamma, self.price_cache):
             if c is None:
                 continue
             try:

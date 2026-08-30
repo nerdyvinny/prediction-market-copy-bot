@@ -1,11 +1,9 @@
 """Command-line entrypoint.
 
 Usage:
-    pmbot paper                 # copy + arb loop in simulation
+    pmbot paper                 # copy loop in simulation
     pmbot paper --cycles 1      # run a single cycle and exit
     pmbot backtest              # replay historical leader trades (Phase 4)
-    pmbot arb-scan [--suggest]  # live arb scan / propose cross-venue pairs
-    pmbot arb-backtest [--auto] # replay historical cross-venue gaps
     pmbot status                # portfolio summary (both venues)
     pmbot settle                # realize P&L on resolved markets
     pmbot live                  # GATED — refuses unless explicitly, lawfully enabled
@@ -44,27 +42,6 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="only copy leader BUYs at/above this USD size (default: settings)")
     bt.add_argument("--longterm", action="store_true",
                     help="use the old Strategy #4 semantics (BUY-only, hold to resolution)")
-
-    arb = sub.add_parser("arb-scan",
-                         help="scan confirmed PM<->Kalshi pairs for live arbitrage")
-    arb.add_argument("--suggest", action="store_true",
-                     help="fuzzy-match open markets across venues and print candidate pairs")
-    arb.add_argument("--pm-limit", type=int, default=200,
-                     help="[suggest] how many top-volume Polymarket markets to consider")
-    arb.add_argument("--kalshi-limit", type=int, default=600,
-                     help="[suggest] how many open Kalshi markets to consider")
-    arb.add_argument("--min-sim", type=float, default=None,
-                     help="[suggest] override similarity floor (default from settings)")
-
-    abt = sub.add_parser("arb-backtest",
-                         help="replay historical PM<->Kalshi gaps on resolved pairs")
-    abt.add_argument("--lookback", type=int, default=30, help="days of history (default 30)")
-    abt.add_argument("--auto", action="store_true",
-                     help="auto-match RESOLVED markets for backtesting (unvetted, analysis only)")
-    abt.add_argument("--auto-limit", type=int, default=150,
-                     help="[auto] max resolved markets per venue to consider")
-    abt.add_argument("--min-sim", type=float, default=0.75,
-                     help="[auto] similarity floor for auto-matched pairs (default 0.75)")
 
     ldr = sub.add_parser("leaders",
                          help="RESEARCH: rank candidate wallets for the roster (never auto-followed)")
@@ -204,129 +181,6 @@ def _run_leader_research(args, settings) -> int:
                 pass
 
 
-def _run_arb_scan(args, settings) -> int:
-    from pmbot.arb.matcher import load_pairs_config, suggest_pairs
-    from pmbot.arb.scanner import ArbScanner
-    from pmbot.data import GammaClient, KalshiClient, PriceCache
-
-    gamma, prices, kalshi = GammaClient(), PriceCache(), KalshiClient()
-    try:
-        cfg = load_pairs_config(settings.arb_pairs_path)
-
-        if args.suggest:
-            min_sim = args.min_sim if args.min_sim is not None else settings.arb_match_min_similarity
-            series = [s for s in settings.kalshi_series.split(",") if s.strip()]
-            print(f"· fetching top {args.pm_limit} Polymarket markets + Kalshi series "
-                  f"({len(series)} series + generic feed)…")
-            pm_markets = gamma.get_markets(limit=args.pm_limit)
-            k_markets = kalshi.get_markets_for_series(series, status="open",
-                                                      limit_per_series=200)
-            k_markets += kalshi.get_markets(status="open", limit=args.kalshi_limit, max_pages=6)
-            # De-dup (series fetch + generic feed can overlap).
-            k_markets = list({k.ticker: k for k in k_markets}.values())
-            confirmed = {(p.pm_market_id, p.kalshi_ticker) for p in cfg.pairs}
-            cands = suggest_pairs(
-                pm_markets, k_markets,
-                min_similarity=min_sim,
-                max_close_diff_hours=settings.arb_match_max_close_diff_hours,
-                exclude=confirmed | cfg.rejected,
-            )
-            if not cands:
-                print("No candidates found. Try --min-sim 0.5 or a larger --kalshi-limit.")
-                return 0
-            print(f"\n{len(cands)} candidate pair(s) — REVIEW RESOLUTION RULES BEFORE CONFIRMING.")
-            print("Paste vetted entries into pmbot/config/arb_pairs.yaml under `pairs:`\n")
-            for c in cands:
-                dh = f"{c.close_diff_hours:.1f}h" if c.close_diff_hours is not None else "?"
-                print(f"- sim={c.similarity:.2f} close_diff={dh}")
-                print(f"   PM: {c.pm_market.question}")
-                print(f"   K : {c.kalshi_market.title}  [{c.kalshi_market.ticker}]")
-                print(c.as_yaml_stub())
-            return 0
-
-        if not cfg.pairs:
-            print("No confirmed pairs in arb_pairs.yaml — run `pmbot arb-scan --suggest` "
-                  "to find candidates, vet their resolution rules, then add them.")
-            return 0
-        scanner = ArbScanner(
-            gamma, prices, kalshi,
-            min_edge=settings.arb_min_edge,
-            slippage_buffer=settings.arb_slippage_buffer,
-            max_per_trade_usd=settings.arb_max_per_trade_usd,
-        )
-        print(f"· scanning {len(cfg.pairs)} confirmed pair(s)…")
-        opps = scanner.scan(cfg.pairs)
-        if not opps:
-            print("No opportunities clear the edge threshold right now "
-                  f"(min_edge={settings.arb_min_edge:.3f}, buffer={settings.arb_slippage_buffer:.3f}).")
-            return 0
-        print(f"\n{len(opps)} opportunity(ies):")
-        for o in opps:
-            print(f"  {o.describe()}")
-            print(f"     PM: {o.pm_market.question[:70]}")
-            print(f"     K : {o.kalshi_market.title[:70]}")
-        return 0
-    finally:
-        for c in (gamma, prices, kalshi):
-            c.close()
-
-
-def _run_arb_backtest(args, settings) -> int:
-    from pmbot.arb.backtest import ArbBacktester
-    from pmbot.arb.matcher import ConfirmedPair, load_pairs_config, suggest_pairs
-    from pmbot.data import GammaClient, KalshiClient, PriceCache
-
-    gamma, prices, kalshi = GammaClient(), PriceCache(), KalshiClient()
-    try:
-        pairs = load_pairs_config(settings.arb_pairs_path).pairs
-        if args.auto:
-            print(f"· auto-matching resolved markets (sim >= {args.min_sim:.2f}) — "
-                  "UNVETTED pairs, analysis only…")
-            pm_markets = gamma.get_markets(
-                limit=args.auto_limit, closed=True, active=None, order="volume24hr"
-            )
-            series = [s for s in settings.kalshi_series.split(",") if s.strip()]
-            k_markets = kalshi.get_markets_for_series(
-                series, status="settled", limit_per_series=args.auto_limit
-            )
-            print(f"  considering {len(pm_markets)} PM / {len(k_markets)} Kalshi "
-                  f"resolved markets across {len(series)} series")
-            cands = suggest_pairs(
-                pm_markets, k_markets,
-                min_similarity=args.min_sim,
-                max_close_diff_hours=settings.arb_match_max_close_diff_hours,
-                include_closed=True,
-                top_k_per_market=1,
-            )
-            auto = [
-                ConfirmedPair(
-                    pm_market_id=c.pm_market.market_id,
-                    kalshi_ticker=c.kalshi_market.ticker,
-                    note=f"AUTO sim={c.similarity:.2f}",
-                )
-                for c in cands
-            ]
-            print(f"  matched {len(auto)} resolved pair(s)")
-            pairs = pairs + auto
-        if not pairs:
-            print("No pairs to backtest. Add confirmed pairs to arb_pairs.yaml "
-                  "or run with --auto.")
-            return 0
-        bt = ArbBacktester(
-            gamma, prices, kalshi,
-            min_edge=settings.arb_min_edge,
-            slippage_buffer=settings.arb_slippage_buffer,
-            max_per_trade_usd=settings.arb_max_per_trade_usd,
-            lookback_days=args.lookback,
-        )
-        print(f"· replaying {len(pairs)} pair(s) over {args.lookback}d…\n")
-        print(bt.run(pairs).summary_text())
-        return 0
-    finally:
-        for c in (gamma, prices, kalshi):
-            c.close()
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     _setup_logging(getattr(args, "verbose", False))
@@ -376,12 +230,6 @@ def main(argv: list[str] | None = None) -> int:
             gamma.close()
         return 0
 
-    if args.mode == "arb-scan":
-        return _run_arb_scan(args, settings)
-
-    if args.mode == "arb-backtest":
-        return _run_arb_backtest(args, settings)
-
     if args.mode == "status":
         from pmbot.portfolio.ledger import Ledger
 
@@ -400,21 +248,20 @@ def main(argv: list[str] | None = None) -> int:
             if positions:
                 print("  positions:")
                 for p in sorted(positions, key=lambda x: -abs(x.shares * x.avg_price)):
-                    venue = "K" if p.venue == "kalshi" else "PM"
-                    print(f"    [{venue:>2s}] {p.outcome:>4s} {p.shares:>11.2f} sh @ {p.avg_price:.4f} "
+                    print(f"    {p.outcome:>4s} {p.shares:>11.2f} sh @ {p.avg_price:.4f} "
                           f"(${p.shares*p.avg_price:,.2f})  mkt={p.market_id[:16]}…")
         finally:
             led.close()
         return 0
 
     if args.mode == "settle":
-        from pmbot.data import GammaClient, KalshiClient
+        from pmbot.data import GammaClient
         from pmbot.portfolio.ledger import Ledger
         from pmbot.portfolio.settlement import Settler
 
-        led, gamma, kalshi = Ledger(settings.db_path), GammaClient(), KalshiClient()
+        led, gamma = Ledger(settings.db_path), GammaClient()
         try:
-            settler = Settler(led, gamma, kalshi)
+            settler = Settler(led, gamma)
             if args.market is not None:
                 if args.price is None or not (0.0 <= args.price <= 1.0):
                     print("--market requires --price between 0 and 1 (payout per share).")
@@ -430,7 +277,6 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             led.close()
             gamma.close()
-            kalshi.close()
         return 0
 
     if args.mode == "live":

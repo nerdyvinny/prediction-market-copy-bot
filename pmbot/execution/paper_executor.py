@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from pmbot.arb.fees import kalshi_taker_fee
 from pmbot.config import get_settings
 from pmbot.data import PriceCache
 from pmbot.execution.executor import TradeExecutor
@@ -61,22 +60,6 @@ class PaperExecutor(TradeExecutor):
         )
         return fill
 
-    def execute_group(self, signals: list[Signal]) -> list[Fill] | None:
-        """Atomic multi-leg fill: price every leg first, record only if ALL
-        legs priced. This is what makes paper arb both-or-neither."""
-        fills = [self._build_fill(s) for s in signals if s.size_usd > 0]
-        if len(fills) != len(signals) or any(f is None for f in fills):
-            log.warning("paper: leg group aborted (a leg failed to price)")
-            return None
-        for f in fills:
-            self.ledger.record_fill(f)
-            log.info(
-                "paper %s %s[%s] %.2f sh @ %.4f ($%.2f, fee $%.2f) %s",
-                f.signal.side.value, f.signal.outcome, f.signal.venue, f.shares,
-                f.fill_price, f.size_usd, f.fee_usd, f.signal.reason,
-            )
-        return fills  # type: ignore[return-value]
-
     def _build_fill(self, signal: Signal) -> Fill | None:
         """Price a signal and construct the Fill without recording it."""
         price = self._resolve_fill_price(signal)
@@ -98,10 +81,6 @@ class PaperExecutor(TradeExecutor):
         else:
             shares = signal.size_usd / price
             size_usd = signal.size_usd
-        fee = 0.0
-        if signal.venue == Venue.KALSHI.value:
-            # Kalshi taker fee on the order (contracts == shares).
-            fee = kalshi_taker_fee(shares, price)
         return Fill(
             signal=signal,
             fill_price=price,
@@ -110,7 +89,7 @@ class PaperExecutor(TradeExecutor):
             timestamp=datetime.now(timezone.utc),
             mode=self.mode,
             slippage_bps=self.slippage_bps,
-            fee_usd=fee,
+            fee_usd=0.0,
         )
 
     def _resolve_fill_price(self, signal: Signal) -> float | None:
@@ -121,10 +100,6 @@ class PaperExecutor(TradeExecutor):
                 quote = self.price_cache.get_quote(signal.token_id)
             except Exception as e:  # network hiccup -> fall back to target price
                 log.debug("paper: quote fetch failed (%s); using target price", e)
-        # Kalshi legs fill at the scan-time book price (target_price): the
-        # CLOB cache can't quote Kalshi tokens, and the scan happened seconds
-        # ago in the same cycle. Slippage budget still applies.
-
         is_copy_buy = (
             signal.side is Side.BUY
             and signal.source_leader is not None

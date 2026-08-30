@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     data_api_base: str = "https://data-api.polymarket.com"
     gamma_api_base: str = "https://gamma-api.polymarket.com"
     clob_api_base: str = "https://clob.polymarket.com"
-    kalshi_api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
     # Polymarket US (QCX LLC) public gateway — a separate CFTC-designated
     # venue, NOT the global CLOB above. Read-only; trading there needs the
     # authenticated api.polymarket.us host and is not wired up.
@@ -196,30 +195,6 @@ class Settings(BaseSettings):
     # ($491->$308) by skipping late trades. Off for max profit; set 6 for a
     # calmer equity curve.
     copy_min_hours_to_resolution: float = 0.0
-
-    # --- Strategy #1: cross-platform arbitrage (Polymarket vs Kalshi) ---
-    arb_enabled: bool = False
-    # Minimum net edge per $1 contract pair AFTER Kalshi fees + slippage buffer.
-    arb_min_edge: float = 0.015
-    # Extra safety haircut per pair to absorb fill slippage on both legs.
-    arb_slippage_buffer: float = 0.005
-    arb_max_per_trade_usd: float = 50.0
-    # Matching: candidates below this title similarity are never suggested.
-    arb_match_min_similarity: float = 0.60
-    # Candidate pair end dates must agree within this window. Venues stamp
-    # dates differently (PM daily markets: start-of-day UTC; Kalshi: actual
-    # event close), so same-day pairs can differ by ~23h. 30h keeps same-day
-    # pairs while excluding adjacent days of daily-recurring series.
-    arb_match_max_close_diff_hours: float = 30.0
-    # Path to the confirmed-pairs file (only confirmed pairs are traded).
-    arb_pairs_path: str = "pmbot/config/arb_pairs.yaml"
-    # Kalshi series to scan for matching (comma-separated). The generic
-    # market feeds are flooded with combo/parlay markets, so matching works
-    # series-by-series over categories that overlap Polymarket.
-    kalshi_series: str = (
-        "KXWCGAME,KXWCADVANCE,KXMLBGAME,KXWTAMATCH,KXATPMATCH,"
-        "KXBTCD,KXETHD,KXBTC,KXETH,KXNBA,KXNHL,KXUFCFIGHT,KXHIGHNY"
-    )
 
     # --- LIVE ONLY (optional; leave unset for paper/backtest) ---
     pk: str | None = None

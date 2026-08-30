@@ -116,6 +116,9 @@ _SINCE_FLAT = f"""
 _MIGRATIONS: list[tuple[str, str, str]] = [
     ("fills", "venue", "ALTER TABLE fills ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'"),
     ("fills", "fee_usd", "ALTER TABLE fills ADD COLUMN fee_usd REAL NOT NULL DEFAULT 0"),
+    # leg_group is a dead column: it grouped cross-venue arbitrage legs, and
+    # arbitrage was removed. Kept (and still created on fresh DBs) so the
+    # schema matches every existing pmbot.db without a migration; always NULL.
     ("fills", "leg_group", "ALTER TABLE fills ADD COLUMN leg_group TEXT"),
     # The price the SIGNAL targeted — for copies, the leader's own fill price.
     # Without it there is no way to ask the question that actually matters:
@@ -216,7 +219,7 @@ class Ledger:
                 fill.timestamp.isoformat(), fill.mode, s.market_id, s.token_id,
                 s.outcome, s.side.value, fill.fill_price, fill.size_usd, fill.shares,
                 fill.slippage_bps, s.reason, s.source_leader, s.source_uid,
-                s.venue, fill.fee_usd, s.leg_group, s.target_price,
+                s.venue, fill.fee_usd, None, s.target_price,
             ),
         )
         row = cur.execute(

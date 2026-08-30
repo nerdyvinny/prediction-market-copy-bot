@@ -63,7 +63,7 @@ def _round_trip_engine(*, skip_round_tripped: bool):
                        side=Side.SELL, price=0.55, shares=100, usd_size=55.0,
                        timestamp=t1, tx_hash="u-sell")
 
-    s = Settings(db_path=":memory:", arb_enabled=False)
+    s = Settings(db_path=":memory:")
     ledger = Ledger(":memory:")
     quote = FakeCache(Quote(token_id="tok", bid=0.49, ask=0.51))
     strategy = ExactCopyStrategy(
@@ -122,7 +122,7 @@ def test_sell_only_batch_still_skips_cleanly_when_nothing_held():
     sell = LeaderTrade(leader="0xlead", market_id="m", token_id="tok", outcome="Yes",
                        side=Side.SELL, price=0.55, shares=100, usd_size=55.0,
                        timestamp=NOW, tx_hash="u-sell")
-    s = Settings(db_path=":memory:", arb_enabled=False)
+    s = Settings(db_path=":memory:")
     ledger = Ledger(":memory:")
     quote = FakeCache(Quote(token_id="tok", bid=0.49, ask=0.51))
     strategy = ExactCopyStrategy(

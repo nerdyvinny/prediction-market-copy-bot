@@ -123,25 +123,3 @@ class RiskManager:
             return None
         return replace(signal, size_usd=round(desired, 2))
 
-    def check_group(self, signals: list[Signal]) -> bool:
-        """Approve/reject a pre-sized multi-leg group (arbitrage legs).
-
-        Arb legs are sized upstream (budget + book depth) and must not be
-        rescaled independently — shrinking one leg would unhedge the pair.
-        So this is a yes/no gate: combined cost must fit the remaining
-        bankroll and each market's remaining allowance.
-        """
-        total_cost = sum(s.size_usd for s in signals)
-        if total_cost <= 0:
-            return False
-
-        if total_cost > self._free_bankroll():
-            log.debug("risk: arb group rejected ($%.2f > free bankroll)", total_cost)
-            return False
-
-        for s in signals:
-            used = self.ledger.exposure_for_market(s.market_id)
-            if used + s.size_usd > self.max_per_market:
-                log.debug("risk: arb group rejected (market %s over cap)", s.market_id[:12])
-                return False
-        return True

@@ -40,8 +40,7 @@ class _CountingSettler:
 
 
 def _engine(roster, strategy=None, **kw):
-    s = Settings(db_path=":memory:", arb_enabled=False,
-                 poll_interval_seconds=0, **kw)
+    s = Settings(db_path=":memory:", poll_interval_seconds=0, **kw)
     return Engine(settings=s, roster=roster, strategy=strategy or FakeStrategy())
 
 
