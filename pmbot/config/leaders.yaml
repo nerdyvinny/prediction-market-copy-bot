@@ -37,9 +37,28 @@ roster:
   - "0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33"   # most productive source of the first month (25 buys)
   - "0xd487f513cfead22d76b6db4567c756b3cf25053e"
   - "0x455e565fdaa9c4d106e1aebd557b8443925af7f9"
-  - "0xc23dc0eca9e1c2e293de8911b9ac254f0bcd82c8"   # most copyable tape of any wallet (184 trades)
   - "0x9cdda449d7cedf1072d74982a5dc2349df3d3e97"
   - "0x61171892acad4064e139ca4fcb6ce3321a362faf"
+
+  # 2026-09-02. Added on the wallet census (scripts/wallet_census.py): 962
+  # wallets each replayed alone over 30/60/90 days on the quoted-book backtest.
+  # HongYunX is the only one that came out positive in all three windows AND in
+  # both non-overlapping slices (+51.3% days 30-60, +56.8% days 60-90), over 100
+  # closed copies and 153 days of tape. That consistency is the whole case for
+  # it -- most high scorers on that list are a single hot streak.
+  #
+  # Read it as the best-evidenced pick available, NOT as a prediction: across 66
+  # wallets, a slice's return correlated -0.168 with the next slice. Position
+  # caps, not conviction, are what limit the damage if it stops working.
+  - "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21"   # HongYunX
+
+  # DROPPED 2026-09-02: 0xc23dc0eca9e1c2e293de8911b9ac254f0bcd82c8.
+  # It had the most copyable tape of any wallet (184 trades) and that is exactly
+  # why it is the most confident negative we have. Backtest: -7.5% / -5.3% /
+  # -4.9% over 30/60/90 days on 113 closed copies, negative in the middle slice
+  # too. Live: -1.67% over 52 real round-trips, the largest live sample for any
+  # leader. Simulation and reality agree, on the biggest n available.
+  # Its open positions become exit-only -- SELLs still mirrored, BUYs ignored.
 
 # ---------------------------------------------------------------------------
 # Everything below this line feeds `pmbot leaders` ONLY. The live loop never
