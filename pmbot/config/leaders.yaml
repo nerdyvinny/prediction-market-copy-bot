@@ -29,48 +29,52 @@
 # ignored — so nothing is stranded.
 
 roster:
-  # Seeded 2026-08-30 from the roster the bot had selected for itself, so the
-  # strip changed the mechanism without changing who was being copied on that
-  # day. Judge these on their own merits from here; the scores that put them
-  # here came from the ranking that is no longer trusted.
-  - "0xcae693bcf9696a2ebf0a62de767719b45f354f85"
-  - "0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33"   # most productive source of the first month (25 buys)
-  - "0xd487f513cfead22d76b6db4567c756b3cf25053e"
-  - "0x455e565fdaa9c4d106e1aebd557b8443925af7f9"
-  - "0x9cdda449d7cedf1072d74982a5dc2349df3d3e97"
-  - "0x61171892acad4064e139ca4fcb6ce3321a362faf"
-
-  # 2026-09-02. Added on the wallet census (scripts/wallet_census.py): 962
-  # wallets each replayed alone over 30/60/90 days on the quoted-book backtest.
-  # HongYunX is the only one that came out positive in all three windows AND in
-  # both non-overlapping slices (+51.3% days 30-60, +56.8% days 60-90), over 100
-  # closed copies and 153 days of tape. That consistency is the whole case for
-  # it -- most high scorers on that list are a single hot streak.
+  # Rebuilt 2026-09-02 from the wallet census (30/60/90-day runs over 962
+  # wallets) plus `scripts/roster_arms.py`, which scores whole LINEUPS as
+  # cohorts competing for the one $500 rather than scoring wallets alone.
   #
-  # Read it as the best-evidenced pick available, NOT as a prediction: across 66
-  # wallets, a slice's return correlated -0.168 with the next slice. Position
-  # caps, not conviction, are what limit the damage if it stops working.
-  - "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21"   # HongYunX
-
-  # 2026-09-02, same census. Added for the OPPOSITE reason to HongYunX: not the
-  # biggest number, the biggest sample. 402 closed copies over 98 days -- more
-  # evidence than any wallet we have ever followed -- and positive in both
-  # non-overlapping slices (+7.2% days 30-60, +12.8% days 60-90). +7.4% on 402
-  # trades is a far more trustworthy estimate than +40% on 50, which is the
-  # mistake the top of the ranked list invites.
+  # The size result is the load-bearing one, and it is monotone under two
+  # independent selection rules -- by score and by sample size:
   #
-  # Note its 30-day figure is -0.0% (101 trades). That is the honest shape of a
-  # thin-edge, high-volume wallet, not a warning sign; judging it on one month
-  # is exactly the error the census was built to avoid.
-  - "0xff81cc85838ce8f91a7d4ae2eeddadfa3f8444c9"
+  #     3 wallets  +42.7% / +25.6%      peak capital $330 / $413
+  #     5 wallets  +27.0% / +18.0%      peak $698 / $804
+  #     8 wallets  +16.7% / +12.6%      peak $868 / $1,197
+  #    12 wallets  +13.0%               peak $1,294
+  #    19 wallets   +9.8%               peak $1,018
+  #
+  # More leaders is worse, twice over: ROI falls and peak concurrent capital
+  # climbs past the bankroll, so the larger lineups are spending money the bot
+  # does not have. Concentration is the finding; there is no size to grow into.
+  #
+  # These three were picked by RULE, not by taking the highest backtest number.
+  # Each clears the strict bar -- positive over 30, 60 AND 90 days and in both
+  # NON-OVERLAPPING slices (days 30-60 and 60-90) -- on 100+ closed copies, so
+  # the estimate is one you can believe. The "strict top 3" lineup scored
+  # +42.7% but is the three highest-scoring wallets drawn from the same data
+  # that scored them, which is the in-sample trap this repo keeps relearning.
+  # This lineup scores +20.4% at a peak of $165, the only arm that fits $500.
+  #
+  # It is still selected on 90 days of history, and across 66 wallets a slice's
+  # return correlated -0.168 with the next slice. Position caps, not these
+  # numbers, are what limit the damage.
+  - "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21"   # HongYunX: +55.9%/100 copies, slices +51.3/+56.8, 153d tape
+  - "0xf28e42d20e4826f2b10a24bc952001697947cab2"   # +13.4%/151, slices +9.6/+13.8, 265d tape (longest)
+  - "0xe015b5a2a299167be835a2fd1e86f09c49e06ffd"   # TAIWANNUMBERONE: +9.8%/230, slices +9.8/+25.9, 210d
 
-  # DROPPED 2026-09-02: 0xc23dc0eca9e1c2e293de8911b9ac254f0bcd82c8.
-  # It had the most copyable tape of any wallet (184 trades) and that is exactly
-  # why it is the most confident negative we have. Backtest: -7.5% / -5.3% /
-  # -4.9% over 30/60/90 days on 113 closed copies, negative in the middle slice
-  # too. Live: -1.67% over 52 real round-trips, the largest live sample for any
-  # leader. Simulation and reality agree, on the biggest n available.
-  # Its open positions become exit-only -- SELLs still mirrored, BUYs ignored.
+  # DROPPED 2026-09-02, with reasons:
+  #   0x5cd5c8d7a1  -13.7% over 90d. The old allowlist pin; no longer earns it.
+  #   0x455e565fda   -6.1%, negative at both 60 and 90 days.
+  #   0xd487f513cf   +37.0% on NINE copies in 90 days. Unmeasurable, not good.
+  #   0x9cdda449d7   +35.7% on 22. Same.
+  #   0xcae693bcf9    +1.5% on 275. Real evidence of a real but tiny edge;
+  #                   adding it back cost 2.2pp of roster ROI (+12.8 -> +10.5).
+  #   0xff81cc8583    +7.4% on 402 -- the most reliable single estimate we have,
+  #                   which is why it was added earlier today. But in a LINEUP
+  #                   its volume crowds the bankroll: including it took the
+  #                   roster from +20.4% to +13.6% and peak capital from $165 to
+  #                   $870. Good wallet, wrong role. Solo quality and roster
+  #                   contribution are not the same measurement.
+  # All keep their open positions as exit-only: SELLs mirrored, BUYs ignored.
 
 # ---------------------------------------------------------------------------
 # Everything below this line feeds `pmbot leaders` ONLY. The live loop never
