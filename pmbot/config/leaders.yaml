@@ -52,6 +52,18 @@ roster:
   # caps, not conviction, are what limit the damage if it stops working.
   - "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21"   # HongYunX
 
+  # 2026-09-02, same census. Added for the OPPOSITE reason to HongYunX: not the
+  # biggest number, the biggest sample. 402 closed copies over 98 days -- more
+  # evidence than any wallet we have ever followed -- and positive in both
+  # non-overlapping slices (+7.2% days 30-60, +12.8% days 60-90). +7.4% on 402
+  # trades is a far more trustworthy estimate than +40% on 50, which is the
+  # mistake the top of the ranked list invites.
+  #
+  # Note its 30-day figure is -0.0% (101 trades). That is the honest shape of a
+  # thin-edge, high-volume wallet, not a warning sign; judging it on one month
+  # is exactly the error the census was built to avoid.
+  - "0xff81cc85838ce8f91a7d4ae2eeddadfa3f8444c9"
+
   # DROPPED 2026-09-02: 0xc23dc0eca9e1c2e293de8911b9ac254f0bcd82c8.
   # It had the most copyable tape of any wallet (184 trades) and that is exactly
   # why it is the most confident negative we have. Backtest: -7.5% / -5.3% /
