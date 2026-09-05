@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 
 def followed_leaders(db_path: str) -> list[str]:
@@ -229,7 +230,7 @@ def main(argv: list[str]) -> None:
                 oldest = min(t.timestamp for t in tape)
                 span_s = f", oldest {(now-oldest).days}d ago"
             print(f"  {w[:12]}… {len(tape)} trades{span_s}", flush=True)
-        base = bt.simulate(tapes, lookback_days=args.span)
+        base = bt.simulate(tapes, lookback_days=args.span, warn_no_book=False)
         print(f"\nwarming resolution cache: {base.metrics()['n_trades']} trades "
               f"({time.time()-t0:.0f}s)", flush=True)
         if args.cache:
@@ -238,6 +239,11 @@ def main(argv: list[str]) -> None:
                 pickle.dump((tapes, bt._mkt_cache), fh)
             os.replace(tmp, args.cache)
             print(f"cached tapes + resolutions -> {args.cache}", flush=True)
+
+    # Quote the book once for the whole tape, whichever branch supplied it.
+    # Every fold prices off it; a trade it cannot quote is a trade the live bot
+    # could not have made either.
+    shared_book(bt, tapes)
 
     folds = []
     test_end = now

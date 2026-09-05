@@ -16,6 +16,7 @@ import time
 
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 LOOKBACKS = [30, 45, 60, 90]
 MIN_NOTIONALS = [0.0, 100.0, 500.0]
@@ -33,6 +34,10 @@ def main(leaders: list[str]) -> None:
     t0 = time.time()
     print(f"fetching tapes for {len(leaders)} leaders…", flush=True)
     tapes = bt.fetch_tapes(leaders)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     for w, tape in tapes.items():
         print(f"  {w[:12]}… {len(tape)} trades", flush=True)
 

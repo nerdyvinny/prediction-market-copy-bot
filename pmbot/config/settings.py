@@ -37,9 +37,56 @@ class Settings(BaseSettings):
     # authenticated api.polymarket.us host and is not wired up.
     polymarket_us_api_base: str = "https://gateway.polymarket.us"
 
-    # Poll loop. Every second of lag is edge lost to the drift guard, so poll
-    # as fast as is polite to the public Data API (8 leader queries/cycle).
+    # Poll loop. This is NOT how late we copy — see `copy_feed_lag_seconds`.
+    # The feed refreshes far more slowly than we ask, so most polls re-read a
+    # page we have already seen. 10s is kept so we pick up each refresh
+    # promptly, not because it makes the copy fast.
     poll_interval_seconds: float = 10.0
+    # How far behind the leader the Data API's /trades feed actually is, in
+    # seconds. This is NOT a knob — it is a measurement, and the bot cannot go
+    # faster than it. Polling every 10s does not make us 10 seconds late.
+    #
+    # Measured 2026-09-03 two independent ways (`scripts/measure_copy_lag.py`):
+    #   * 450 live fills, our fill timestamp minus the leader's trade
+    #     timestamp: median 149s on BUYs, 179s on SELLs, p90 ~285s.
+    #   * probing the feed itself: `/trades` is served through Cloudflare with
+    #     `cache-control: max-age=300`, and our measured lag is statistically
+    #     indistinguishable from a uniform draw over that cache's own lifetime
+    #     (KS D=0.060 vs U(0,300), n=148). So the cache is essentially ALL of
+    #     it and Polymarket's own index adds little — it serves trades ~23s
+    #     old once the cache is out of the way. `copy_bypass_feed_cache`
+    #     below is the lever for that; this figure describes the default,
+    #     cached path the bot runs today.
+    #
+    # The backtester uses `copy_feed_lag_seconds + poll_interval_seconds` as
+    # the moment it may first quote the book. Left at the poll interval alone,
+    # every simulated entry and exit was priced 15x closer to the leader than
+    # the live bot can ever fill, which is optimistic in exactly the dimension
+    # copy trading lives or dies on.
+    copy_feed_lag_seconds: float = 140.0
+    # Send a unique query parameter with every /trades request, so Cloudflare
+    # cannot serve us its cached page and the query reaches Polymarket's own
+    # index. OFF by default: it is a deliberate choice to bypass someone
+    # else's CDN, and that is the operator's call, not a default.
+    #
+    # The evidence for turning it on, measured 2026-09-03:
+    #   * Our live latency is statistically indistinguishable from a uniform
+    #     draw over the cache's own 300s lifetime — KS D=0.060 against
+    #     U(0,300) at n=148, critical value 0.112. U(0,600), U(0,200) and
+    #     U(0,300)+20s are all rejected. So the CDN is essentially ALL of it
+    #     and the origin adds nothing.
+    #   * Controlled A/B, both arms polling the same six wallets continuously
+    #     for 30 minutes so the cached arm's edge entry was hot exactly as the
+    #     bot's is (n=450 paired trades): cached p50 270s, busted p50 **23s**,
+    #     busted sooner on 67% of trades, median saving 244s.
+    #   * `scripts/sweep_lag.py` prices the difference at +22% net P&L over 30
+    #     days on the roster (218 trades/+$522 at 150s, 262/+$638 at 10s).
+    #
+    # The cost is load: it turns every poll into an origin request, ~6 per
+    # minute per followed wallet at `poll_interval_seconds=10`. Raise the poll
+    # interval if you turn this on — past the origin's own freshness (~20s)
+    # the extra requests buy nothing anyway.
+    copy_bypass_feed_cache: bool = False
     # How often to check open positions for resolved markets (realize P&L).
     # Settling is cheap (one Gamma call per open position) and every hour a
     # resolved position sits unsettled is bankroll that can't fund new copies,

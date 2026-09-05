@@ -145,11 +145,19 @@ def _run_leader_research(args, settings) -> int:
             print()
             vetter = ExactCopyBacktester(data, gamma, settings, trades_limit=4000)
             now = datetime.now(timezone.utc)
+            # One shared book cache across candidates: wallets overlap on the
+            # busy markets, and a re-quoted token is a wasted request.
+            book_cache: dict = {}
             for r in ranked:
                 try:
                     tapes = vetter.fetch_tapes([r.wallet])
-                    m = vetter.simulate(
-                        tapes, lookback_days=args.lookback, now=now,
+                    # simulate_live, not simulate: it quotes the book at each
+                    # entry the way the executor does. Plain simulate fills at
+                    # the leader's own price and reported this wallet ~15pp
+                    # better than the bot could have done.
+                    m = vetter.simulate_live(
+                        tapes, book_cache=book_cache,
+                        lookback_days=args.lookback, now=now,
                         min_leader_notional=settings.copy_min_leader_notional_usd,
                         skip_round_tripped_entries=settings.skip_round_tripped_entries,
                     ).metrics()

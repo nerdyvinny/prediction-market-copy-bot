@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import Settings, get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 # The live followed set (rescored 2026-08-12 21:16 UTC) plus 0x5cd5c8d7, which
 # vetting dropped that day and the allowlist has since pinned back.
@@ -110,6 +111,10 @@ def main() -> int:
           f"${s.copy_min_leader_notional_usd:.0f}\n")
     print(f"fetching {len(LEADERS)} tapes (limit {TAPE})…")
     tapes = bt.fetch_tapes(LEADERS)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     for w, tape in tapes.items():
         if tape:
             span = (max(t.timestamp for t in tape)

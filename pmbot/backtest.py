@@ -16,7 +16,11 @@ from __future__ import annotations
 import heapq
 import logging
 import time
-from dataclasses import dataclass, replace
+import threading
+from bisect import bisect_left
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from pmbot.config import Settings, get_settings
@@ -35,6 +39,26 @@ _MAX_PRICE = 1 - 1e-4
 # every `poll_interval_seconds` and fetches `trades_per_leader` trades.
 _LIVE_POLL_SECONDS = 10.0
 _LIVE_TAPE_DEPTH = 25
+
+
+def observed_price(
+    series: list[tuple[int, float]] | None, at: float, max_staleness: float
+) -> float | None:
+    """First sampled price at or after `at`, or None if nothing lands near it.
+
+    The live bot quotes the book at the moment it acts; a backtest can only
+    reach for the nearest sample of that token's price history. Returning None
+    rather than the last price before `at` is deliberate — a stale earlier
+    sample is the leader's own price wearing a disguise, which is exactly the
+    free fill this is meant to remove.
+    """
+    if not series:
+        return None
+    i = bisect_left(series, (at,))
+    if i >= len(series):
+        return None
+    ts, px = series[i]
+    return px if (ts - at) <= max_staleness else None
 
 
 def round_tripped_entry_uids(
@@ -85,6 +109,102 @@ def round_tripped_entry_uids(
     return closed
 
 
+def book_windows(
+    moments: list[tuple[str, datetime]],
+    *,
+    lead_seconds: float = 300.0,
+    trail_seconds: float = 900.0,
+    max_span_seconds: float = 12 * 3600.0,
+) -> dict[str, tuple[int, int]]:
+    """One [start, end] fetch window per token, covering the instants we act.
+
+    Trades on a token usually cluster within hours, so a single window at
+    1-minute fidelity covers them all in one request. `max_span_seconds` caps
+    the ones that don't: a token touched on day 1 and again on day 20 gets the
+    first cluster at full fidelity rather than a 20-day window the API would
+    only serve coarsely. Anything outside the window has no quote, and
+    `simulate` then does what live does with no quote — nothing.
+    """
+    seen: dict[str, list[float]] = {}
+    for token, ts in moments:
+        if token:
+            seen.setdefault(token, []).append(ts.timestamp())
+    out: dict[str, tuple[int, int]] = {}
+    for token, stamps in seen.items():
+        lo = min(stamps) - lead_seconds
+        hi = min(max(stamps) + trail_seconds, lo + max_span_seconds)
+        out[token] = (int(lo), int(hi))
+    return out
+
+
+def fetch_book(
+    moments: list[tuple[str, datetime]],
+    price_cache,
+    *,
+    cache: dict | None = None,
+    workers: int = 12,
+    fidelity_minutes: int = 1,
+    progress: "callable | None" = None,
+) -> dict[str, list[tuple[int, float]]]:
+    """Price history around every moment we would have quoted the book.
+
+    This is the other half of a faithful `simulate` — without it the sim fills
+    at the leader's own price, which the live executor refuses to do. One
+    request per token at the finest fidelity the CLOB serves, threaded because
+    a month of a few leaders runs to thousands of tokens.
+
+    `cache` is read AND written in place ({token: [[ts, px], …]}), so a caller
+    that persists it makes re-runs free.
+
+    A FAILED fetch is deliberately left out of the cache, while a successful
+    empty response is stored. The two are indistinguishable once written, and
+    they mean opposite things: an empty series is "no quote", which `simulate`
+    reads as "no trade" — so caching an error would silently delete real trades
+    from every later run and understate the wallet, with nothing in the output
+    to show for it. Left uncached, the token is simply retried next pass.
+    Failures are counted and returned to the caller via the log.
+    """
+    windows = book_windows(moments)
+    cache = {} if cache is None else cache
+    todo = [(t, w) for t, w in windows.items() if t not in cache]
+    if todo:
+        local = threading.local()
+        lock = threading.Lock()
+        done, failed = [0], [0]
+
+        def one(item):
+            token, (lo, hi) = item
+            pc = getattr(local, "pc", None)
+            if pc is None:
+                pc = local.pc = price_cache() if callable(price_cache) else price_cache
+            try:
+                hist = pc.get_price_history(token, start_ts=lo, end_ts=hi,
+                                            fidelity_minutes=fidelity_minutes)
+            except Exception as e:
+                log.debug("backtest: book fetch failed for %s: %s", token[:12], e)
+                with lock:
+                    failed[0] += 1          # NOT cached: retried on the next pass
+                return
+            with lock:
+                cache[token] = hist
+                done[0] += 1
+                if progress is not None and done[0] % 250 == 0:
+                    progress(done[0], len(todo))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(one, todo))
+        if failed[0]:
+            log.warning(
+                "backtest: %d/%d book fetches failed and were NOT cached — those "
+                "tokens have no quote this pass, so their trades are skipped; "
+                "re-run to pick them up", failed[0], len(todo),
+            )
+    return {
+        t: sorted((int(a), float(b)) for a, b in (cache.get(t) or []))
+        for t in windows
+    }
+
+
 @dataclass
 class CopyResult:
     leader: str
@@ -120,6 +240,14 @@ class BacktestReport:
     starting_bankroll: float
     title: str = "Strategy #4 (long-term copy)"
     note: str = "assumes hold-to-resolution; only resolved markets included."
+    # Why candidate BUYs were dropped, keyed by filter name. A backtest that
+    # only reports what it took cannot be compared against live, where most of
+    # the tape is refused — see `simulate`'s live-filter arguments.
+    skipped: dict[str, int] = field(default_factory=dict)
+    # (token_id, timestamp) for every BUY that cleared the *static* filters,
+    # whether or not the RiskManager sized it. Callers pre-fetch entry prices
+    # for these before a second pass turns the price-dependent filters on.
+    candidate_entries: list[tuple[str, datetime]] = field(default_factory=list)
 
     def metrics(self) -> dict:
         n = len(self.results)
@@ -197,7 +325,7 @@ class Backtester:
         self.price_min = s.copy_price_min if price_min is None else price_min
         self.price_max = s.copy_price_max if price_max is None else price_max
         self._mkt_cache: dict[str, tuple[Market | None, str | None]] = {}
-
+        # Quotes every `simulate` uses unless one is passed explicitly. Set via
     def _market(self, condition_id: str) -> tuple[Market | None, str | None]:
         if condition_id not in self._mkt_cache:
             try:
@@ -375,6 +503,10 @@ class ExactCopyBacktester:
         self.slip = (s.slippage_bps if slippage_bps is None else slippage_bps) / 10_000
         self.trades_limit = trades_limit
         self._mkt_cache: dict[str, tuple[Market | None, str | None]] = {}
+        # Quotes every `simulate` uses unless one is passed explicitly. Set via
+        # `attach_book` so a sweep can fetch once and leave its dozens of call
+        # sites — most of them nested helpers — untouched.
+        self._book: dict[str, list[tuple[int, float]]] | None = None
 
     def _market(self, condition_id: str) -> tuple[Market | None, str | None]:
         if condition_id not in self._mkt_cache:
@@ -447,6 +579,133 @@ class ExactCopyBacktester:
             tapes[leader.lower()] = trades
         return tapes
 
+    def prefetch_markets(
+        self, condition_ids, *, workers: int = 16, progress=None
+    ) -> int:
+        """Resolve many markets in parallel, straight into `_market`'s memo.
+
+        `_market` is serial and memoized, which is right for a replay — it asks
+        for each market once, when it first matters. It is wrong for the first
+        pass over a wide pool: one 25-wallet batch of feed-sourced wallets
+        resolved 7,247 unseen markets, and at one request apiece that was 49 of
+        the 50 minutes the batch took. Warming the same memo from a thread pool
+        turns that into minutes and changes nothing else.
+
+        Only misses are fetched. A failure is deliberately left UNMEMOIZED so
+        the replay retries it, exactly as `_market` already does — caching the
+        error would silently drop every trade in that market.
+        """
+        todo = [c for c in dict.fromkeys(condition_ids)
+                if c and c not in self._mkt_cache]
+        if not todo:
+            return 0
+        lock = threading.Lock()
+        done = [0]
+
+        def one(cid):
+            try:
+                got = self.gamma.get_market_with_resolution(cid)
+            except Exception as e:
+                log.debug("backtest: prefetch failed for %s: %s", cid[:12], e)
+                return
+            with lock:
+                self._mkt_cache[cid] = got
+                done[0] += 1
+                if progress is not None and done[0] % 500 == 0:
+                    progress(done[0], len(todo))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(one, todo))
+        return len(todo)
+
+    def attach_book(
+        self, book: dict[str, list[tuple[int, float]]] | None
+    ) -> "ExactCopyBacktester":
+        """Use `book` for every later `simulate` that does not pass its own.
+
+        A sweep calls `build_book` once and attaches the result; each arm then
+        prices off real quotes without threading an argument through helpers
+        that were written before quotes existed. Returns self so it chains.
+        """
+        self._book = book
+        return self
+
+    def build_book(
+        self,
+        tapes: dict[str, list[LeaderTrade]],
+        *,
+        price_cache=None,
+        book_cache: dict | None = None,
+        progress=None,
+        **kw,
+    ) -> dict[str, list[tuple[int, float]]]:
+        """Quotes for everything any run over these tapes could trade.
+
+        Two passes are unavoidable: the quotes we need depend on which trades
+        clear the static filters, and that is only known after a replay. This
+        is pass 1 — its fills are discarded, only its `candidate_entries`
+        matter — plus the fetch. SELLs on candidate tokens are included, so a
+        mirrored exit prices on the book too.
+
+        Discovery deliberately runs at the LOOSEST filters: whole price band,
+        no notional floor, no liquidity floor, no horizon, no round-trip skip.
+        One book then covers a whole parameter sweep. Narrowing discovery to
+        the current settings would leave a sweep's wider arms with no quotes,
+        and `simulate` reads "no quote" as "no trade" — so those arms would
+        silently score zero and the sweep would pick a winner by data coverage.
+
+        For the same reason, a walk-forward should pass the WIDEST window in
+        its grid (`now` at the latest fold's end, `lookback_days` spanning all
+        of them); a narrower one leaves the other folds unquoted.
+        """
+        from pmbot.data import PriceCache
+
+        loose = dict(kw)
+        loose.update(
+            price_min=0.0, price_max=1.0, min_leader_notional=0.0,
+            min_liquidity=0.0, min_hours_to_resolution=0.0,
+            max_hours_to_resolution=0.0, skip_price_band=None,
+            skip_round_tripped_entries=False, stop_loss_frac=None,
+            book=None, warn_no_book=False,
+        )
+        attached, self._book = self._book, None    # discovery must not reuse a book
+        try:
+            scout = self.simulate(tapes, **loose)
+        finally:
+            self._book = attached
+        wanted = {tok for tok, _ in scout.candidate_entries}
+        moments = list(scout.candidate_entries)
+        moments += [
+            (t.token_id, t.timestamp)
+            for tape in tapes.values() for t in tape
+            if t.side is Side.SELL and t.token_id in wanted
+        ]
+        return fetch_book(moments, price_cache or PriceCache(),
+                          cache=book_cache, progress=progress)
+
+    def simulate_live(
+        self,
+        tapes: dict[str, list[LeaderTrade]],
+        *,
+        price_cache=None,
+        book_cache: dict | None = None,
+        progress=None,
+        **kw,
+    ) -> BacktestReport:
+        """`simulate` with the book fetched for you — the faithful entry point.
+
+        Prefer this over calling `simulate` directly. `simulate` with no `book`
+        fills at the leader's own price, which the live executor refuses to do,
+        and every number that comes out of it is optimistic.
+
+        For a SWEEP, call `build_book` once and pass `book=` to each
+        `simulate`: this method rebuilds the discovery pass every call, which
+        over a parameter grid is pure waste.
+        """
+        book = self.build_book(tapes, price_cache=price_cache,
+                               book_cache=book_cache, progress=progress, **kw)
+        return self.simulate(tapes, book=book, **kw)
+
     def run(
         self,
         leaders: list[str],
@@ -482,6 +741,12 @@ class ExactCopyBacktester:
         resolve_at: dict[str, datetime] | None = None,
         skip_round_tripped_entries: bool = False,
         skip_price_band: tuple[float, float] | None = None,
+        min_liquidity: float | None = None,
+        book: dict[str, list[tuple[int, float]]] | None = None,
+        entry_lag_seconds: float | None = None,
+        max_price_drift: float | None = None,
+        book_max_staleness_seconds: float = 180.0,
+        warn_no_book: bool = True,
     ) -> BacktestReport:
         """Simulate the tapes over the window [now - lookback_days, now].
 
@@ -525,6 +790,66 @@ class ExactCopyBacktester:
         tranche settles instantly — fine for P&L (the payout is still right),
         useless for anything time-dependent. A stop needs a real holding
         window, so pass a data-derived resolution for those markets.
+
+        THE LIVE PATH
+        -------------
+        Everything above describes the leader's tape. This part describes *us*,
+        and it is not optional: `min_liquidity`, `entry_lag_seconds` and
+        `max_price_drift` all default to the values in `settings` — the same
+        object the live bot reads — so an unconfigured call reproduces the
+        deployed strategy instead of an optimistic cartoon of it. Pass a number
+        only to sweep one deliberately.
+
+        `book` is the missing half: {token_id: [(unix_ts, price), …]},
+        ascending, each token's own price history. Live, both the strategy and
+        the executor quote the CLOB at the moment they act, and every decision
+        below flows from that quote. Build it with `fetch_book`.
+
+        With a `book`, an entry is decided exactly as live decides it:
+
+          1. The quote is the first sample at or after
+             `trade_ts + entry_lag_seconds`, which defaults to
+             `copy_feed_lag_seconds + poll_interval_seconds`. The second term
+             is the loop; the FIRST is the one that matters. `/trades` is
+             served from a 300s CDN cache over an origin that publishes in
+             ~200s batches, so a leader's trade is ~150s old before any poll
+             can see it (measured over 450 live fills: median 149s on entries,
+             179s on exits, p90 ~285s). A sim run at the poll interval alone
+             prices every fill 15x closer to the leader than we can fill.
+          2. NO QUOTE MEANS NO TRADE. `PaperExecutor` refuses a copy buy it has
+             no book for, deliberately: falling back to the leader's price
+             grants a perfect fill exactly when we are blind. Same for a copy
+             sell, which is then left to ride into resolution. Counted as
+             `no_book` / `exit_no_book`.
+          3. `max_price_drift` (`copy_max_price_drift`) refuses an entry whose
+             quote has moved further than the budget from the leader's fill —
+             the edge was arbitraged away before we could reach it.
+          4. The fill is `quote * (1 + slippage)` for a buy and
+             `quote * (1 - slippage)` for a sell, never the leader's price.
+          5. `PaperExecutor`'s limit cap then refuses any buy whose FILL lands
+             above `leader_price + copy_max_price_drift`. That is a second and
+             tighter gate than (3), and it binds whenever the quote sits near
+             the drift budget, because the slippage is added afterwards.
+             Counted as `entry_limit`.
+
+        Without a `book` this warns once and fills at the leader's price. That
+        path exists for offline unit tests; any backtest whose number you mean
+        to believe must supply one.
+
+        `min_liquidity` mirrors `min_market_liquidity_usd`, including the live
+        rule that an ABSENT liquidity figure passes — but read
+        `liquidity_unknown` in `skipped` before trusting it, because Gamma drops
+        `liquidityNum` when a market closes, so a resolved-market backtest sees
+        the figure on very few markets. Correct where the data exists; the data
+        usually does not.
+
+        Two live behaviours are deliberately NOT modelled, having been measured
+        to be no-ops rather than assumed to be: the 25-trade fetch window never
+        binds (the busiest roster wallet peaks at 24 trades in a 10-second poll,
+        so nothing scrolls off unseen), and `copy_max_trade_age_minutes` cannot
+        bind in a continuous replay, where every trade is decided one poll after
+        it appears. Both only bite after downtime, which a backtest has no way
+        to know about.
         """
         s = settings or self.s
         slip = self.slip if slippage_bps is None else slippage_bps / 10_000
@@ -532,6 +857,22 @@ class ExactCopyBacktester:
         cutoff = now - timedelta(days=lookback_days)
         p_min = s.copy_price_min if price_min is None else price_min
         p_max = s.copy_price_max if price_max is None else price_max
+        # The live path, taken from the same settings object the bot reads.
+        book = self._book if book is None else book
+        min_liq = s.min_market_liquidity_usd if min_liquidity is None else min_liquidity
+        drift = s.copy_max_price_drift if max_price_drift is None else max_price_drift
+        # Not the poll interval: the feed we poll is itself minutes behind the
+        # leader (see `copy_feed_lag_seconds`), and polling faster than it
+        # publishes buys nothing. Measured 2026-09-03 at ~150s end to end.
+        lag = (s.copy_feed_lag_seconds + s.poll_interval_seconds
+               if entry_lag_seconds is None else entry_lag_seconds)
+        if book is None and warn_no_book:
+            log.warning(
+                "backtest: no `book` supplied — entries will fill at the leader's "
+                "own price and neither the drift guard nor the executor's limit "
+                "can run. The live bot never trades this way; supply fetch_book() "
+                "output for any result you intend to act on."
+            )
 
         # Detect per leader on that leader's own tape, and only on trades at or
         # before `now` — using an exit the live bot could not yet have seen
@@ -554,6 +895,8 @@ class ExactCopyBacktester:
         leader_pos: dict[tuple[str, str], float] = {}   # leader's own share count
         tranches: dict[tuple[str, str], _Tranche] = {}  # our copied holdings
         results: list[CopyResult] = []
+        skipped: Counter[str] = Counter()
+        report_candidates: list[tuple[str, datetime]] = []
         # heap: (resolve_ts, seq, key, winner) — settle leftovers at payout.
         pending: list[tuple] = []
         settled: set[tuple[str, str]] = set()
@@ -674,17 +1017,22 @@ class ExactCopyBacktester:
 
             if t.side is Side.BUY:
                 if t.uid in round_tripped:
+                    skipped["round_tripped"] += 1
                     continue                       # leader already flat before our next poll
                 if not (p_min <= t.price <= p_max):
+                    skipped["price_band"] += 1
                     continue
                 if skip_price_band is not None and (
                     skip_price_band[0] <= t.price < skip_price_band[1]
                 ):
+                    skipped["skip_band"] += 1
                     continue                       # punched-out middle band
                 if t.usd_size < min_leader_notional:
+                    skipped["leader_notional"] += 1
                     continue
                 market, winner = self._market(t.market_id)
                 if market is None or not market.closed or winner is None or market.end_date is None:
+                    skipped["unresolved_market"] += 1
                     continue                       # only resolved markets have a known payout
                 # Only enforce when the knob is ON (matches ExactCopyStrategy).
                 # Daily-sports markets carry end_date at START of day, so every
@@ -702,14 +1050,51 @@ class ExactCopyBacktester:
                     # what we want — the ceiling is aimed at months-out macro
                     # markets, not at sports.
                     if max_hours_to_resolution > 0 and hours_left > max_hours_to_resolution:
+                        skipped["horizon"] += 1
                         continue
+                # Live rule, absence included: a market with no liquidity figure
+                # passes. Gamma drops the field on close, so `liquidity_unknown`
+                # is usually most of the tape — the counter exists so a caller
+                # cannot mistake "not filtered" for "checked and fine".
+                if min_liq > 0:
+                    if market.liquidity_usd is None:
+                        skipped["liquidity_unknown"] += 1
+                    elif market.liquidity_usd < min_liq:
+                        skipped["liquidity"] += 1
+                        continue
+                report_candidates.append((t.token_id, t.timestamp))
+                # What the book showed one poll after the leader hit it. Live,
+                # no book means no copy — never the leader's price (see
+                # PaperExecutor._resolve_fill_price).
+                quoted = None
+                if book is not None:
+                    quoted = observed_price(
+                        book.get(t.token_id),
+                        t.timestamp.timestamp() + lag,
+                        book_max_staleness_seconds,
+                    )
+                    if quoted is None:
+                        skipped["no_book"] += 1
+                        continue
+                if quoted is not None and drift > 0 and abs(quoted - t.price) > drift:
+                    skipped["price_drift"] += 1
+                    continue                       # edge already arbitraged away
+                # Fill on the book we found, not on the leader's print.
+                entry = (t.price if quoted is None else quoted) * (1 + slip)
+                # The executor's limit: never pay more than the leader's price
+                # plus the drift budget. Checked on the FILL, so it bites where
+                # the drift guard alone does not — slippage is added after it.
+                if quoted is not None and drift > 0 and entry > t.price + drift:
+                    skipped["entry_limit"] += 1
+                    continue
                 sized = risk.size(Signal(
                     t.market_id, t.token_id, t.outcome, Side.BUY, t.price,
                     t.usd_size, "backtest", source_leader=t.leader.lower(), source_uid=t.uid,
                 ))
                 if sized is None:
+                    skipped["bankroll_or_caps"] += 1
                     continue
-                entry = min(max(t.price * (1 + slip), _MIN_PRICE), _MAX_PRICE)
+                entry = min(max(entry, _MIN_PRICE), _MAX_PRICE)
                 shares = sized.size_usd / entry
                 ledger.record_fill(Fill(
                     signal=sized, fill_price=entry, size_usd=sized.size_usd,
@@ -730,6 +1115,19 @@ class ExactCopyBacktester:
                 tr = tranches.get(lkey)
                 if tr is None or lkey in settled or tr.shares <= 1e-9:
                     continue                       # nothing of ours to mirror-sell
+                quoted_exit = None
+                if book is not None:
+                    quoted_exit = observed_price(
+                        book.get(t.token_id),
+                        t.timestamp.timestamp() + lag,
+                        book_max_staleness_seconds,
+                    )
+                    if quoted_exit is None:
+                        # No bid to hit. Live leaves the uid unretired and the
+                        # position rides into resolution, which is the honest
+                        # answer: we could not have sold either.
+                        skipped["exit_no_book"] += 1
+                        continue
                 fraction = 1.0 if prior <= 1e-9 else min(1.0, t.shares / prior)
                 sell_shares = tr.shares * fraction
                 # Mirrors ExactCopyStrategy's dust sweep. Tranches are keyed
@@ -740,7 +1138,8 @@ class ExactCopyBacktester:
                     residual_value = (tr.shares - sell_shares) * tr.avg
                     if 0 < residual_value < s.exit_dust_usd:
                         sell_shares = tr.shares
-                exit_price = min(max(t.price * (1 - slip), _MIN_PRICE), _MAX_PRICE)
+                exit_base = t.price if quoted_exit is None else quoted_exit
+                exit_price = min(max(exit_base * (1 - slip), _MIN_PRICE), _MAX_PRICE)
                 tr.realized += (exit_price - tr.avg) * sell_shares
                 tr.shares -= sell_shares
                 ledger.record_fill(Fill(
@@ -767,4 +1166,5 @@ class ExactCopyBacktester:
             results=results, starting_bankroll=s.bankroll_usd,
             title="exact copy (entries + mirrored exits)",
             note="mirrors leader exits; leftovers settle at resolution; resolved markets only.",
+            skipped=dict(skipped), candidate_entries=report_candidates,
         )

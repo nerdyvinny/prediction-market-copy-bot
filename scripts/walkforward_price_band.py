@@ -43,6 +43,7 @@ from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.models import Side
+from scripts._book import shared_book
 from scripts.sweep_horizon import followed_leaders
 
 TRAIN_DAYS = 30
@@ -226,6 +227,10 @@ def main(argv: list[str]) -> None:
 
     t0 = time.time()
     tapes = load_tapes(bt, leaders, args.refresh)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     print(f"({time.time()-t0:.0f}s)", flush=True)
 
     print(f"per-market cap in force: ${s.per_market_cap_usd:,.2f} "

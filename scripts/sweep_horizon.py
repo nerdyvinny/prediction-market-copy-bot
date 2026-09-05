@@ -33,6 +33,7 @@ from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.models import Side
+from scripts._book import shared_book
 
 # Ceilings in hours. None = filter off (today's behaviour).
 HORIZONS = [None, 720.0, 336.0, 168.0, 72.0, 24.0, 12.0, 6.0]
@@ -186,6 +187,10 @@ def main(argv: list[str]) -> None:
 
     t0 = time.time()
     tapes = load_tapes(bt, leaders, args.refresh)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     for w, tape in sorted(tapes.items()):
         print(f"  {w[:12]}… {len(tape)} trades", flush=True)
     print(f"({time.time()-t0:.0f}s)", flush=True)

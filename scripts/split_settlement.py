@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 BAND = (0.15, 0.85)
 CACHE = ".tapes_split.pkl"
@@ -174,6 +175,11 @@ def main() -> int:
         with open(CACHE, "wb") as f:
             pickle.dump(tapes, f)
         print(f"fetched {sum(len(v) for v in tapes.values())} trades in {time.time()-t0:.0f}s")
+
+    # Quote the book once for the whole tape, whichever branch supplied it:
+    # `simulate` prices every fill off it and skips what it cannot quote, as
+    # the live executor does. Without this the run fills at the leader's price.
+    shared_book(bt, tapes)
 
     def run(**kw):
         return bt.simulate(

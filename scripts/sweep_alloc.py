@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import Settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 MIN_NOTIONAL = 500.0
 BAND = (0.15, 0.85)
@@ -59,6 +60,10 @@ def main(leaders: list[str]) -> None:
     t0 = time.time()
     print(f"fetching tapes for {len(leaders)} leaders (limit 2000)…", flush=True)
     tapes = bt.fetch_tapes(leaders)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     for w, tape in tapes.items():
         oldest = min((t.timestamp for t in tape), default=None)
         print(f"  {w[:12]}… {len(tape)} trades (back to {oldest:%Y-%m-%d})" if oldest

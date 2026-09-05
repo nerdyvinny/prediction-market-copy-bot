@@ -26,22 +26,19 @@ from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.data.price_cache import PriceCache
+from pmbot.leaders import load_leader_config
 from scripts.sweep_stop import derive_resolutions, fetch_series, load_cache
 
 # --- Live VPS settings, 2026-08-06 -----------------------------------------
-LEADERS = [
-    "0x6ffb4354cbe6e0f9989e3b55564ec5fb8646a834",
-    "0xe839e7fe9cbd0997200c83d0fb77e7c290a10a9d",
-    "0x3eae57986be5e0ca435102ffe1f14206ffa2e2ed",
-    "0x8931aa50226eea3e626c961ccffcf176dcf3a90c",
-    "0xc3e550fae1c90b71675f3355e5864c240bea519d",
-    "0xd32e92fdcaf41c886400bdc747525ca22f03b577",
-    "0x88f9a9b2878aa55d7763543fc7255d216c555c03",
-    "0xc97b0b2a2547bb3ed57167092ef8a6e816c347e5",
-]
+# The roster is read from leaders.yaml, not pinned here. Since the static
+# roster shipped (2026-08-30) that file IS the deployed lineup, so a hardcoded
+# copy could only ever be a stale one — and was: this script still ran the
+# 8 wallets of 2026-08-06 three roster changes later.
+LEADERS = [w.lower() for w in load_leader_config().roster]
 BANKROLL = 500.0
 COPY_FRACTION = 0.10
-MAX_PER_MARKET = 50.0
+MAX_PER_MARKET_PCT = 0.03    # $15 on $500; live since 2026-08-13, replaces the $ cap
+MAX_PER_MARKET = 50.0        # IGNORED while the pct is set, as in the live .env
 MAX_PER_LEADER = 400.0
 MIN_LIQUIDITY = 5000.0
 COMPOUND = False
@@ -76,12 +73,17 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--csv", default="", help="also write the blotter here")
+    ap.add_argument("--feed-lag", type=float, default=None,
+                    help="seconds the /trades feed runs behind the leader "
+                         "(default: the measured copy_feed_lag_seconds). Pass 0 "
+                         "to see the old, optimistic poll-interval-only model.")
     args = ap.parse_args()
 
     s = get_settings().model_copy(update={
         "bankroll_usd": BANKROLL,
         "copy_fraction": COPY_FRACTION,
         "max_per_market_usd": MAX_PER_MARKET,
+        "max_per_market_pct": MAX_PER_MARKET_PCT,
         "max_per_leader_usd": MAX_PER_LEADER,
         "min_market_liquidity_usd": MIN_LIQUIDITY,
         "compound_profits": COMPOUND,
@@ -89,6 +91,7 @@ def main() -> int:
         "copy_price_max": BAND[1],
         "copy_min_leader_notional_usd": MIN_LEADER_NOTIONAL,
         "slippage_bps": SLIPPAGE_BPS,
+        **({} if args.feed_lag is None else {"copy_feed_lag_seconds": args.feed_lag}),
     })
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=args.days)
@@ -106,9 +109,15 @@ def main() -> int:
     print(f"tape span: {min(a for a, _ in spans):%Y-%m-%d} .. {max(b for _, b in spans):%Y-%m-%d}"
           f"   ({in_window} raw trades inside the {args.days}d window)")
 
+    book_cache: dict = {}
+
     def run(resolve_at=None):
-        return bt.simulate(
+        # simulate_live quotes the book at every entry and exit, the way the
+        # paper executor does. Plain simulate fills at the leader's own price,
+        # which scored this exact roster ~15pp above what the bot delivered.
+        return bt.simulate_live(
             tapes,
+            book_cache=book_cache,
             lookback_days=args.days,
             now=now,
             min_leader_notional=MIN_LEADER_NOTIONAL,
@@ -146,10 +155,15 @@ def main() -> int:
     print(f"window: {start:%Y-%m-%d %H:%M} .. {now:%Y-%m-%d %H:%M} UTC")
     print(f"{'='*100}")
     print(f"bankroll ${BANKROLL:,.0f} | copy {COPY_FRACTION:.0%} of leader | "
-          f"cap ${MAX_PER_MARKET:,.0f}/market, ${MAX_PER_LEADER:,.0f}/leader")
+          f"cap {MAX_PER_MARKET_PCT:.0%} = ${BANKROLL * MAX_PER_MARKET_PCT:,.0f}/market, "
+          f"${MAX_PER_LEADER:,.0f}/leader")
     print(f"band {BAND[0]}-{BAND[1]} | leader-notional floor ${MIN_LEADER_NOTIONAL:,.0f} | "
           f"slippage {SLIPPAGE_BPS:.0f}bps | compound {COMPOUND} | "
           f"round-trip filter {SKIP_ROUND_TRIPPED}")
+    print(f"copy lag {s.copy_feed_lag_seconds + s.poll_interval_seconds:.0f}s "
+          f"(feed {s.copy_feed_lag_seconds:.0f}s + poll {s.poll_interval_seconds:.0f}s) — "
+          f"every fill below is quoted that long after the leader's print")
+    print(f"skipped by filter: {rep.skipped}")
 
     rs_all = sorted(rep.results, key=lambda r: r.entry_ts)
     if not rs_all:

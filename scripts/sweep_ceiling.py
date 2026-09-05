@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import Settings, get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 # The live followed set on the VPS (rescored 2026-07-30 20:59 UTC).
 LEADERS = [
@@ -61,6 +62,10 @@ def main() -> int:
     print(f"=== PRICE-CEILING SWEEP ===  (live ceiling = {s.copy_price_max})", flush=True)
     print(f"fetching {len(LEADERS)} tapes ({TAPE} trades each)…", flush=True)
     tapes = bt.fetch_tapes(LEADERS)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     got = sum(len(v) for v in tapes.values())
     print(f"  {len(tapes)} tapes, {got:,} trades ({time.time()-t0:.0f}s)\n", flush=True)
 

@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import Settings, get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 LEADERS = [
     "0xd487f513cfead22d76b6db4567c756b3cf25053e",
@@ -60,6 +61,10 @@ def main() -> int:
           flush=True)
     print(f"fetching {len(LEADERS)} tapes…", flush=True)
     tapes = bt.fetch_tapes(LEADERS)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     print(f"  {sum(len(v) for v in tapes.values()):,} trades ({time.time()-t0:.0f}s)\n",
           flush=True)
 

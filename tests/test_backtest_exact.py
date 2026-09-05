@@ -342,3 +342,259 @@ def test_resolve_at_override_gives_in_game_trades_a_real_holding_window():
     )
     assert fixed.results[0].closed_by == "stop-loss"
     assert fixed.results[0].pnl > blind.results[0].pnl
+
+
+# --- the live path ---------------------------------------------------------
+#
+# These exist because the sim used to copy a bot that does not exist: it scored
+# the live roster at +11.9% over a month the bot lost 2.9% on. Each test pins
+# one rule of the real path, and the rules are NOT opt-in — they come from the
+# same settings object the live bot reads.
+
+
+def _thin(cid, liq):
+    return Market(market_id=cid, question=cid, closed=True,
+                  end_date=NOW - timedelta(days=1), liquidity_usd=liq)
+
+
+def _at(t, offset=10):
+    return int(t.timestamp.timestamp()) + offset
+
+
+def test_thin_markets_are_skipped_without_being_asked():
+    """The floor comes from settings, so a caller cannot forget it."""
+    res = {"m1": (_thin("m1", 900.0), "tokW")}
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert rep.results == []
+    assert rep.skipped["liquidity"] == 1
+    # Only an explicit zero turns it off, for a deliberate sweep.
+    assert len(_bt(res).simulate(tapes, lookback_days=30, now=NOW,
+                                 min_liquidity=0.0).results) == 1
+
+
+def test_unknown_liquidity_passes_like_live_but_is_counted():
+    """Gamma drops liquidityNum on close, so most resolved markets read None.
+    Live lets those through; the counter is what stops a caller reading
+    'not filtered' as 'checked and fine'."""
+    res = {"m1": (_thin("m1", None), "tokW")}
+    tapes = {"0xlead": [_trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")]}
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW)
+    assert len(rep.results) == 1
+    assert rep.skipped["liquidity_unknown"] == 1
+    assert "liquidity" not in rep.skipped
+
+
+def test_entry_fills_on_the_book_not_the_leaders_print():
+    """The copy lands one poll late, so it pays what the book then shows."""
+    res = {"m1": (_mkt("m1"), "tokW")}
+    t = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")
+    rep = _bt(res).simulate({"0xlead": [t]}, lookback_days=30, now=NOW,
+                            book={"tokW": [(_at(t), 0.52)]}, entry_lag_seconds=10.0)
+    assert rep.results[0].entry_price == pytest.approx(0.52)
+
+
+def test_default_lag_is_the_measured_feed_lag_not_the_poll_interval():
+    """The feed we poll is minutes behind the leader, so the poll interval is
+    not the lag. Every arm of every sweep inherits this default, and at 10s it
+    quoted fills 15x closer to the leader than the bot can reach — so pin it.
+
+    Book has one sample the poll-interval model would have taken (0.52, 10s in)
+    and one the measured model takes (0.58, 150s in)."""
+    res = {"m1": (_mkt("m1"), "tokW")}
+    t = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")
+    book = {"tokW": [(_at(t) + 10, 0.52), (_at(t) + 150, 0.58)]}
+    s = _settings()
+    assert s.copy_feed_lag_seconds + s.poll_interval_seconds == 150.0
+    rep = _bt(res).simulate({"0xlead": [t]}, lookback_days=30, now=NOW, book=book,
+                            max_price_drift=0.0)     # off, so only the lag moves
+    assert rep.results[0].entry_price == pytest.approx(0.58)
+    # And the old model is still reachable for a deliberate comparison.
+    rep10 = _bt(res).simulate({"0xlead": [t]}, lookback_days=30, now=NOW, book=book,
+                              max_price_drift=0.0, entry_lag_seconds=10.0)
+    assert rep10.results[0].entry_price == pytest.approx(0.52)
+
+
+def test_no_book_means_no_trade():
+    """PaperExecutor refuses a copy buy it has no book for. Falling back to the
+    leader's price would grant a perfect fill exactly when we are blind."""
+    res = {"m1": (_mkt("m1"), "tokW")}
+    t = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")
+    stale = _at(t, 5000)                            # past the staleness bound
+    rep = _bt(res).simulate({"0xlead": [t]}, lookback_days=30, now=NOW,
+                            book={"tokW": [(stale, 0.51)]}, entry_lag_seconds=10.0)
+    assert rep.results == []
+    assert rep.skipped["no_book"] == 1
+
+
+def test_price_drift_refuses_an_entry_that_already_moved():
+    res = {"m1": (_mkt("m1"), "tokW")}
+    t = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")
+    moved = {"tokW": [(_at(t), 0.58)]}              # 8c away, budget is 3c
+    rep = _bt(res).simulate({"0xlead": [t]}, lookback_days=30, now=NOW,
+                            book=moved, entry_lag_seconds=10.0)
+    assert rep.results == []
+    assert rep.skipped["price_drift"] == 1
+    # Widen the budget and the same tape is copied at the drifted price.
+    kept = _bt(res).simulate({"0xlead": [t]}, lookback_days=30, now=NOW,
+                             book=moved, entry_lag_seconds=10.0, max_price_drift=0.20)
+    assert kept.results[0].entry_price == pytest.approx(0.58)
+
+
+def test_executor_limit_bites_where_the_drift_guard_does_not():
+    """Live checks drift on the quote, then refuses the FILL if slippage pushes
+    it past leader + budget. A quote sitting just inside the guard therefore
+    still gets refused -- which the guard alone would never do."""
+    res = {"m1": (_mkt("m1"), "tokW")}
+    t = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")
+    inside = {"tokW": [(_at(t), 0.529)]}            # 2.9c drift: inside the 3c guard
+    s = _settings().model_copy(update={"slippage_bps": 60.0})
+    rep = _bt(res).simulate({"0xlead": [t]}, lookback_days=30, now=NOW, settings=s,
+                            slippage_bps=60.0, book=inside, entry_lag_seconds=10.0)
+    assert rep.results == []                        # 0.529 * 1.006 = 0.5322 > 0.53
+    assert "price_drift" not in rep.skipped
+    assert rep.skipped["entry_limit"] == 1
+
+
+def test_exit_without_a_book_rides_to_resolution():
+    """No bid to hit means we could not have sold either, so the tranche
+    settles at the payout rather than at the leader's exit price."""
+    res = {"m1": (_mkt("m1"), "tokW")}
+    buy = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 3, "u1")
+    sell = _trade("m1", "tokW", Side.SELL, 0.40, 1000, 2, "u2")
+    book = {"tokW": [(_at(buy), 0.50)]}             # covers the buy, not the sell
+    rep = _bt(res).simulate({"0xlead": [buy, sell]}, lookback_days=30, now=NOW,
+                            book=book, entry_lag_seconds=10.0)
+    assert rep.skipped["exit_no_book"] == 1
+    assert rep.results[0].closed_by == "resolution"
+
+
+def test_exit_fills_on_the_book_when_there_is_one():
+    res = {"m1": (_mkt("m1"), "tokW")}
+    buy = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 3, "u1")
+    sell = _trade("m1", "tokW", Side.SELL, 0.40, 1000, 2, "u2")
+    book = {"tokW": [(_at(buy), 0.50), (_at(sell), 0.60)]}
+    rep = _bt(res).simulate({"0xlead": [buy, sell]}, lookback_days=30, now=NOW,
+                            book=book, entry_lag_seconds=10.0)
+    assert rep.results[0].closed_by == "leader-exit"
+    # Sold at the book's 0.60, not at the leader's 0.40.
+    assert rep.results[0].pnl == pytest.approx((0.60 - 0.50) * rep.results[0].shares)
+
+
+def test_candidate_entries_cover_what_the_second_pass_needs_prices_for():
+    """Pass 1 must report entries the RiskManager refused too, or pass 2 turns
+    the price filters on for trades it has no prices for."""
+    # Both settle at NOW, so the first entry still holds its exposure when the
+    # second arrives and the per-leader cap has something to bind against.
+    res = {"m1": (_mkt("m1", end_days_ago=0.0), "tokW"),
+           "m2": (_mkt("m2", end_days_ago=0.0), "tokX")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokW", Side.BUY, 0.50, 1000, 2, "u1"),
+        _trade("m2", "tokX", Side.BUY, 0.50, 1000, 1, "u2"),
+    ]}
+    s = _settings().model_copy(update={"max_per_leader_usd": 20.0})   # 2nd is refused
+    rep = _bt(res).simulate(tapes, lookback_days=30, now=NOW, settings=s)
+    assert len(rep.results) == 1
+    assert rep.skipped["bankroll_or_caps"] == 1
+    assert {tok for tok, _ in rep.candidate_entries} == {"tokW", "tokX"}
+
+
+def test_attached_book_is_used_by_later_simulates():
+    """A sweep fetches once and attaches; every arm must then price off it,
+    including helpers that never learned to pass a `book` argument."""
+    res = {"m1": (_mkt("m1"), "tokW")}
+    t = _trade("m1", "tokW", Side.BUY, 0.50, 1000, 1, "u1")
+    bt = _bt(res)
+    assert bt.simulate({"0xlead": [t]}, lookback_days=30,
+                       now=NOW).results[0].entry_price == pytest.approx(0.50)
+    bt.attach_book({"tokW": [(_at(t), 0.52)]})
+    rep = bt.simulate({"0xlead": [t]}, lookback_days=30, now=NOW, entry_lag_seconds=10.0)
+    assert rep.results[0].entry_price == pytest.approx(0.52)
+    # An explicit argument still wins over the attached one.
+    rep2 = bt.simulate({"0xlead": [t]}, lookback_days=30, now=NOW,
+                       entry_lag_seconds=10.0, book={"tokW": [(_at(t), 0.49)]})
+    assert rep2.results[0].entry_price == pytest.approx(0.49)
+
+
+def test_build_book_discovery_ignores_an_attached_book():
+    """Discovery runs at the loosest filters; if it inherited the attached book
+    it would drop every trade that book has no quote for, and the fetch would
+    then never widen past the gaps it already has."""
+    res = {"m1": (_mkt("m1"), "tokW"), "m2": (_mkt("m2"), "tokX")}
+    tapes = {"0xlead": [
+        _trade("m1", "tokW", Side.BUY, 0.50, 1000, 2, "u1"),
+        _trade("m2", "tokX", Side.BUY, 0.50, 1000, 1, "u2"),
+    ]}
+    bt = _bt(res)
+    bt.attach_book({"tokW": [(0, 0.50)]})        # covers one token, badly
+    seen = {}
+
+    def fake_cache_fetch(moments, price_cache, *, cache=None, progress=None, **kw):
+        seen["tokens"] = {tok for tok, _ in moments}
+        return {}
+
+    import pmbot.backtest as bmod
+    real, bmod.fetch_book = bmod.fetch_book, fake_cache_fetch
+    try:
+        bt.build_book(tapes, lookback_days=30, now=NOW)
+    finally:
+        bmod.fetch_book = real
+    assert seen["tokens"] == {"tokW", "tokX"}    # both, not just the quoted one
+    assert bt._book == {"tokW": [(0, 0.50)]}     # and the attachment survives
+
+
+def test_prefetch_markets_warms_the_memo_and_skips_hits():
+    """The replay must find prefetched markets already resolved, and a market
+    already in the memo must not be refetched."""
+    calls = []
+
+    class CountingGamma(FakeGamma):
+        def get_market_with_resolution(self, cid):
+            calls.append(cid)
+            return self._res.get(cid, (None, None))
+
+    res = {c: (_mkt(c), f"tok{c}") for c in ("m1", "m2", "m3")}
+    bt = ExactCopyBacktester(data=None, gamma=CountingGamma(res), settings=_settings())
+    assert bt.prefetch_markets(["m1", "m2", "m2", "m3", ""]) == 3   # deduped, blanks dropped
+    assert sorted(calls) == ["m1", "m2", "m3"]
+    calls.clear()
+    assert bt.prefetch_markets(["m1", "m2"]) == 0                   # all memoized
+    assert calls == []
+    tapes = {"0xlead": [_trade("m1", "tokm1", Side.BUY, 0.50, 1000, 1, "u1")]}
+    assert len(bt.simulate(tapes, lookback_days=30, now=NOW).results) == 1
+    assert calls == []                                              # replay hit the memo
+
+
+def test_prefetch_does_not_memoize_a_failure():
+    """A transient Gamma error must stay unmemoized, or every trade in that
+    market is silently dropped for the rest of the run."""
+    class AngryGamma(FakeGamma):
+        def get_market_with_resolution(self, cid):
+            raise RuntimeError("429 rate limited")
+
+    bt = ExactCopyBacktester(data=None, gamma=AngryGamma({}), settings=_settings())
+    bt.prefetch_markets(["m1"])
+    assert "m1" not in bt._mkt_cache
+
+
+def test_failed_book_fetch_is_not_cached_as_empty():
+    """An empty series means 'no quote', which simulate reads as 'no trade'.
+    Caching a fetch ERROR that way would silently delete real trades from every
+    later run, so a failure must leave the token absent and retryable."""
+    from pmbot.backtest import fetch_book
+
+    class Boom:
+        def get_price_history(self, token, **kw):
+            raise RuntimeError("429")
+
+    cache: dict = {}
+    out = fetch_book([("tokW", NOW)], Boom(), cache=cache, workers=1)
+    assert cache == {}                    # nothing written, so next pass retries
+    assert out == {"tokW": []}            # this pass has no quote for it
+
+    class Fine:
+        def get_price_history(self, token, **kw):
+            return []                     # a genuine empty response IS cached
+
+    fetch_book([("tokW", NOW)], Fine(), cache=cache, workers=1)
+    assert cache == {"tokW": []}

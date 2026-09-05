@@ -33,6 +33,7 @@ from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.data.price_cache import PriceCache
+from scripts._book import shared_book
 
 STOPS = [None, 0.50, 0.40, 0.30, 0.25, 0.20, 0.15, 0.10]
 CACHE = os.environ.get("PMBOT_STOP_CACHE", "/tmp/pmb_stop_prices.json")
@@ -174,6 +175,10 @@ def main(argv: list[str]) -> None:
     t0 = time.time()
     print(f"fetching tapes for {len(leaders)} leaders…", flush=True)
     tapes = bt.fetch_tapes(leaders)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     for w, tape in tapes.items():
         print(f"  {w[:12]}… {len(tape)} trades", flush=True)
 

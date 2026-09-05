@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester, vet_weights
 from pmbot.config import Settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from scripts._book import shared_book
 
 WINDOW_DAYS = 45
 MIN_NOTIONAL = 500.0
@@ -104,6 +105,10 @@ def main(current: list[str]) -> None:
     # --- 3) tune-window vet of candidates + current leaders ----------------
     print("fetching tapes + tune-window backtests…", flush=True)
     tapes = bt.fetch_tapes(list(cur) + cands)
+    # Quote the book once for the whole tape: `simulate` prices every fill
+    # off it and skips what it cannot quote, exactly as the live executor
+    # does. Without this the run fills at the leader's own price.
+    shared_book(bt, tapes)
     tune_pnl: dict[str, tuple[float, float, int]] = {}   # wallet -> (pnl, roi, n)
     for i, w in enumerate(tapes, 1):
         m = sim({w: tapes[w]}, tune_now)

@@ -40,6 +40,7 @@ from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.leaders.config import load_leader_config
 from pmbot.leaders.discovery import harvest_candidates
 from pmbot.leaders.scoring import WalletStats, compute_wallet_stats, passes_filters, rank_wallets
+from scripts._book import shared_book
 
 WINDOW_DAYS = 45
 TOP_N = 8
@@ -82,6 +83,11 @@ def main() -> None:
         if i % 20 == 0:
             print(f"  tapes {i}/{len(ordered)} [{time.time()-t0:.0f}s]", flush=True)
         time.sleep(PACE_S)
+
+    # Quote the book once, now that every tape is in hand and before anything
+    # simulates: `simulate` prices every fill off it and skips what it cannot
+    # quote, as the live executor does.
+    shared_book(bt, tapes)
 
     # -- 3) stats on the 45d slice (resolutions shared with the simulator) --
     def resolver(cid: str):

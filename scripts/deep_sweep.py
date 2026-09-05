@@ -55,6 +55,7 @@ from pmbot.data.resolution_cache import ResolutionStore
 from pmbot.leaders.config import load_leader_config
 from pmbot.leaders.discovery import _shrunk_win_frac, profile_candidates
 from pmbot.leaders.scoring import LeaderSelector, failing_filters, rank_wallets
+from scripts._book import shared_book
 
 LB_API = "https://lb-api.polymarket.com"
 LB_WINDOWS = ("1d", "7d", "30d", "all")
@@ -316,6 +317,10 @@ def main() -> int:
         )
         bt = ExactCopyBacktester(data, gamma, settings=vet_settings, trades_limit=2000)
         tapes = bt.fetch_tapes(vet)
+        # Quote the book once for the whole tape: `simulate` prices every fill
+        # off it and skips what it cannot quote, exactly as the live executor
+        # does. Without this the run fills at the leader's own price.
+        shared_book(bt, tapes)
         _log(f"  fetched {len(tapes)} tapes ({time.time()-t0:.0f}s)")
 
         def sim(sub, when, weights=None):
