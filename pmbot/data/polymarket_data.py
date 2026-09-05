@@ -13,6 +13,7 @@ individual fills, which is exactly what mirroring a leader needs.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,9 +37,14 @@ _RETRYABLE = (httpx.TransportError, httpx.HTTPStatusError)
 class PolymarketDataClient:
     """Thin, typed wrapper over the public Data API."""
 
-    def __init__(self, base_url: str | None = None, client: httpx.Client | None = None):
+    def __init__(self, base_url: str | None = None, client: httpx.Client | None = None,
+                 *, bypass_cache: bool | None = None):
         settings = get_settings()
         self.base_url = (base_url or settings.data_api_base).rstrip("/")
+        # See `copy_bypass_feed_cache`: /trades is served through a 300s CDN
+        # cache, and that cache is measurably the whole of our copy lag.
+        self.bypass_cache = (settings.copy_bypass_feed_cache
+                             if bypass_cache is None else bypass_cache)
         self._client = client or httpx.Client(
             timeout=20.0, headers={"User-Agent": "pmbot/0.1 (+research)"}
         )
@@ -83,6 +89,13 @@ class PolymarketDataClient:
             params["user"] = user
         if market:
             params["market"] = market
+        if self.bypass_cache:
+            # A parameter the API ignores but the CDN keys on, so this request
+            # can only be answered by the origin. Applied to /trades alone —
+            # it is the only endpoint whose staleness costs us anything, and
+            # the others are polled rarely enough for the cache to be a
+            # kindness rather than a tax.
+            params["_"] = uuid.uuid4().hex
         data = self._get("/trades", params)
         return data if isinstance(data, list) else []
 

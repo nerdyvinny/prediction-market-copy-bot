@@ -72,6 +72,39 @@ def test_buy_mirrored_and_filtered():
     led.close()
 
 
+def test_skips_are_counted_by_reason():
+    """The live bot used to refuse a copy silently, so the only thing anyone
+    could compare against the backtester's `skipped` was the trades that got
+    through. Every refusal now lands in one named bucket, once per decision."""
+    markets = {
+        "m_ok": _mkt("m_ok"),
+        "m_closed": _mkt("m_closed", closed=True),
+        "m_thin": _mkt("m_thin", liq=1000),
+    }
+    trades = [
+        _trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "u1"),
+        _trade("m_ok", "tokHI", Side.BUY, 0.98, 100, "u2"),      # price band
+        _trade("m_thin", "tokTHIN", Side.BUY, 0.50, 100, "u3"),  # liquidity
+        _trade("m_closed", "tokCL", Side.BUY, 0.50, 100, "u4"),  # closed
+        _trade("m_ok", "tokGONE", Side.SELL, 0.50, 100, "u5"),   # nothing to sell
+    ]
+    led = Ledger(":memory:")
+    strat = _strategy(trades, markets, led)
+    assert len(list(strat.generate())) == 1
+    # These keys are the backtester's `BacktestReport.skipped` keys on purpose.
+    assert dict(strat.skips) == {
+        "price_band": 1,
+        "liquidity": 1,
+        "market_closed": 1,
+        "exit_no_position": 1,
+    }
+    # A second cycle re-decides nothing: the uids are retired, so the counter
+    # reports what happened THIS cycle rather than accumulating forever.
+    assert list(strat.generate()) == []
+    assert dict(strat.skips) == {}
+    led.close()
+
+
 def test_dedupes_already_copied():
     markets = {"m_ok": _mkt("m_ok")}
     trades = [_trade("m_ok", "tokOK", Side.BUY, 0.50, 100, "dup-uid")]

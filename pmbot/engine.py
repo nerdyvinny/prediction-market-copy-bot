@@ -80,6 +80,12 @@ class Engine:
         # the box had been up a full `settle_interval`, pinning the bankroll of
         # every already-resolved position for up to half an hour.
         self._last_settle: float | None = None
+        # Why the last cycle did not copy things, by reason. Printed with the
+        # cycle line so the live refusal mix can be read against the
+        # backtester's `BacktestReport.skipped` — until now only the sim
+        # reported this, so the two were comparable only on trades that got
+        # through, and never on the ones that did not.
+        self.last_skips: dict[str, int] = {}
 
     # -- roster ----------------------------------------------------------
     def _configured_roster(self) -> list[str]:
@@ -151,18 +157,31 @@ class Engine:
         """
         fills = 0
         n_signals = 0
+        self.last_skips = {}
 
         for sig in self.strategy.generate():
             n_signals += 1
             try:
                 sized = self.risk.size(sig)
                 if sized is None:
+                    self._skipped("risk_rejected")
                     continue
                 if self.executor.execute(sized) is not None:
                     fills += 1
+                else:
+                    # The executor names it: no_book, entry_limit, exit_no_book…
+                    self._skipped(
+                        getattr(self.executor, "last_refusal", None) or "executor_refused")
             except Exception as e:
                 log.warning("poll: failed on %s: %s", sig.token_id[:10], e)
+        # The strategy's own refusals (band, notional, drift, age, …) plus ours.
+        skips = dict(getattr(self.strategy, "skips", {}))
+        skips.update(self.last_skips)
+        self.last_skips = {k: v for k, v in skips.items() if v}
         return fills, n_signals
+
+    def _skipped(self, reason: str) -> None:
+        self.last_skips[reason] = self.last_skips.get(reason, 0) + 1
 
     # -- loop ------------------------------------------------------------
     def run(self, max_cycles: int | None = None) -> None:
@@ -192,9 +211,13 @@ class Engine:
 
                     fills, n = self.poll_once()
                     s = self.ledger.summary()
+                    skips = ("  skipped: " + ", ".join(
+                        f"{k}={v}" for k, v in sorted(
+                            self.last_skips.items(), key=lambda kv: -kv[1]))
+                        if self.last_skips else "")
                     print(f"· cycle {cycle}: {n} signals, {fills} paper fills | "
                           f"open={s['open_positions']} deployed=${s['deployed_usd']:,.0f} "
-                          f"realized=${s['realized_pnl']:,.2f}")
+                          f"realized=${s['realized_pnl']:,.2f}{skips}")
                     errors = 0
                 except Exception as e:
                     errors += 1

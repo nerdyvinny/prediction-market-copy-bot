@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
@@ -149,6 +150,14 @@ class ExactCopyStrategy(Strategy):
         # only). Lets a re-decided exit size off what we observed at the time
         # instead of reconstructing it; see `generate`.
         self._seen_priors: dict[str, float] = {}
+        # Why we did NOT copy something, counted per cycle. The backtester has
+        # reported this for months (`BacktestReport.skipped`) while the live
+        # bot reported nothing, so the two could only ever be compared on the
+        # trades that got through — and the interesting difference is in the
+        # ones that don't. Reset at the top of every `generate()`; the engine
+        # prints it. Only decisions taken THIS cycle are counted: a uid already
+        # in `_processed_uids` returns before any of these.
+        self.skips: Counter[str] = Counter()
         try:
             self.ledger.prune_seen_trades(older_than_days=30.0)
             self._leader_shares = self.ledger.load_leader_positions()
@@ -218,6 +227,10 @@ class ExactCopyStrategy(Strategy):
     ) -> str | None:
         """Why this entry can never be copied, or None if it's still a candidate.
 
+        The codes are deliberately the same strings `simulate` counts in
+        `BacktestReport.skipped`, so a live cycle's refusal mix can be read
+        straight against a backtest's without a translation table.
+
         Every reason here is settled for the life of the trade — the leader's
         price and notional are fixed, a closed market never reopens, and both
         the trade's age and the market's time-to-resolution only move one way —
@@ -227,21 +240,21 @@ class ExactCopyStrategy(Strategy):
         are deliberately NOT decided here.
         """
         if market.closed:
-            return "market closed"
+            return "market_closed"
         if not (self.price_min <= t.price <= self.price_max):
-            return "price outside entry band"     # little edge at the extremes
+            return "price_band"                   # little edge at the extremes
         if t.usd_size < self.min_leader_notional:
-            return "leader notional too small"    # low-conviction probe
+            return "leader_notional"              # low-conviction probe
         if self.max_trade_age_minutes > 0:
             age_min = (now - t.timestamp).total_seconds() / 60.0
             if age_min > self.max_trade_age_minutes:
-                return "trade too old"            # stale history, not a fresh signal
+                return "trade_too_old"            # stale history, not a fresh signal
         if market.liquidity_usd is not None and market.liquidity_usd < self.min_liquidity:
-            return "market too thin"
+            return "liquidity"
         if self.min_hours_to_resolution > 0 and market.end_date is not None:
             hours_left = (market.end_date - now).total_seconds() / 3600
             if hours_left < self.min_hours_to_resolution:
-                return "too close to resolution"  # lag is adverse here
+                return "horizon"                  # lag is adverse here
         return None
 
     @staticmethod
@@ -293,6 +306,7 @@ class ExactCopyStrategy(Strategy):
 
     def generate(self) -> Iterable[Signal]:
         now = datetime.now(timezone.utc)
+        self.skips.clear()
         watchlist = [(w, False) for w in self.leaders]
         watchlist += [(w, True) for w in self.exit_only_leaders]
         for leader, exit_only in watchlist:
@@ -300,6 +314,7 @@ class ExactCopyStrategy(Strategy):
                 trades = self.data.get_trades(user=leader, limit=self.trades_per_leader)
             except Exception as e:
                 log.debug("strategy: trades fetch failed for %s: %s", leader[:10], e)
+                self.skips["tape_fetch_failed"] += 1
                 continue
             # Oldest-first so leader position tracking replays in order.
             ordered = sorted(trades, key=lambda tr: tr.timestamp)
@@ -365,6 +380,7 @@ class ExactCopyStrategy(Strategy):
             return
 
         if exit_only and t.side is Side.BUY:
+            self.skips["exit_only_buy"] += 1
             return                       # exit-only leader: mirror exits, never new entries
 
         if t.side is Side.BUY and t.uid in round_tripped:
@@ -372,6 +388,7 @@ class ExactCopyStrategy(Strategy):
             # entry costs no API call: the leader's exit is history and
             # can never un-happen, so this uid is never copyable.
             self._processed_uids.add(t.uid)
+            self.skips["round_tripped"] += 1
             return
 
         market = self._market(t.market_id)
@@ -381,18 +398,25 @@ class ExactCopyStrategy(Strategy):
             # failure leaves the trade unprocessed so the next cycle
             # retries it instead of skipping it forever.
             if market is None:
+                self.skips["market_lookup_failed"] += 1
                 return
             # Entry-only filters: exits are never blocked by these —
             # mirroring a leader out of a position reduces our risk.
             reason = self._entry_reject_reason(t, market, now)
             if reason is not None:
                 self._processed_uids.add(t.uid)   # settled: never copyable
+                self.skips[reason] += 1
                 return
             drift_ok = self._price_drift_ok(t.token_id, t.price)
             if drift_ok is None:
+                self.skips["quote_unverified"] += 1
                 return         # couldn't verify — transient, retry next cycle
             self._processed_uids.add(t.uid)       # verified: decision is final
             if not drift_ok:
+                # Read this one against the lag: by the time the feed shows us
+                # the trade it is ~150s old (`copy_feed_lag_seconds`), so this
+                # counts prices that moved in those 150s, not in our 10s poll.
+                self.skips["price_drift"] += 1
                 return         # edge already arbitraged away
             yield Signal(
                 market_id=t.market_id,
@@ -411,10 +435,12 @@ class ExactCopyStrategy(Strategy):
             # settlement owns those).
             if market is not None and market.closed:
                 self._processed_uids.add(t.uid)
+                self.skips["exit_market_closed"] += 1
                 return
             our_position = self.ledger.get_position(t.token_id)
             if our_position is None or abs(our_position.shares) <= 1e-9:
                 self._processed_uids.add(t.uid)
+                self.skips["exit_no_position"] += 1
                 return                   # nothing of ours to mirror-sell
             # Only THIS leader's slice is ours to exit. `positions`
             # holds the combined total, so sizing off it let one
@@ -428,6 +454,7 @@ class ExactCopyStrategy(Strategy):
             copied = min(max(0.0, from_leader), held_total)
             if copied <= 1e-9:
                 self._processed_uids.add(t.uid)
+                self.skips["exit_not_from_this_leader"] += 1
                 return                   # we hold this token, but not from them
             # NB: a mirror-exit we yield is deliberately NOT retired
             # here. The RiskManager can still reject it (e.g. the slice

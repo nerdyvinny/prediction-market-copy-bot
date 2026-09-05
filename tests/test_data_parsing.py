@@ -117,3 +117,53 @@ def test_4xx_is_non_retryable_5xx_and_429_are_retryable():
     with pytest.raises(httpx.HTTPStatusError):
         raise_for_status_smart(httpx.Response(429, request=req))
     raise_for_status_smart(httpx.Response(200, request=req))  # no raise
+
+
+class _Response:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+class _RecordingClient:
+    """Captures the params of each request instead of making one."""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls: list[tuple[str, dict]] = []
+
+    def get(self, url, params=None):
+        self.calls.append((url, dict(params or {})))
+        return _Response(self.payload)
+
+
+def test_trades_are_cdn_cached_unless_the_bypass_is_on():
+    """`/trades` is served with cache-control: max-age=300, and that cache is
+    measurably the whole of our copy lag (KS D=0.060 against U(0,300), n=148).
+    The bypass adds a parameter the API ignores and the CDN keys on. It is off
+    by default because bypassing someone else's cache is an operator's call."""
+    http = _RecordingClient([TRADE])
+    off = PolymarketDataClient(client=http, bypass_cache=False)
+    off.get_raw_trades(user="0xlead", limit=25)
+    assert "_" not in http.calls[-1][1]
+
+    on = PolymarketDataClient(client=http, bypass_cache=True)
+    on.get_raw_trades(user="0xlead", limit=25)
+    first = http.calls[-1][1]
+    assert first["_"] and first["user"] == "0xlead" and first["limit"] == 25
+
+    # Unique per request: a fixed value would just seed one more cache entry.
+    on.get_raw_trades(user="0xlead", limit=25)
+    assert http.calls[-1][1]["_"] != first["_"]
+
+    # Only /trades. The other endpoints are polled rarely enough that the
+    # cache costs us nothing, so there is no reason to push load to origin.
+    on.get_positions("0xlead")
+    assert "_" not in http.calls[-1][1]
