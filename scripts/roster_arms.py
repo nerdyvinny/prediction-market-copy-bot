@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from pmbot.leaders import load_leader_config
 from scripts._book import shared_book
 
 BANKROLL = 500.0
@@ -45,16 +46,11 @@ _TMP = os.environ.get("TEMP", "/tmp")
 TAPE_CACHE = os.path.join(_TMP, "pmb_lb_tapes.pkl")
 MKT_CACHE = os.path.join(_TMP, "pmb_lb_markets.pkl")
 
-CURRENT = [
-    "0xcae693bcf9696a2ebf0a62de767719b45f354f85",
-    "0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33",
-    "0xd487f513cfead22d76b6db4567c756b3cf25053e",
-    "0x455e565fdaa9c4d106e1aebd557b8443925af7f9",
-    "0x9cdda449d7cedf1072d74982a5dc2349df3d3e97",
-    "0x61171892acad4064e139ca4fcb6ce3321a362faf",
-    "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21",
-    "0xff81cc85838ce8f91a7d4ae2eeddadfa3f8444c9",
-]
+# The control arm must be the lineup the bot is actually running, so it is read
+# from leaders.yaml rather than pinned. It used to be pinned, and by 2026-09-13
+# the pin was the 8 wallets of the morning of 2026-09-02 -- the arm labelled
+# "current" was a lineup that had been replaced the same day it was written.
+CURRENT = [w.lower() for w in load_leader_config().roster]
 
 
 def peak_concurrent(results) -> float:
@@ -73,6 +69,14 @@ def peak_concurrent(results) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=90)
+    ap.add_argument("--candidates", default="",
+                    help="JSON from scripts.census_strict (default: the file "
+                         "it writes). These are the wallets that cleared the "
+                         "strict bar; arms are built from them.")
+    ap.add_argument("--per-candidate", type=int, default=4,
+                    help="also run LIVE+<wallet> for this many top candidates, "
+                         "which is the only arm that isolates one wallet's "
+                         "contribution to the lineup we actually run")
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
@@ -82,81 +86,65 @@ def main() -> int:
         "copy_price_min": BAND[0], "copy_price_max": BAND[1],
         "copy_min_leader_notional_usd": MIN_LEADER_NOTIONAL, "slippage_bps": SLIPPAGE_BPS,
     })
+    cand_path = args.candidates or os.path.join(_TMP, "pmb_strict.json")
+    try:
+        cands = json.load(open(cand_path))
+    except (OSError, ValueError):
+        print(f"no candidate file at {cand_path} — run scripts.census_strict first")
+        return 1
     tapes = pickle.load(open(TAPE_CACHE, "rb"))
-    kept = {c["w"]: c for c in json.load(open(os.path.join(_TMP, "pmb_top25.json")))}
+    kept = {c["w"]: c for c in cands}
 
-    # Every wallet that cleared the strict bar: positive in all three windows AND
-    # in both non-overlapping slices. Sorted by the shrunk score so "top k" means
-    # something consistent.
-    strict = sorted(
-        (c for c in kept.values()
-         if c["mid"] is not None and c["old"] is not None
-         and c["mid"] > 0 and c["old"] > 0 and c["n90"] >= 50),
-        key=lambda c: -c["shrunk"],
-    )
+    # `census_strict` already applied the bar and ordered by the shrunk score,
+    # so this reads the list rather than re-deriving it. Anything that needs a
+    # different bar belongs in that script, where the bar is documented.
+    strict = sorted(kept.values(), key=lambda c: -c["shrunk"])
     strict_w = [c["w"] for c in strict]
-    keepers = ["0xcae693bcf9696a2ebf0a62de767719b45f354f85",
-               "0x61171892acad4064e139ca4fcb6ce3321a362faf",
-               "0xd487f513cfead22d76b6db4567c756b3cf25053e",
-               "0x9cdda449d7cedf1072d74982a5dc2349df3d3e97"]
+    evidence_w = [c["w"] for c in strict if c["n90"] >= 100]
+    print(f"{len(strict)} candidates cleared the bar; "
+          f"{len(evidence_w)} of them on 100+ closed copies")
 
     def dedupe(ws):
         return list(dict.fromkeys(ws))
 
+    # The arms answer three separate questions and are labelled by which:
+    #   SIZE      -- how many leaders can the one bankroll carry (the 2026-09-02
+    #                finding was monotone: fewer is better, and peak concurrent
+    #                capital climbs past the $500 well before ROI stops falling)
+    #   SWAP      -- does any candidate improve the lineup we actually run
+    #   ISOLATE   -- what does ONE candidate add to the live roster, which is
+    #                the only arm that separates roster contribution from solo
+    #                quality (a wallet with the best solo estimate we had cost
+    #                6.8pp of roster ROI by crowding the bankroll)
     arms = {
-        "current 8": CURRENT,
-        "proposed 7 (2 out, 1 in)": dedupe(
-            [w for w in CURRENT
-             if w not in ("0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33",
-                          "0x455e565fdaa9c4d106e1aebd557b8443925af7f9")]
-            + ["0xf28e42d20e4826f2b10a24bc952001697947cab2"]),
-        "strict top 3": dedupe(strict_w[:3]),
-        "strict top 5": dedupe(strict_w[:5]),
-        "strict top 8": dedupe(strict_w[:8]),
-        "strict top 12": dedupe(strict_w[:12]),
-        "strict ALL": dedupe(strict_w),
-        "strict ALL + keepers": dedupe(strict_w + keepers),
-        # Built on EVIDENCE rather than score: the strict-bar wallets whose
-        # estimates rest on 100+ closed copies. Same bar, but every member's
-        # number is one you can believe.
-        "high-evidence top 3": dedupe([c["w"] for c in strict if c["n90"] >= 100][:3]),
-        "high-evidence top 5": dedupe([c["w"] for c in strict if c["n90"] >= 100][:5]),
-        "high-evidence top 8": dedupe([c["w"] for c in strict if c["n90"] >= 100][:8]),
-        # The recommendation: small (the size effect above is monotone under two
-        # independent selection rules), every member on 100+ closed copies so
-        # the estimate is believable, and every member positive in BOTH
-        # non-overlapping slices rather than on one hot streak.
-        "FINAL 4": [
-            "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21",   # HongYunX
-            "0xf28e42d20e4826f2b10a24bc952001697947cab2",
-            "0xe015b5a2a299167be835a2fd1e86f09c49e06ffd",   # TAIWANNUMBERONE
-            "0xff81cc85838ce8f91a7d4ae2eeddadfa3f8444c9",
-        ],
-        "FINAL 4 minus ff81cc85": [
-            "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21",
-            "0xf28e42d20e4826f2b10a24bc952001697947cab2",
-            "0xe015b5a2a299167be835a2fd1e86f09c49e06ffd",
-        ],
-        "RECOMMENDED 5": [
-            "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21",   # HongYunX
-            "0xe015b5a2a299167be835a2fd1e86f09c49e06ffd",   # TAIWANNUMBERONE
-            "0x0353aaf82abbd3e69c00059df0a825bc198fc2ff",   # AGUGava
-            "0xf28e42d20e4826f2b10a24bc952001697947cab2",
-            "0xff81cc85838ce8f91a7d4ae2eeddadfa3f8444c9",
-        ],
-        "RECOMMENDED 5 + cae693bc": [
-            "0xc72d7dcdb23597d143a83536fb97b1d7db7efc21",
-            "0xe015b5a2a299167be835a2fd1e86f09c49e06ffd",
-            "0x0353aaf82abbd3e69c00059df0a825bc198fc2ff",
-            "0xf28e42d20e4826f2b10a24bc952001697947cab2",
-            "0xff81cc85838ce8f91a7d4ae2eeddadfa3f8444c9",
-            "0xcae693bcf9696a2ebf0a62de767719b45f354f85",
-        ],
-        "top3 score + top3 evidence": dedupe(
-            strict_w[:3] + [c["w"] for c in strict if c["n90"] >= 100][:3]),
+        f"LIVE roster ({len(CURRENT)})": CURRENT,                      # control
     }
+    for k in (1, 2, 3, 5, 8):
+        if len(strict_w) >= k:
+            arms[f"SIZE: strict top {k}"] = dedupe(strict_w[:k])
+    for k in (3, 5):
+        if len(evidence_w) >= k:
+            arms[f"SIZE: high-evidence top {k}"] = dedupe(evidence_w[:k])
+    new_w = [w for w in strict_w if w not in set(CURRENT)]
+    for k in (1, 2, 3):
+        if len(new_w) >= k:
+            arms[f"SWAP: LIVE + top {k} new"] = dedupe(CURRENT + new_w[:k])
+    for w in new_w[:max(args.per_candidate, 0)]:
+        c = kept[w]
+        label = f"ISOLATE: LIVE + {w[:10]} ({c['r90']:+.0f}%/n{c['n90']})"
+        arms[label] = dedupe(CURRENT + [w])
+    # Dropping each incumbent in turn: a seat is only worth holding if the
+    # lineup is worse without it.
+    for w in CURRENT:
+        if len(CURRENT) > 1:
+            arms[f"DROP: LIVE minus {w[:10]}"] = [x for x in CURRENT if x != w]
 
-    data, gamma = PolymarketDataClient(), GammaClient()
+    # Research reads HISTORY, so the CDN's cached copy is exactly as good as
+    # the origin's and costs them nothing. `copy_bypass_feed_cache` is a live
+    # copy-path setting (it buys the bot seconds on a trade it is about to
+    # mirror); inherited here it would only push a whole sweep -- thousands of
+    # wallets -- through someone else's origin for no gain.
+    data, gamma = PolymarketDataClient(bypass_cache=False), GammaClient()
     bt = ExactCopyBacktester(data, gamma, s, slippage_bps=SLIPPAGE_BPS, trades_limit=3000)
     if os.path.exists(MKT_CACHE):
         with open(MKT_CACHE, "rb") as fh:
@@ -200,7 +188,7 @@ def main() -> int:
         print("members:")
         for w in best[1]:
             c = kept.get(w)
-            tag = "  (current roster)" if w in CURRENT else ""
+            tag = "  (live roster)" if w in CURRENT else ""
             extra = (f"  90d {c['r90']:+.1f}% n={c['n90']}" if c else "")
             print(f"  {w}{extra}{tag}")
     return 0

@@ -56,6 +56,7 @@ import httpx
 from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
+from pmbot.leaders import load_leader_config
 from scripts._book import shared_book
 
 # Live VPS settings, read 2026-08-30. The liquidity floor, drift budget and
@@ -70,15 +71,12 @@ MIN_LEADER_NOTIONAL = 150.0
 SLIPPAGE_BPS = 60.0
 BOOK_STALENESS = 180.0
 
-ROSTER = [
-    "0xcae693bcf9696a2ebf0a62de767719b45f354f85",
-    "0x5cd5c8d7a17c78d7389d8b87b611aed83322ac33",
-    "0xd487f513cfead22d76b6db4567c756b3cf25053e",
-    "0x455e565fdaa9c4d106e1aebd557b8443925af7f9",
-    "0xc23dc0eca9e1c2e293de8911b9ac254f0bcd82c8",
-    "0x9cdda449d7cedf1072d74982a5dc2349df3d3e97",
-    "0x61171892acad4064e139ca4fcb6ce3321a362faf",
-]
+# Read from leaders.yaml, never pinned here: since the static roster shipped
+# (2026-08-30) that file IS the deployed lineup, so a hardcoded copy can only
+# ever go stale -- and had. This list was still the 7 wallets of 2026-08-30,
+# two roster changes later, which silently made the census control arm a
+# lineup the bot has not traded since. Same fix as `backtest_current.py`.
+ROSTER = [w.lower() for w in load_leader_config().roster]
 
 LB_API = "https://lb-api.polymarket.com"
 LB_WINDOWS = ("1d", "7d", "30d", "all")
@@ -95,11 +93,21 @@ def out_json(days: int) -> str:
 
 def done_cache(days: int) -> str:
     return os.path.join(_TMP, f"pmb_census_done_{days}d.json")
-# wallet -> copyable count, for every wallet ever screened. Tiny, and it
-# stops a re-run refetching the ~90% that will never be worth scoring.
-# NOT window-keyed: it only gates the tape FETCH, and the fetch is the same
-# tape whatever window we later score it over.
-SCREEN_CACHE = os.path.join(_TMP, "pmb_census_screen.json")
+# wallet -> copyable count in the SCREEN window, for every wallet ever
+# screened. Tiny, and it stops a re-run refetching the ~90% that will never be
+# worth scoring.
+#
+# This used to be one un-keyed file, on the reasoning that it "only gates the
+# tape FETCH, and the fetch is the same tape whatever window we later score it
+# over". That reasoning is wrong, and quietly so: the fetch is window-blind but
+# the KEEP/DISCARD decision is not. Screening at 30 days threw away the tape of
+# every wallet quiet in the last month, and a later 90-day run then skipped
+# them as "already screened out" -- so the 90-day census silently scored only
+# wallets active in the last 30 days, which is not the population it claims to
+# measure. Keyed by the screen window, a 90-day screen serves the 30- and
+# 60-day runs too, because its kept set is a superset of theirs.
+def screen_cache(days: int) -> str:
+    return os.path.join(_TMP, f"pmb_census_screen_{days}d.json")
 
 
 def _log(m: str) -> None:
@@ -193,7 +201,23 @@ def main() -> int:
     ap.add_argument("--db", action="store_true", help="also pool the local ledger")
     ap.add_argument("--pool-cached", action="store_true",
                     help="also pool every wallet whose tape is already held")
-    ap.add_argument("--min-copyable", type=int, default=5)
+    ap.add_argument("--min-copyable", type=int, default=5,
+                    help="a wallet needs this many copyable BUYs inside the "
+                         "SCORED window to be worth the Gamma + CLOB spend")
+    ap.add_argument("--only", default="",
+                    help="JSON list of wallets to score, INSTEAD of building a "
+                         "pool. The three windows must score the SAME set: a "
+                         "wallet absent from one window reads as a missing "
+                         "window in census_strict and fails the bar silently, "
+                         "and --feeds resamples live markets so each run would "
+                         "otherwise pool a slightly different universe.")
+    ap.add_argument("--screen-days", type=int, default=0,
+                    help="window used to decide whether to KEEP a fetched tape "
+                         "(default: --days). Set this to the longest window you "
+                         "intend to score so one fetch pass serves them all.")
+    ap.add_argument("--screen-min-copyable", type=int, default=0,
+                    help="copyable BUYs required in --screen-days to keep a "
+                         "tape (default: --min-copyable)")
     ap.add_argument("--max-wallets", type=int, default=0, help="0 = no cap")
     ap.add_argument("--trades-limit", type=int, default=2000)
     ap.add_argument("--restart", action="store_true",
@@ -203,8 +227,12 @@ def main() -> int:
     args = ap.parse_args()
 
     OUT, DONE = out_json(args.days), done_cache(args.days)
+    screen_days = args.screen_days or args.days
+    screen_min = args.screen_min_copyable or args.min_copyable
+    SCREEN_CACHE = screen_cache(screen_days)
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=args.days)
+    screen_cutoff = now - timedelta(days=screen_days)
     s = get_settings().model_copy(update={
         "bankroll_usd": BANKROLL, "copy_fraction": COPY_FRACTION,
         "max_per_market_pct": MAX_PER_MARKET_PCT, "max_per_leader_usd": MAX_PER_LEADER,
@@ -215,12 +243,19 @@ def main() -> int:
     _log("=" * 112)
     _log(f"WALLET CENSUS -- every wallet scored alone, live path, "
          f"{cutoff:%Y-%m-%d} .. {now:%Y-%m-%d}")
+    _log(f"screen: keep a tape on >= {screen_min} copyable BUYs in "
+         f"{screen_days}d; score it on >= {args.min_copyable} in {args.days}d")
     _log(f"each gets the full ${BANKROLL:,.0f} | copy {COPY_FRACTION:.0%} | "
          f"cap {MAX_PER_MARKET_PCT:.0%} | band {BAND[0]}-{BAND[1]} | "
          f"floor ${MIN_LEADER_NOTIONAL:,.0f} | slip {SLIPPAGE_BPS:.0f}bps")
     _log("=" * 112)
 
-    data, gamma = PolymarketDataClient(), GammaClient()
+    # Research reads HISTORY, so the CDN's cached copy is exactly as good as
+    # the origin's and costs them nothing. `copy_bypass_feed_cache` is a live
+    # copy-path setting (it buys the bot seconds on a trade it is about to
+    # mirror); inherited here it would only push a whole sweep -- thousands of
+    # wallets -- through someone else's origin for no gain.
+    data, gamma = PolymarketDataClient(bypass_cache=False), GammaClient()
     bt = ExactCopyBacktester(data, gamma, s, slippage_bps=SLIPPAGE_BPS,
                              trades_limit=args.trades_limit)
     if os.path.exists(MKT_CACHE):
@@ -229,13 +264,20 @@ def main() -> int:
         _log(f"markets: {len(bt._mkt_cache)} resolutions restored")
 
     _log("\n[1/4] building the pool")
-    names = pool_leaderboard()
-    pool = set(names)
-    if args.feeds:
+    names: dict[str, str] = {}
+    if args.only:
+        with open(args.only) as fh:
+            pool = {str(w).lower() for w in json.load(fh)}
+        _log(f"  --only: {len(pool)} wallets from {args.only}; "
+             f"no leaderboard, feed or ledger sweep")
+    else:
+        names = pool_leaderboard()
+        pool = set(names)
+    if not args.only and args.feeds:
         pool |= pool_feeds(data, gamma, markets=args.feeds, per_market=args.per_market)
-    if args.db:
+    if not args.only and args.db:
         pool |= pool_db(s.db_path)
-    if args.pool_cached and os.path.exists(TAPE_CACHE):
+    if not args.only and args.pool_cached and os.path.exists(TAPE_CACHE):
         # Everything a previous run already fetched AND kept, without paying
         # for another feed sweep. The tape cache holds exactly the wallets that
         # passed the screen, so this is free breadth.
@@ -243,7 +285,7 @@ def main() -> int:
             held = set(pickle.load(fh))
         _log(f"  cached tapes: {len(held)} wallets already fetched")
         pool |= held
-    pool |= {w.lower() for w in ROSTER}
+    pool |= {w.lower() for w in ROSTER}      # the control arm, always scored
     pool = sorted(pool)
     _log(f"  pool: {len(pool)} unique wallets")
 
@@ -274,9 +316,9 @@ def main() -> int:
     for i in range(0, len(todo), 50):
         batch = bt.fetch_tapes(todo[i:i + 50])
         for w, tape in batch.items():
-            c = copyable_count(tape, cutoff)
+            c = copyable_count(tape, screen_cutoff)
             screened[w] = c
-            if c >= args.min_copyable:
+            if c >= screen_min:
                 tapes[w] = tape                # worth the Gamma + CLOB spend
                 kept_new += 1
         if (i // 50) % 10 == 9 or i + 50 >= len(todo):
@@ -292,17 +334,23 @@ def main() -> int:
 
     for w in pool:
         if w in tapes and w not in screened:
-            screened[w] = copyable_count(tapes[w], cutoff)
+            screened[w] = copyable_count(tapes[w], screen_cutoff)
+    # The screen decided which tapes are worth holding; the SCORED window
+    # decides which of those are worth replaying, and it is recomputed here
+    # rather than read from the screen cache -- they are different windows
+    # whenever --screen-days is wider than --days.
     scored_pool = sorted(
-        ((screened.get(w, 0), w) for w in pool
-         if w in tapes and screened.get(w, 0) >= args.min_copyable),
+        ((copyable_count(tapes[w], cutoff), w) for w in pool if w in tapes),
         reverse=True,
     )
+    scored_pool = [(c, w) for c, w in scored_pool if c >= args.min_copyable]
     if args.max_wallets:
         scored_pool = scored_pool[:args.max_wallets]
     keep = [w for _, w in scored_pool]
-    _log(f"\n  {len(keep)} of {len(pool)} wallets have >= {args.min_copyable} "
-         f"copyable BUYs ({len(pool) - len(keep)} dropped before any API spend)")
+    _log(f"\n  {len(tapes)} tapes kept by the {screen_days}d screen "
+         f"(>= {screen_min} copyable BUYs); {len(keep)} of those clear "
+         f">= {args.min_copyable} inside the {args.days}d SCORED window "
+         f"({len(pool) - len(keep)} of {len(pool)} dropped before any API spend)")
 
     results = []
     if os.path.exists(OUT) and not args.restart:

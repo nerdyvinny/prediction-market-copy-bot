@@ -15,11 +15,64 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 CACHE = os.environ.get(
     "PMBOT_BOOK_CACHE",
     os.path.join(os.environ.get("TEMP", "/tmp"), "pmb_book.json"),
 )
+
+
+def tmp_path(dest: str) -> str:
+    """A scratch name only this process will use.
+
+    Every script in here shares one cache path, and they are meant to be run
+    together -- a census scoring in one terminal while a sweep reads the same
+    quotes in another. With a single fixed `<cache>.tmp`, the second writer
+    replaces the first writer's scratch file and the first then dies on a
+    vanished path. That is not a rare race: it killed a census 24 minutes into
+    a retry, purely because another script ran alongside it.
+
+    Per-process temp names remove the collision. The final `os.replace` is
+    still last-writer-wins, which is correct for a cache -- both copies are
+    supersets of what they started from, so the loser's new quotes are simply
+    refetched next time.
+    """
+    return f"{dest}.{os.getpid()}.tmp"
+
+
+def atomic_replace(tmp: str, dest: str) -> bool:
+    """Persist the cache, tolerating Windows' non-atomic reality.
+
+    `os.replace` onto an existing path raises WinError 32 whenever anything
+    else has the target open even for reading -- an indexer or a virus scanner
+    walking TEMP is enough, and this file is tens of megabytes by the end of a
+    census, so the scan window is wide. It killed a 90-day census four hours
+    in, on chunk five of forty-five, having already fetched every tape.
+
+    A cache write is not worth losing a run over: retry a few times, and if the
+    file still will not move, keep the quotes in memory and carry on. The next
+    chunk re-fetches only what this one could not save.
+
+    FileNotFoundError means the temp file is already gone -- another process
+    replaced it out from under us (see `tmp_path`). Same conclusion: this
+    write is lost, the cache still holds someone's good copy, carry on.
+    """
+    for attempt in range(6):
+        try:
+            os.replace(tmp, dest)
+            return True
+        except FileNotFoundError:
+            return False
+        except PermissionError:
+            time.sleep(0.5 * 2 ** attempt)      # 0.5s .. 16s, ~31s in total
+    print(f"  cache: could not replace {dest} after 6 tries; "
+          f"continuing with the in-memory copy", flush=True)
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    return False
 
 
 def shared_book(bt, tapes, *, attach: bool = True, quiet: bool = False, **kw):
@@ -50,10 +103,10 @@ def shared_book(bt, tapes, *, attach: bool = True, quiet: bool = False, **kw):
 
     book = bt.build_book(tapes, book_cache=cache, progress=progress, **kw)
     if len(cache) != before:
-        tmp = CACHE + ".tmp"
+        tmp = tmp_path(CACHE)
         with open(tmp, "w") as fh:
             json.dump(cache, fh)
-        os.replace(tmp, CACHE)
+        atomic_replace(tmp, CACHE)
     if not quiet:
         quoted = sum(1 for v in book.values() if v)
         print(f"book: {len(book)} tokens, {quoted} quoted "

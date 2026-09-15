@@ -33,10 +33,16 @@ from pmbot.backtest import ExactCopyBacktester
 from pmbot.config import get_settings
 from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.data.price_cache import PriceCache
-from scripts._book import shared_book
+from scripts._book import atomic_replace, shared_book, tmp_path
 
 STOPS = [None, 0.50, 0.40, 0.30, 0.25, 0.20, 0.15, 0.10]
-CACHE = os.environ.get("PMBOT_STOP_CACHE", "/tmp/pmb_stop_prices.json")
+# Every other script here derives its cache from TEMP; this one hardcoded a
+# POSIX path, so on Windows it resolved to C:	mp and every caller that
+# reaches `fetch_series` (including `backtest_current`) died on the write.
+CACHE = os.environ.get(
+    "PMBOT_STOP_CACHE",
+    os.path.join(os.environ.get("TEMP", "/tmp"), "pmb_stop_prices.json"),
+)
 
 
 def followed_leaders(db_path: str) -> list[str]:
@@ -56,10 +62,10 @@ def load_cache() -> dict:
 
 
 def save_cache(c: dict) -> None:
-    tmp = CACHE + ".tmp"
+    tmp = tmp_path(CACHE)          # see scripts/_book: shared TEMP, many scripts
     with open(tmp, "w") as fh:
         json.dump(c, fh)
-    os.replace(tmp, CACHE)
+    atomic_replace(tmp, CACHE)
 
 
 MAX_HOLD_DAYS = 14          # forward window to look for the real resolution

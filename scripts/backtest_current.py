@@ -96,7 +96,12 @@ def main() -> int:
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=args.days)
 
-    data = PolymarketDataClient()
+    # Research reads HISTORY, so the CDN's cached copy is exactly as good as
+    # the origin's and costs them nothing. `copy_bypass_feed_cache` is a live
+    # copy-path setting (it buys the bot seconds on a trade it is about to
+    # mirror); inherited here it would only push a whole sweep -- thousands of
+    # wallets -- through someone else's origin for no gain.
+    data = PolymarketDataClient(bypass_cache=False)
     gamma = GammaClient()
     bt = ExactCopyBacktester(data, gamma, s, slippage_bps=SLIPPAGE_BPS, trades_limit=3000)
 
