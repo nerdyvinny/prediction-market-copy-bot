@@ -61,6 +61,57 @@ roster:
   - "0xf28e42d20e4826f2b10a24bc952001697947cab2"   # +13.4%/151, slices +9.6/+13.8, 265d tape (longest)
   - "0xe015b5a2a299167be835a2fd1e86f09c49e06ffd"   # TAIWANNUMBERONE: +9.8%/230, slices +9.8/+25.9, 210d
 
+  # ADDED 2026-09-15 from a fresh three-window census (9,463 wallets screened,
+  # 574 with enough copyable tape to judge, each replayed alone on the live
+  # path at the measured 150s copy lag).
+  #
+  #   +14.4% / +22.8% / +21.1% over 30/60/90d on 83 closed copies
+  #   slices +36.3% (days 30-60) and +11.7% (days 60-90), 101 days of tape
+  #
+  # It is here on THREE separate tests, not on the headline number:
+  #   * the strict bar -- positive in every window and both non-overlapping
+  #     slices, on tape that genuinely reaches back into each of them;
+  #   * the lineup test -- adding it to this roster is worth +21.1% marginal
+  #     ROI, second only to HongYunX, and takes peak concurrent capital from
+  #     $75 to $90 of the $500 (see scripts/roster_arms.py);
+  #   * the hold-time screen -- median hold 4.3h, p90 23h, and ZERO dollars
+  #     in positions open longer than a week. That last one is a safety test,
+  #     not a return test: on 2026-09-03 long-dated positions left the free
+  #     bankroll at -$0.45 and the bot refused every entry for eight days
+  #     while logging healthy cycles (see scripts/candidate_horizon.py).
+  #
+  # The number is still IN-SAMPLE -- it was chosen by the same 90 days that
+  # score it -- so treat +21% as "passed the rule", never as a forecast. The
+  # population it came from has no edge at all: 545 wallets, 49.7% profitable,
+  # mean -0.42%, t=-0.30. Judge this seat on the window AFTER today.
+  - "0x73e3fec494611d73c170cb2f23850fd998b21be9"   # +21.1%/83 copies, slices +36.3/+11.7, 101d tape
+
+  # CONSIDERED AND REJECTED on the same run, worth recording because the
+  # rejections are the useful part:
+  #
+  #   0x4873713d49  +13.9% on 185 copies -- the largest sample in the search,
+  #                 and it was very nearly added. Its tape spans 49 DAYS and
+  #                 holds nothing between 60 and 90 days ago, so its "+19.3%
+  #                 over days 60-90" was never a slice at all: the 90-day run
+  #                 simply quoted more of the SAME trades than the 60-day run
+  #                 did, and subtracting the two turned that coverage gap into
+  #                 fake out-of-sample evidence. census_strict now checks each
+  #                 slice against the raw tape; this dropped the survivors of
+  #                 that run from 12 to 8. 0x7b3193adf8 was the same fault.
+  #   0xb3cfe7615d  +37.8%, the highest-scoring wallet found. Holds positions
+  #                 up to 702h (29 days) -- the exact profile that deadlocked
+  #                 the account. Score and safety disagreed; safety won.
+  #   0x60a92c8620  +20.4% with 50% of its dollars locked beyond a week.
+  #   0x98d04f9eb5  +18.7%, 25% locked beyond a week.
+  #   0x67b03b38b1  +15.4%, 12.5% locked beyond a week.
+  #   0xed08d59722   +8.5% and hold-time clean, but on 55 copies with a
+  #                 +168% middle slice -- a thin window, not an edge.
+  #
+  # NOT dropped, though both failed the bar this run: 0xf28e42d2 failed on a
+  # days-30-60 slice of FIVE trades and 0xe015b5a2 on one of EIGHT. Both still
+  # contribute positive dollars. Five trades tests nothing, and churning a
+  # seat on that is what the static roster exists to prevent.
+
   # DROPPED 2026-09-02, with reasons:
   #   0x5cd5c8d7a1  -13.7% over 90d. The old allowlist pin; no longer earns it.
   #   0x455e565fda   -6.1%, negative at both 60 and 90 days.
