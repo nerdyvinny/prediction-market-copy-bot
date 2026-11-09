@@ -167,3 +167,163 @@ def test_trades_are_cdn_cached_unless_the_bypass_is_on():
     # cache costs us nothing, so there is no reason to push load to origin.
     on.get_positions("0xlead")
     assert "_" not in http.calls[-1][1]
+
+
+# --- Data API v2 (v1 retired 2026-11-02 and answers 410 on every route) ----
+# A real /v2/trades row (trimmed).
+TRADE_V2 = {
+    "proxy_wallet": "0xc7681a3b05052fdb3ec737bf6a6cfe175e1efdbf",
+    "side": "BUY",
+    "token_id": "3028730761916982946156889971869341610476256386836911451297450809391475011255",
+    "condition_id": "0x6016a045cd1d6f5201f00b0cd09a1c8bbf9991c020bf850f6425e6525b6ccf8e",
+    "size": 94.8208,
+    "price": 0.9753132646,
+    "timestamp": 1794248613,
+    "slug": "eth-updown-5m-1794248400",
+    "event_slug": "",
+    "outcome": "Down",
+    "transaction_hash": "0x6e7a47d6f05f04ada619c4109745fceffd2e4b77ee80fad2ff9b4229dc593468",
+}
+
+# A real /v2/positions row (trimmed).
+POSITION_V2 = {
+    "proxy_wallet": "0xc69bd5567b40ef4d11922eaa57e1f9be1c642076",
+    "token_id": "15907269680083135091620869613557617263613890890387514554477997501123964677519",
+    "condition_id": "0x98c266979031b3ee6c87ea5b8b671be0e242e13f9be4c123ff2c21ef46ff62c3",
+    "current_size": 138740.278,
+    "avg_price": 0.3362,
+    "current_price": 0.625,
+    "current_value": 86712.6737,
+    "unrealized_pnl": 40056.3059,
+    "percent_pnl": 85.8538,
+    "redeemable": False,
+    "title": "Will Gen.G win Worlds 2026?",
+    "slug": "will-genptg-win-worlds-2026",
+    "event_slug": "worlds-2026-winner",
+    "outcome": "Yes",
+    "end_date": "2026-11-29",
+}
+
+
+class _PagedClient:
+    """Serves a fixed list of v2 trade rows through cursor pages."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls: list[dict] = []
+
+    def get(self, url, params=None):
+        params = dict(params or {})
+        self.calls.append(params)
+        start = int(params.get("cursor", 0))
+        end = start + int(params["limit"])
+        page = self.rows[start:end]
+        more = end < len(self.rows)
+        return _Response({
+            "data": page,
+            "pagination": {"has_more": more, "next_cursor": str(end) if more else None},
+        })
+
+
+def test_v2_trade_row_parses_like_a_v1_row():
+    t = PolymarketDataClient._parse_trade(TRADE_V2)
+    assert t.leader == TRADE_V2["proxy_wallet"]
+    assert t.token_id == TRADE_V2["token_id"]          # was `asset` in v1
+    assert t.market_id == TRADE_V2["condition_id"]
+    assert t.side is Side.BUY and t.shares == 94.8208
+    assert t.uid == TRADE_V2["transaction_hash"]
+    assert t.event_slug is None                          # v2 sends "" for none
+
+
+def test_raw_trades_unwrap_the_envelope_and_carry_v1_keys():
+    http = _PagedClient([TRADE_V2])
+    raw = PolymarketDataClient(client=http, bypass_cache=False).get_raw_trades(user="0xlead")
+    assert len(raw) == 1
+    row = raw[0]
+    assert row["proxyWallet"] == TRADE_V2["proxy_wallet"]
+    assert row["asset"] == TRADE_V2["token_id"]
+    assert row["conditionId"] == TRADE_V2["condition_id"]
+    assert row["token_id"] == TRADE_V2["token_id"]       # v2 keys kept too
+    assert "offset" not in http.calls[-1]                # v2 answers 400 to it
+    assert "cursor" not in http.calls[-1]                # and to an empty cursor
+
+
+def test_market_filter_is_sent_as_condition():
+    http = _PagedClient([])
+    PolymarketDataClient(client=http, bypass_cache=False).get_raw_trades(market="0xcid")
+    assert http.calls[-1]["condition"] == "0xcid" and "market" not in http.calls[-1]
+
+
+def test_sequential_offset_paging_costs_one_request_per_page():
+    rows = [dict(TRADE_V2, transaction_hash=f"0x{i}") for i in range(10)]
+    http = _PagedClient(rows)
+    client = PolymarketDataClient(client=http, bypass_cache=False)
+    got = []
+    for offset in (0, 4, 8):
+        got += client.get_raw_trades(user="0xlead", limit=4, offset=offset)
+    assert [r["transactionHash"] for r in got] == [f"0x{i}" for i in range(10)]
+    assert len(http.calls) == 3
+    assert all("offset" not in c for c in http.calls)
+
+
+def test_cold_offset_walks_forward_and_past_the_end_is_empty():
+    rows = [dict(TRADE_V2, transaction_hash=f"0x{i}") for i in range(10)]
+    http = _PagedClient(rows)
+    client = PolymarketDataClient(client=http, bypass_cache=False)
+    page = client.get_raw_trades(user="0xlead", limit=3, offset=6)
+    assert [r["transactionHash"] for r in page] == ["0x6", "0x7", "0x8"]
+    assert client.get_raw_trades(user="0xother", limit=3, offset=50) == []
+
+
+def test_positions_carry_the_v1_names_the_dashboard_reads():
+    http = _RecordingClient({"data": [POSITION_V2], "pagination": {"has_more": False}})
+    p = PolymarketDataClient(client=http).get_positions("0xlead")[0]
+    assert p["asset"] == POSITION_V2["token_id"]
+    assert p["size"] == POSITION_V2["current_size"]
+    assert p["avgPrice"] == 0.3362 and p["curPrice"] == 0.625
+    assert p["currentValue"] == POSITION_V2["current_value"]
+    assert p["cashPnl"] == POSITION_V2["unrealized_pnl"]
+    assert p["percentPnl"] == POSITION_V2["percent_pnl"]
+    assert p["endDate"] == "2026-11-29" and p["eventSlug"] == "worlds-2026-winner"
+    assert http.calls[-1][0].endswith("/v2/positions")
+
+
+def test_value_and_holders_read_the_v2_shapes():
+    http = _RecordingClient({"data": {"proxy_wallet": "0xa", "value": 93864.8414}})
+    assert PolymarketDataClient(client=http).get_value("0xa") == 93864.8414
+
+    http = _RecordingClient({"data": [{"token_id": "t1", "holders": [
+        {"proxy_wallet": "0xh1", "amount": 5.0}]}]})
+    client = PolymarketDataClient(client=http)
+    groups = client.get_holders("0xcid")
+    assert groups[0]["token"] == "t1"
+    assert groups[0]["holders"][0]["proxyWallet"] == "0xh1"
+    assert http.calls[-1][1]["condition"] == "0xcid"
+
+
+class _GammaClient:
+    """Answers /markets from {condition id: (row, closed)}, like Gamma does:
+    the default query returns only non-closed markets."""
+
+    def __init__(self, markets):
+        self.markets = markets
+        self.calls: list[dict] = []
+
+    def get(self, url, params=None):
+        params = dict(params or {})
+        self.calls.append(params)
+        want_closed = params.get("closed") == "true"
+        rows = [row for cid, (row, closed) in self.markets.items()
+                if cid in params["condition_ids"] and closed == want_closed]
+        return _Response(rows)
+
+
+def test_markets_by_ids_batches_and_falls_back_to_closed():
+    open_m = dict(MARKET, conditionId="0xopen")
+    closed_m = dict(MARKET, conditionId="0xshut", closed=True)
+    http = _GammaClient({"0xopen": (open_m, False), "0xshut": (closed_m, True)})
+    found = GammaClient(client=http).get_markets_by_ids(
+        ["0xopen", "0xshut", "0xnope", "0xopen"], chunk=50)
+    assert set(found) == {"0xopen", "0xshut"}
+    assert len(http.calls) == 2                       # one open pass + one closed pass
+    assert http.calls[1]["condition_ids"] == ["0xshut", "0xnope"]   # only the misses

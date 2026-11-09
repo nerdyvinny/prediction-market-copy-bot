@@ -100,6 +100,32 @@ class GammaClient:
                 return rows[0]
         return None
 
+    def get_markets_by_ids(self, condition_ids: list[str], chunk: int = 50) -> dict[str, Market]:
+        """Many markets by condition id, open or closed, in a few requests.
+
+        /markets takes `condition_ids` repeated. As with `_fetch_market_raw`,
+        the default query only returns non-closed markets, so whatever the
+        open pass misses is asked again with closed=true. Ids Gamma doesn't
+        know are simply absent from the result.
+        """
+        found: dict[str, Market] = {}
+        ids = list(dict.fromkeys(i for i in condition_ids if i))
+        for start in range(0, len(ids), chunk):
+            batch = ids[start:start + chunk]
+            for closed in (None, "true"):
+                missing = [i for i in batch if i not in found]
+                if not missing:
+                    break
+                params: dict[str, Any] = {"condition_ids": missing, "limit": len(missing)}
+                if closed:
+                    params["closed"] = closed
+                data = self._get("/markets", params)
+                rows = data if isinstance(data, list) else data.get("data", [])
+                for raw in rows:
+                    m = self._parse_market(raw)
+                    found[m.market_id] = m
+        return found
+
     def get_market(self, condition_id: str) -> Market | None:
         """Fetch a single market by its condition id (open or closed)."""
         m = self._fetch_market_raw(condition_id)

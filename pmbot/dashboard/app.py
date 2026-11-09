@@ -13,11 +13,13 @@ never places orders and only reads public APIs + the local DB.
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+import httpx
 import psutil
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -28,6 +30,8 @@ from pmbot.data import GammaClient, PolymarketDataClient
 from pmbot.data.price_cache import PriceCache
 from pmbot.models import Market, Side
 from pmbot.portfolio.ledger import Ledger, apply_fill
+
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="pmbot dashboard")
 
@@ -111,13 +115,54 @@ def _market_url(slug: object, event_slug: object) -> str | None:
     return None
 
 
+# After any Gamma failure, skip uncached lookups for this long. The cache starts
+# empty on every restart and /api/state labels every market ever traded, so a
+# cold start used to fire thousands of one-market requests — each retried on
+# 429 — which got the VPS rate-limited and left /api/state hanging for minutes
+# (seen 2026-11-09). Blank labels for a minute beat a page that never loads.
+GAMMA_COOLDOWN = 60.0
+_gamma_down_until = 0.0
+
+
+def _gamma_cooling() -> bool:
+    return time.time() < _gamma_down_until
+
+
+def _gamma_failed(exc: Exception) -> None:
+    global _gamma_down_until
+    _gamma_down_until = time.time() + GAMMA_COOLDOWN
+    log.warning("Gamma lookup failed (%s); pausing lookups %.0fs", exc, GAMMA_COOLDOWN)
+
+
+def _prefetch_markets(market_ids: list[str]) -> None:
+    """Fill the market cache for every uncached id in a few batched requests."""
+    missing = [m for m in dict.fromkeys(market_ids) if m and m not in _market_cache]
+    if not missing or _gamma_cooling():
+        return
+    try:
+        found = _get_gamma().get_markets_by_ids(missing)
+    except httpx.HTTPError as exc:      # network trouble or 429/5xx: back off
+        _gamma_failed(exc)
+        return
+    except Exception:                   # anything else: fall back to per-market lookups
+        log.exception("batched Gamma prefetch failed")
+        return
+    for market_id, m in found.items():
+        _market_cache[market_id] = _row_of(m)
+
+
 def _market_row(market_id: str) -> tuple[str, str | None, str | None]:
     """(question, URL, resolution ISO) for a condition id, cached for the process."""
     if market_id not in _market_cache:
+        if _gamma_cooling():
+            return ("", None, None)
         try:
             m = _get_gamma().get_market(market_id)
+        except httpx.HTTPError as exc:
+            _gamma_failed(exc)
+            return ("", None, None)  # transient API failure: retry after the cooldown, don't cache
         except Exception:
-            return ("", None, None)  # transient API failure: retry next poll, don't cache
+            return ("", None, None)  # not an outage: retry next poll, don't cache
         if m is None:
             # Not found *right now* is not an answer either — caching the blank
             # would leave the row unlabelled for the life of the process.
@@ -428,6 +473,8 @@ def state() -> dict:
 
     all_fills = [dict(r) for r in rows]
     _annotate_realized(all_fills)  # oldest-first order matters: this replays the tape
+    # Label every market on the page in a few batched Gamma calls, not one each.
+    _prefetch_markets([f["market_id"] for f in all_fills] + [p.market_id for p in positions])
     open_pos = {p.token_id: p for p in positions}
     mids = {p.token_id: _mid_for(p.token_id, p.venue) for p in positions}
     # Leader stats are a roll-up of the same trade rows the tables show, so the
